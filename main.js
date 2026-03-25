@@ -1903,14 +1903,11 @@ function createPoolOrbitControls(camera, domElement) {
     sphericalDelta: new THREE.Spherical(),
     scale: 1,
     minPolarAngle: 0.01, maxPolarAngle: Math.PI - 0.01,
-    minDistance: 7.5 * POOL_SCENE_SCALE, maxDistance: 34 * POOL_SCENE_SCALE,
+    minDistance: 7.5*POOL_SCENE_SCALE, maxDistance: 34*POOL_SCENE_SCALE,
     rotateSpeed: 0.19, zoomSpeed: 0.75,
     dampingFactor: 0.93,
     enableDamping: true,
-    _twoFingerActive: false,
-    _lastTouchMidX: 0,
-    _lastTouchMidY: 0,
-    _lastPinchDist: 0,
+    _twoFingerActive: false, _lastTouchMidX: 0, _lastTouchMidY: 0, _lastPinchDist: 0,
   };
 
   domElement.style.touchAction = 'none';
@@ -1919,166 +1916,111 @@ function createPoolOrbitControls(camera, domElement) {
   offset.copy(camera.position).sub(ctrl.target);
   ctrl.spherical.setFromVector3(offset);
 
-  function getTouchMid(t) {
-    return {
-      x: (t[0].clientX + t[1].clientX) * 0.5,
-      y: (t[0].clientY + t[1].clientY) * 0.5
-    };
-  }
-
-  function getTouchDist(t) {
-    const dx = t[0].clientX - t[1].clientX;
-    const dy = t[0].clientY - t[1].clientY;
-    return Math.sqrt(dx * dx + dy * dy);
-  }
-
-  // PC(트랙패드)와 모바일(터치) 방향을 따로 맞춤
-  // 지금 증상 기준: PC만 반대로 느껴지므로 wheel만 뒤집음
-  const WHEEL_X_SIGN = -1;
-  const WHEEL_Y_SIGN = -1;
-  const TOUCH_X_SIGN =  1;
-  const TOUCH_Y_SIGN =  1;
+  function getTouchMid(t) { return {x:(t[0].clientX+t[1].clientX)*0.5,y:(t[0].clientY+t[1].clientY)*0.5}; }
+  function getTouchDist(t) { const dx=t[0].clientX-t[1].clientX,dy=t[0].clientY-t[1].clientY; return Math.sqrt(dx*dx+dy*dy); }
 
   ctrl._handlers = {
     wheel(e) {
       e.preventDefault();
       e.stopPropagation();
 
-      if (e.ctrlKey) {
+      if(e.ctrlKey){
         const factor = 1 + Math.abs(e.deltaY) * ctrl.zoomSpeed * 0.005;
-        if (e.deltaY > 0) ctrl.scale = Math.min(ctrl.scale * factor, 1.08);
+        if(e.deltaY>0) ctrl.scale = Math.min(ctrl.scale * factor, 1.08);
         else ctrl.scale = Math.max(ctrl.scale / factor, 0.92);
         return;
       }
 
-      const dTheta =
-        (2 * Math.PI * e.deltaX / domElement.clientWidth) *
-        ctrl.rotateSpeed * 1.5 * WHEEL_X_SIGN;
-
-      const dPhi =
-        (2 * Math.PI * e.deltaY / domElement.clientHeight) *
-        ctrl.rotateSpeed * 1.5 * WHEEL_Y_SIGN;
-
+      const dTheta =  (2*Math.PI*e.deltaX/domElement.clientWidth)  * ctrl.rotateSpeed * 1.5;
+      const dPhi   =  (2*Math.PI*e.deltaY/domElement.clientHeight) * ctrl.rotateSpeed * 1.5;
       ctrl.sphericalDelta.theta += dTheta;
-      ctrl.sphericalDelta.phi += dPhi;
+      ctrl.sphericalDelta.phi   += dPhi;
     },
-
     touchstart(e) {
       e.stopPropagation();
-
-      if (e.touches.length === 2) {
+      if(e.touches.length===2){
         e.preventDefault();
-        ctrl._twoFingerActive = true;
-
-        const mid = getTouchMid(e.touches);
-        ctrl._lastTouchMidX = mid.x;
-        ctrl._lastTouchMidY = mid.y;
-        ctrl._lastPinchDist = getTouchDist(e.touches);
+        ctrl._twoFingerActive=true;
+        const mid=getTouchMid(e.touches);
+        ctrl._lastTouchMidX=mid.x; ctrl._lastTouchMidY=mid.y;
+        ctrl._lastPinchDist=getTouchDist(e.touches);
       } else {
-        ctrl._twoFingerActive = false;
+        ctrl._twoFingerActive=false;
       }
     },
-
     touchmove(e) {
       e.stopPropagation();
-      if (e.touches.length !== 2 || !ctrl._twoFingerActive) return;
-
+      if(e.touches.length!==2||!ctrl._twoFingerActive)return;
       e.preventDefault();
+      const mid=getTouchMid(e.touches);
+      const dx=mid.x-ctrl._lastTouchMidX, dy=mid.y-ctrl._lastTouchMidY;
+      ctrl._lastTouchMidX=mid.x; ctrl._lastTouchMidY=mid.y;
 
-      const mid = getTouchMid(e.touches);
-      const dx = mid.x - ctrl._lastTouchMidX;
-      const dy = mid.y - ctrl._lastTouchMidY;
-
-      ctrl._lastTouchMidX = mid.x;
-      ctrl._lastTouchMidY = mid.y;
-
-      const dTheta =
-        (2 * Math.PI * dx / domElement.clientWidth) *
-        ctrl.rotateSpeed * 1.5 * TOUCH_X_SIGN;
-
-      const dPhi =
-        (2 * Math.PI * dy / domElement.clientHeight) *
-        ctrl.rotateSpeed * 1.5 * TOUCH_Y_SIGN;
-
+      // 모바일/iPad에서만 좌우·상하를 둘 다 반전
+      const dTheta=-(2*Math.PI*dx/domElement.clientWidth)*ctrl.rotateSpeed*1.5;
+      const dPhi  =-(2*Math.PI*dy/domElement.clientHeight)*ctrl.rotateSpeed*1.5;
       ctrl.sphericalDelta.theta += dTheta;
-      ctrl.sphericalDelta.phi += dPhi;
+      ctrl.sphericalDelta.phi   += dPhi;
 
-      const dist = getTouchDist(e.touches);
-      if (ctrl._lastPinchDist > 0) {
+      const dist=getTouchDist(e.touches);
+      if(ctrl._lastPinchDist>0){
         const pinchScale = 1 + (ctrl._lastPinchDist - dist) * 0.003;
         ctrl.scale *= Math.max(0.94, Math.min(1.06, pinchScale));
       }
-      ctrl._lastPinchDist = dist;
+      ctrl._lastPinchDist=dist;
     },
-
     touchend(e) {
       e.stopPropagation();
-      if (e.touches.length < 2) {
-        ctrl._twoFingerActive = false;
-        ctrl._lastPinchDist = 0;
+      if(e.touches.length<2){
+        ctrl._twoFingerActive=false;
+        ctrl._lastPinchDist=0;
       }
     }
   };
 
-  domElement.addEventListener('wheel', ctrl._handlers.wheel, { passive: false });
-  domElement.addEventListener('touchstart', ctrl._handlers.touchstart, { passive: false });
-  domElement.addEventListener('touchmove', ctrl._handlers.touchmove, { passive: false });
-  domElement.addEventListener('touchend', ctrl._handlers.touchend, { passive: false });
-  domElement.addEventListener('touchcancel', ctrl._handlers.touchend, { passive: false });
+  domElement.addEventListener('wheel',      ctrl._handlers.wheel, {passive:false});
+  domElement.addEventListener('touchstart', ctrl._handlers.touchstart, {passive:false});
+  domElement.addEventListener('touchmove',  ctrl._handlers.touchmove,  {passive:false});
+  domElement.addEventListener('touchend',   ctrl._handlers.touchend,   {passive:false});
+  domElement.addEventListener('touchcancel',ctrl._handlers.touchend,   {passive:false});
 
   ctrl.update = function() {
     const offset2 = new THREE.Vector3();
-    const quat = new THREE.Quaternion().setFromUnitVectors(
-      camera.up,
-      new THREE.Vector3(0, 1, 0)
-    );
+    const quat    = new THREE.Quaternion().setFromUnitVectors(camera.up, new THREE.Vector3(0,1,0));
     const quatInv = quat.clone().invert();
-
     offset2.copy(camera.position).sub(ctrl.target);
     offset2.applyQuaternion(quat);
-
     ctrl.spherical.setFromVector3(offset2);
     ctrl.spherical.theta += ctrl.sphericalDelta.theta;
-    ctrl.spherical.phi += ctrl.sphericalDelta.phi;
-    ctrl.spherical.phi = Math.max(
-      ctrl.minPolarAngle,
-      Math.min(ctrl.maxPolarAngle, ctrl.spherical.phi)
-    );
-
+    ctrl.spherical.phi   += ctrl.sphericalDelta.phi;
+    ctrl.spherical.phi    = Math.max(ctrl.minPolarAngle, Math.min(ctrl.maxPolarAngle, ctrl.spherical.phi));
     ctrl.spherical.radius *= ctrl.scale;
-    ctrl.spherical.radius = Math.max(
-      ctrl.minDistance,
-      Math.min(ctrl.maxDistance, ctrl.spherical.radius)
-    );
-
+    ctrl.spherical.radius = Math.max(ctrl.minDistance, Math.min(ctrl.maxDistance, ctrl.spherical.radius));
     ctrl.spherical.makeSafe();
     offset2.setFromSpherical(ctrl.spherical);
     offset2.applyQuaternion(quatInv);
-
     camera.position.copy(ctrl.target).add(offset2);
     camera.lookAt(ctrl.target);
 
-    if (ctrl.enableDamping) {
-      ctrl.sphericalDelta.theta *= (1 - ctrl.dampingFactor);
-      ctrl.sphericalDelta.phi *= (1 - ctrl.dampingFactor);
-
-      if (Math.abs(ctrl.sphericalDelta.theta) < 0.00001) ctrl.sphericalDelta.theta = 0;
-      if (Math.abs(ctrl.sphericalDelta.phi) < 0.00001) ctrl.sphericalDelta.phi = 0;
-
-      ctrl.scale = 1 + (ctrl.scale - 1) * (1 - 0.70 * 1.2);
-      if (Math.abs(ctrl.scale - 1) < 0.00001) ctrl.scale = 1;
+    if(ctrl.enableDamping){
+      ctrl.sphericalDelta.theta *= (1-ctrl.dampingFactor);
+      ctrl.sphericalDelta.phi   *= (1-ctrl.dampingFactor);
+      if(Math.abs(ctrl.sphericalDelta.theta)<0.00001) ctrl.sphericalDelta.theta = 0;
+      if(Math.abs(ctrl.sphericalDelta.phi)<0.00001) ctrl.sphericalDelta.phi = 0;
+      ctrl.scale = 1+(ctrl.scale-1)*(1-0.70*1.2);
+      if(Math.abs(ctrl.scale-1)<0.00001) ctrl.scale = 1;
     } else {
-      ctrl.sphericalDelta.set(0, 0, 0);
-      ctrl.scale = 1;
+      ctrl.sphericalDelta.set(0,0,0);
+      ctrl.scale=1;
     }
   };
 
-  ctrl.dispose = function() {
-    domElement.removeEventListener('wheel', ctrl._handlers.wheel, { passive: false });
-    domElement.removeEventListener('touchstart', ctrl._handlers.touchstart, { passive: false });
-    domElement.removeEventListener('touchmove', ctrl._handlers.touchmove, { passive: false });
-    domElement.removeEventListener('touchend', ctrl._handlers.touchend, { passive: false });
-    domElement.removeEventListener('touchcancel', ctrl._handlers.touchend, { passive: false });
+  ctrl.dispose = function(){
+    domElement.removeEventListener('wheel', ctrl._handlers.wheel, {passive:false});
+    domElement.removeEventListener('touchstart', ctrl._handlers.touchstart, {passive:false});
+    domElement.removeEventListener('touchmove', ctrl._handlers.touchmove, {passive:false});
+    domElement.removeEventListener('touchend', ctrl._handlers.touchend, {passive:false});
+    domElement.removeEventListener('touchcancel', ctrl._handlers.touchend, {passive:false});
   };
 
   return ctrl;
