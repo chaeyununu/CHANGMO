@@ -1048,7 +1048,7 @@ html, body {
 }
 
 .chron-frame-lines {
-  position: absolute; left: 16px; right: 16px; z-index: 6; pointer-events: none;
+  position: absolute; left: 16px; right: 16px; z-index: 3; pointer-events: none;
 }
 
 .chron-glb-wrap {
