@@ -866,25 +866,76 @@ function bindLayoutEvents(){
 // ══════════════════════════════════════════════════════
 // 1D 댐핑 탄성 스프링(오버슈트가 자연스럽게 생기도록)
 class Spring {
-  constructor({ value = 0, velocity = 0, stiffness = 170, damping = 20, mass = 1 } = {}) {
+  /**
+   * Critically-tuned spring with semi-implicit Euler + sub-stepping.
+   * Produces controlled overshoot that feels hand-tweaked, not bouncy.
+   *
+   * @param {number} value      – initial position
+   * @param {number} velocity   – initial velocity
+   * @param {number} stiffness  – spring constant k  (higher = snappier)
+   * @param {number} damping    – viscous drag c      (higher = less overshoot)
+   * @param {number} mass       – inertia             (higher = sluggish)
+   * @param {number} precision  – sleep threshold (avoids micro-jitter)
+   */
+  constructor({
+    value = 0, velocity = 0,
+    stiffness = 170, damping = 20, mass = 1,
+    precision = 0.0001,
+  } = {}) {
     this.x = value;
     this.v = velocity;
-    this.k = stiffness; // stiffness
-    this.c = damping;   // damping
+    this.k = stiffness;
+    this.c = damping;
     this.m = mass;
+    this.precision = precision;
+    this._settled = false;
   }
+
   update(target, dt) {
     if (!dt || dt <= 0) return this.x;
-    // a = (-k(x-target) - c*v) / m
-    const a = (-this.k * (this.x - target) - this.c * this.v) / this.m;
-    this.v += a * dt;
-    this.x += this.v * dt;
+
+    // Sub-step: cap each step at 4 ms for numerical stability
+    const SUB = 0.004;
+    let remaining = Math.min(dt, 0.064);   // hard-cap total delta
+    while (remaining > 0) {
+      const h = Math.min(remaining, SUB);
+      // Semi-implicit Euler: update velocity first, then position
+      const displacement = this.x - target;
+      const springForce  = -this.k * displacement;
+      const dampForce    = -this.c * this.v;
+      const a = (springForce + dampForce) / this.m;
+      this.v += a * h;
+      this.x += this.v * h;
+      remaining -= h;
+    }
+
+    // Sleep when close enough — prevents perpetual micro-vibration
+    if (Math.abs(this.x - target) < this.precision &&
+        Math.abs(this.v) < this.precision) {
+      this.x = target;
+      this.v = 0;
+      this._settled = true;
+    } else {
+      this._settled = false;
+    }
+
     return this.x;
   }
+
+  /** Hard-set without spring transition */
   set(value) {
     this.x = value;
     this.v = 0;
+    this._settled = false;
   }
+
+  /** Inject an impulse (additive velocity kick) */
+  impulse(force) {
+    this.v += force / this.m;
+    this._settled = false;
+  }
+
+  get settled() { return this._settled; }
 }
 
 const chronSections=document.querySelectorAll(".chron-section");
@@ -928,8 +979,8 @@ const GLB_PERS={
   "kiki.glb":                  {wobble:0.012,wFreq:3.0,band:"mid", bRot:0.0022, airHigh:true},
   "cuban_link_chain.glb":      {wobble:0.007,wFreq:1.4,band:"bass", bRot:0.0005, oneWay:true},
   "whiskey.glb":               {wobble:0.006,wFreq:1.5,band:"sub",  bRot:0.0014, whiskyMode:true},
-  "diamond_bape_buckle.glb":   {wobble:0.018,wFreq:4.2,band:"high", bRot:0.0015, airHigh:true, bapeMode:true},
-  "stu.glb":                   {wobble:0.0022,wFreq:0.52,band:"sub",  bRot:0.00045, stuMode:true},
+  "diamond_bape_buckle.glb":   {wobble:0.018,wFreq:4.2,band:"high", bRot:0.0055, airHigh:true, bapeMode:true},
+  "stu.glb":                   {wobble:0.0003,wFreq:0.52,band:"sub",  bRot:0.00045, stuMode:true},
   "20201.glb":                 {wobble:0.0008,wFreq:0.45,band:"bass", bRot:0.00365, bounceMode:true, oneWay:true},
   "boot.glb":                  {wobble:0.000,wFreq:0.0,band:"sub",  bRot:0.0022, bootMode:true},
   "jack_daniels_whiskey_no.7_bottle.glb":{wobble:0.006,wFreq:1.3,band:"sub", bRot:0.0012},
@@ -1542,20 +1593,40 @@ function renderChronEntry(entry){
           a: Math.random() * 1000,
           b: Math.random() * 1000,
           c: Math.random() * 1000,
+          d: Math.random() * 1000,
+          e: Math.random() * 1000,
+          f: Math.random() * 1000,
         };
+        entry._shakeDecay = 0;
       }
-      const deep = Math.max(0, S.bass - 0.24);
-      const deepNorm = Math.min(1, deep / 0.36);
-      if(deepNorm > 0){
+      // ── 20201 micro-jitter: tight, cinematic camera shake ──
+      // Two-layer noise: fast + ultra-fast, gated by bass threshold
+      const rawBass = Math.max(0, S.bass - 0.18);
+      const bassGate = Math.min(1, rawBass / 0.42);
+      // Onset burst: momentary spike decays quickly
+      const beatBurst = S.beat > 0.5 ? S.beat * 0.7 : 0;
+      const shakeTarget = bassGate * 0.65 + beatBurst;
+      entry._shakeDecay += (shakeTarget - entry._shakeDecay) * 0.38;
+      entry._shakeDecay *= 0.92;  // fast natural decay
+
+      const shakeAmt = entry._shakeDecay;
+      if(shakeAmt > 0.003){
         const ph = entry.wPhase;
-        const jitterAmt = deepNorm * 0.006;
-        const n1 = Math.sin(ph * 95.2 + entry._camJSeed.a);
-        const n2 = Math.cos(ph * 88.1 + entry._camJSeed.b);
-        const n3 = Math.sin(ph * 63.7 + entry._camJSeed.c);
+        const s = entry._camJSeed;
+        // Layer 1: medium-freq (rumble feel)
+        const n1 = Math.sin(ph * 72.3 + s.a) * 0.55 + Math.sin(ph * 118.7 + s.d) * 0.45;
+        const n2 = Math.cos(ph * 67.9 + s.b) * 0.50 + Math.cos(ph * 103.4 + s.e) * 0.50;
+        const n3 = Math.sin(ph * 51.2 + s.c) * 0.60 + Math.sin(ph * 89.6 + s.f) * 0.40;
+        // Layer 2: ultra-fast (crispness)
+        const h1 = Math.sin(ph * 213.5 + s.c) * 0.3;
+        const h2 = Math.cos(ph * 197.8 + s.a) * 0.3;
+        const jX = (n1 + h1) * shakeAmt * 0.0048;
+        const jY = (n2 + h2) * shakeAmt * 0.0022;  // vertical more subtle
+        const jZ = n3 * shakeAmt * 0.0018;
         camera.position.set(
-          entry._baseCamPos.x + n1 * jitterAmt,
-          entry._baseCamPos.y + n2 * jitterAmt * 0.45,
-          entry._baseCamPos.z + n3 * jitterAmt * 0.25
+          entry._baseCamPos.x + jX,
+          entry._baseCamPos.y + jY,
+          entry._baseCamPos.z + jZ
         );
       } else {
         camera.position.copy(entry._baseCamPos);
@@ -1564,23 +1635,48 @@ function renderChronEntry(entry){
     } else {
       if(glbFile==="diamond_bape_buckle.glb" || pers.bapeMode){
         if(entry._baseModelY==null) entry._baseModelY = model.position.y;
+        // ── Bape Spring: snappy with one clean overshoot ──
         if(!entry._springScale) entry._springScale = new Spring({
           value: model.scale.x,
-          stiffness: 185,
-          damping: 18,
+          stiffness: 220,      // snappier attack
+          damping: 14,         // lower → visible overshoot, higher → tighter
+          mass: 0.85,
+          precision: 0.00005,
         });
         if(!entry._springY) entry._springY = new Spring({
           value: model.position.y,
-          stiffness: 155,
-          damping: 18,
+          stiffness: 190,
+          damping: 13,
+          mass: 0.9,
+          precision: 0.00005,
+        });
+        // Rotation spring for subtle wobble recovery
+        if(!entry._springRotZ) entry._springRotZ = new Spring({
+          value: 0,
+          stiffness: 260,
+          damping: 16,
+          mass: 0.7,
+          precision: 0.0001,
         });
 
-        const diamondPulse = Math.min(1, S.high * 0.75 + speakerPulse * 0.35 + LQ.highShimmer * 0.12);
-        const scaleTarget = baseScale * (1 + diamondPulse * 0.032);
-        const yTarget = entry._baseModelY + diamondPulse * 0.038;
+        const diamondPulse = Math.min(1, S.high * 0.72 + speakerPulse * 0.32 + LQ.highShimmer * 0.14);
+        const scaleTarget = baseScale * (1 + diamondPulse * 0.028);
+        const yTarget = entry._baseModelY + diamondPulse * 0.034;
+
+        // Impulse kick on beat — gives the spring a sudden push
+        if(!entry._bapePrevBeat) entry._bapePrevBeat = 0;
+        const beatRise = S.beat - entry._bapePrevBeat;
+        if(beatRise > 0.35){
+          const kick = beatRise * 0.42 + S.bass * 0.18;
+          entry._springScale.impulse(kick * 0.12);
+          entry._springY.impulse(kick * 0.22);
+          entry._springRotZ.impulse(kick * 0.55);
+        }
+        entry._bapePrevBeat = S.beat;
 
         const newScale = entry._springScale.update(scaleTarget, delta);
         const newY = entry._springY.update(yTarget, delta);
+        const rotZSpring = entry._springRotZ.update(0, delta);
 
         model.scale.setScalar(newScale);
         model.position.y = newY;
@@ -1589,7 +1685,7 @@ function renderChronEntry(entry){
         const sign=GLB_SPECIAL_REVERSE.has(glbFile)?-1:1;
         model.rotation.y += pers.bRot * (0.55 + bandVal * 1.35 + speakerPulse * 0.18) * sign;
         model.rotation.x = Math.sin(entry.wPhase * pers.wFreq) * pers.wobble * (0.42 + bandVal * 1.1);
-        model.rotation.z = Math.cos(entry.wPhase * pers.wFreq * 0.68) * pers.wobble * 0.30;
+        model.rotation.z = Math.cos(entry.wPhase * pers.wFreq * 0.68) * pers.wobble * 0.30 + rotZSpring * 0.012;
       } else if(glbFile==="kiki.glb"){
         if(entry._baseModelY==null) entry._baseModelY = model.position.y;
         if(entry._kikiVocalSmooth==null) entry._kikiVocalSmooth = 0;
@@ -1865,6 +1961,10 @@ let poolMouseSpeed=0;
 let poolRainActive=false;
 let poolRainTimer=0, poolRainDuration=0, poolRainCooldown=0;
 
+// ── Pool Sky Dawn Transition (곡 끝 무렵 청아한 하늘)
+let _poolDawnFactor = 0;          // 0 = 밤하늘, 1 = 맑은 낮하늘
+let _poolDawnSmooth = 0;          // 부드러운 추적용
+
 const POOL_SCENE_SCALE=1.22;
 const POOL_WATER_LEVEL=1.05*POOL_SCENE_SCALE;
 const POOL_DIMENSIONS = {
@@ -1904,8 +2004,8 @@ function createPoolOrbitControls(camera, domElement) {
     scale: 1,
     minPolarAngle: 0.01, maxPolarAngle: Math.PI - 0.01,
     minDistance: 7.5*POOL_SCENE_SCALE, maxDistance: 34*POOL_SCENE_SCALE,
-    rotateSpeed: 0.19, zoomSpeed: 0.75,
-    dampingFactor: 0.93,
+    rotateSpeed: 0.01, zoomSpeed: 0.75,
+    dampingFactor: 0.025,
     enableDamping: true,
     _twoFingerActive: false, _lastTouchMidX: 0, _lastTouchMidY: 0, _lastPinchDist: 0,
   };
@@ -1956,8 +2056,8 @@ function createPoolOrbitControls(camera, domElement) {
       const dx=mid.x-ctrl._lastTouchMidX, dy=mid.y-ctrl._lastTouchMidY;
       ctrl._lastTouchMidX=mid.x; ctrl._lastTouchMidY=mid.y;
 
-      const dTheta=(2*Math.PI*dx/domElement.clientWidth)*ctrl.rotateSpeed*1.5;
-      const dPhi  =(2*Math.PI*dy/domElement.clientHeight)*ctrl.rotateSpeed*1.5;
+      const dTheta=(2*Math.PI*(-dx)/domElement.clientWidth)*ctrl.rotateSpeed*1.5;
+      const dPhi  =(2*Math.PI*(-dy)/domElement.clientHeight)*ctrl.rotateSpeed*1.5;
       ctrl.sphericalDelta.theta += dTheta;
       ctrl.sphericalDelta.phi   += dPhi;
 
@@ -2916,6 +3016,35 @@ function updateWaterSurface(delta){
     if(!m) return;
     m.opacity = 0.08 + LQ.highShimmer * 0.16 + S.air * 0.07 + poolMouseSpeed * 0.05 + S.beat * 0.04;
   });
+
+  // ── Dawn water: 물색이 맑고 투명하게 ──
+  if(_poolDawnSmooth > 0.001) {
+    const d = _poolDawnSmooth;
+    // 물 deep/mid/shallow → 더 밝고 맑은 터쿼이즈
+    if(u['uWaterDeep']) {
+      u['uWaterDeep'].value.r += d * 0.06;
+      u['uWaterDeep'].value.g += d * 0.14;
+      u['uWaterDeep'].value.b += d * 0.10;
+    }
+    if(u['uWaterMid']) {
+      u['uWaterMid'].value.r += d * 0.08;
+      u['uWaterMid'].value.g += d * 0.12;
+      u['uWaterMid'].value.b += d * 0.06;
+    }
+    if(u['uWaterShallow']) {
+      u['uWaterShallow'].value.r += d * 0.10;
+      u['uWaterShallow'].value.g += d * 0.06;
+      u['uWaterShallow'].value.b += d * 0.03;
+    }
+    // water volume → 더 투명하게
+    if(poolWaterVolume && poolWaterVolume.material) {
+      poolWaterVolume.material.opacity *= (1 - d * 0.35);
+    }
+    // 유리벽 → 더 맑게
+    poolGlassWalls.forEach((wall) => {
+      if(wall.material) wall.material.opacity *= (1 - d * 0.25);
+    });
+  }
 }
 
 function buildProceduralCaustics(){
@@ -3004,6 +3133,63 @@ function renderPoolScene(delta){
 
   if(poolScene._skyMat) poolScene._skyMat.uniforms.uTime.value=poolTime;
 
+  // ── Pool Sky Dawn: 곡 끝 무렵 하늘이 맑고 청아하게 밝아짐 ──
+  {
+    let songProgress = 0;
+    if(mode === MODE_FILE && audioEl.duration > 0 && isPlaying) {
+      songProgress = audioEl.currentTime / audioEl.duration;
+    }
+    // 곡의 마지막 ~28%에서 서서히 시작, 끝에서 최대
+    const dawnOnset = 0.72;
+    const rawDawn = Math.max(0, (songProgress - dawnOnset) / (1.0 - dawnOnset));
+    // ease-in-out cubic for natural feel
+    _poolDawnFactor = rawDawn < 0.5
+      ? 4 * rawDawn * rawDawn * rawDawn
+      : 1 - Math.pow(-2 * rawDawn + 2, 3) / 2;
+    // 곡 안 재생중이면 천천히 원래 밤으로 복귀
+    if(!isPlaying || songProgress < dawnOnset) {
+      _poolDawnFactor = 0;
+    }
+    // 부드러운 추적 (급격한 점프 방지)
+    _poolDawnSmooth += (_poolDawnFactor - _poolDawnSmooth) * 0.012;
+    const d = _poolDawnSmooth;
+
+    if(poolScene._skyMat && d > 0.001) {
+      const u = poolScene._skyMat.uniforms;
+      // 밤하늘 → 맑은 청아한 하늘로 lerp
+      // Top:  0x010306 → 0x1e5a9e (깊은 코발트)
+      u.uTopColor.value.r += (0.118 - u.uTopColor.value.r) * d;
+      u.uTopColor.value.g += (0.353 - u.uTopColor.value.g) * d;
+      u.uTopColor.value.b += (0.620 - u.uTopColor.value.b) * d;
+      // Mid:  0x03080f → 0x5aaad5 (밝은 스카이블루)
+      u.uMidColor.value.r += (0.353 - u.uMidColor.value.r) * d;
+      u.uMidColor.value.g += (0.667 - u.uMidColor.value.g) * d;
+      u.uMidColor.value.b += (0.835 - u.uMidColor.value.b) * d;
+      // Horizon: 0x060e18 → 0xb8ddf0 (밝고 투명한 수평선)
+      u.uHorizonColor.value.r += (0.722 - u.uHorizonColor.value.r) * d;
+      u.uHorizonColor.value.g += (0.867 - u.uHorizonColor.value.g) * d;
+      u.uHorizonColor.value.b += (0.941 - u.uHorizonColor.value.b) * d;
+      // Sun: 0x1a3a6a → 0x7ec8f0 (맑고 선명한 태양빛)
+      u.uSunColor.value.r += (0.494 - u.uSunColor.value.r) * d;
+      u.uSunColor.value.g += (0.784 - u.uSunColor.value.g) * d;
+      u.uSunColor.value.b += (0.941 - u.uSunColor.value.b) * d;
+    }
+
+    // Scene background + fog 밝아짐
+    if(d > 0.001) {
+      // bg: 0x020508 → 0x1a4878 (청아한 딥블루)
+      const bgR = 0.008 + (0.102 - 0.008) * d;
+      const bgG = 0.020 + (0.282 - 0.020) * d;
+      const bgB = 0.031 + (0.471 - 0.031) * d;
+      poolScene.background.setRGB(bgR, bgG, bgB);
+      // fog: 밀도를 살짝 낮추고 색상 밝게
+      if(poolScene.fog) {
+        poolScene.fog.color.setRGB(bgR * 1.2, bgG * 1.15, bgB * 1.08);
+        poolScene.fog.density = 0.010 - d * 0.004;  // 안개 걷힘
+      }
+    }
+  }
+
   if(piaLoaded&&piaModel){
     piaModel.position.y=piaModel._baseY+Math.sin(poolTime*0.8)*0.035*(1+LQ.subPressure*2.0)+S.beat*0.055+LQ.bassShock*0.08;
     piaModel.rotation.z=Math.sin(poolTime*0.6)*0.008*(1+LQ.subPressure*2.2);
@@ -3050,6 +3236,25 @@ function renderPoolScene(delta){
   if(poolFloor&&poolFloor.material){
     poolFloor.material.color.setRGB(0.18+curPal.r/255*0.10, 0.50+curPal.g/255*0.12, 0.68+curPal.b/255*0.12);
     poolFloor.material.emissiveIntensity = 0.24 + LQ.midDensity*0.22 + LQ.highShimmer*0.16 + S.beat*0.06;
+  }
+
+  // ── Dawn lighting: 하늘과 함께 조명도 밝아짐 ──
+  if(_poolDawnSmooth > 0.001) {
+    const d = _poolDawnSmooth;
+    // Hemisphere: 밝기 + 하늘색 톤
+    if(poolScene._hemi) {
+      poolScene._hemi.intensity = 1.7 + d * 2.8;
+      // skyColor → 더 밝은 하늘색으로
+      poolScene._hemi.color.r += (0.88 - poolScene._hemi.color.r) * d * 0.5;
+      poolScene._hemi.color.g += (0.94 - poolScene._hemi.color.g) * d * 0.5;
+      poolScene._hemi.color.b += (1.0  - poolScene._hemi.color.b) * d * 0.5;
+    }
+    // 바닥도 살짝 밝아짐
+    if(poolFloor&&poolFloor.material) {
+      poolFloor.material.color.r += d * 0.08;
+      poolFloor.material.color.g += d * 0.12;
+      poolFloor.material.color.b += d * 0.10;
+    }
   }
   if(poolOrbitControls) poolOrbitControls.update();
   if(poolDropPass){
@@ -3352,6 +3557,7 @@ function initPoolRenderer(){
 
   const hemi=new THREE.HemisphereLight(0xd0ecff,0x4488aa,1.7);
   poolScene.add(hemi);
+  poolScene._hemi=hemi;
 
   const sun=new THREE.DirectionalLight(0xfff6e0,2.6);
   sun.position.set(16,32,12);
