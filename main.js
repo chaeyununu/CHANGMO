@@ -1956,9 +1956,8 @@ function createPoolOrbitControls(camera, domElement) {
       const dx=mid.x-ctrl._lastTouchMidX, dy=mid.y-ctrl._lastTouchMidY;
       ctrl._lastTouchMidX=mid.x; ctrl._lastTouchMidY=mid.y;
 
-      // 모바일/iPad에서만 좌우·상하를 둘 다 반전
-      const dTheta=-(2*Math.PI*dx/domElement.clientWidth)*ctrl.rotateSpeed*1.5;
-      const dPhi  =-(2*Math.PI*dy/domElement.clientHeight)*ctrl.rotateSpeed*1.5;
+      const dTheta=(2*Math.PI*dx/domElement.clientWidth)*ctrl.rotateSpeed*1.5;
+      const dPhi  =(2*Math.PI*dy/domElement.clientHeight)*ctrl.rotateSpeed*1.5;
       ctrl.sphericalDelta.theta += dTheta;
       ctrl.sphericalDelta.phi   += dPhi;
 
