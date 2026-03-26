@@ -837,7 +837,7 @@ let wAccum=0,txS=0,tyS=0,navCooldown=false,lastWheelTime=0;
 function triggerNav(fn){
   if(LS.anim||navCooldown) return;
   navCooldown=true; wAccum=0; fn();
-  setTimeout(()=>{navCooldown=false;wAccum=0;},1050);
+  setTimeout(()=>{navCooldown=false;wAccum=0;},1350);
 }
 
 // 덱 넘기기 쿨다운 (스크롤/스와이프 연속 입력 방지)
@@ -871,7 +871,7 @@ function bindLayoutEvents(){
 
     // 가로 스와이프 (다른 패널)
     if(Math.abs(dx)>Math.abs(dy)+10){
-      const threshold = 40;
+      const threshold = 80;
       if(dx>threshold)  triggerNav(()=>goTo(LS.hIdx+1,0));
       if(dx<-threshold) triggerNav(()=>goTo(LS.hIdx-1,LS.vIdx));
       return;
@@ -1316,6 +1316,10 @@ function initBapeInteraction(entry, glbFile) {
     const zoomDelta = e.deltaY * 0.001;
     bc.zoomTarget = Math.max(0.65, Math.min(1.45, bc.zoomTarget + zoomDelta));
   }, { passive: false });
+
+  canvas.addEventListener('wheel', (e) => {
+  return;
+}, { passive: true });
 
   // 터치 이벤트
   let touchStartTime = 0;
