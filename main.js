@@ -154,19 +154,19 @@ function smooth() {
 
   // ── Pool onset detector: 조용→큰소리 순간 감지 ──
   // baseline은 느리게 추적 (약 2~3초 평균)
-  _poolEnergySmooth += (S.energy - _poolEnergySmooth) * (isMic ? 0.018 : 0.008);
+  _poolEnergySmooth += (S.energy - _poolEnergySmooth) * (isMic ? 0.024 : 0.008);
   _poolOnsetCool = Math.max(0, _poolOnsetCool - 1);
   const _energyRise = S.energy - _poolEnergySmooth;
-  // 마이크 모드: 더 낮은 임계값 + 짧은 쿨다운, 하지만 beat에 동기화
-  const onsetThresh  = isMic ? 0.04  : 0.10;
-  const onsetCoolMax = isMic ? 20    : 40;   // 짧은 쿨다운 = 박자에 더 잘 맞음
+  // 마이크 모드: 아주 낮은 임계값 + 짧은 쿨다운 → 거의 모든 박자에 반응
+  const onsetThresh  = isMic ? 0.025 : 0.10;
+  const onsetCoolMax = isMic ? 10    : 40;   // 10프레임 = ~0.16초 쿨다운
   if (_energyRise > onsetThresh && _poolOnsetCool === 0) {
-    const beatSync = isMic ? (S.beat > 0.3 ? 1.5 : 0.8) : 1.0; // beat에 동기화
-    _poolOnsetStrength = Math.min(1.0, (_energyRise * (isMic ? 5.0 : 3.5) + S.bass * (isMic ? 1.2 : 0.6)) * beatSync);
+    const beatSync = isMic ? (S.beat > 0.2 ? 1.8 : 1.0) : 1.0;
+    _poolOnsetStrength = Math.min(1.0, (_energyRise * (isMic ? 6.5 : 3.5) + S.bass * (isMic ? 1.6 : 0.6)) * beatSync);
     _poolOnsetCool = onsetCoolMax;
   }
-  // onset 강도 감쇠 — 마이크 모드에서는 더 빠르게 감쇠 (깔끔하게)
-  _poolOnsetStrength *= (isMic ? 0.88 : 0.94);
+  // onset 강도 감쇠 — 마이크: 적절히 빠르게 감쇠하되 여운 남기기
+  _poolOnsetStrength *= (isMic ? 0.85 : 0.94);
 }
 
 const root = document.documentElement;
@@ -297,6 +297,16 @@ let _sSceneT     = 0;
 let _sPalR = 110, _sPalG = 90, _sPalB = 240;
 let _sPalBloom = 0;  // 팔레트 색의 부드러운 bloom 강도
 
+// ── 3번 패널 — 서지(물들기) 효과: 진짜 확 커지는 순간에만 은은하게 물듦 ──
+let _sSurgeStrength = 0;        // 현재 서지 강도 (0~1)
+let _sSurgeCool     = 0;        // 쿨다운 (프레임)
+let _sSurgeEnergyBaseline = 0;  // 느린 에너지 평균 (~4초)
+let _sSurgeBassBaseline   = 0;  // 느린 베이스 평균
+let _sSurgePrevEnergy     = 0;
+let _sSurgePrevBass       = 0;
+// 서지 시 현재 팔레트에서 파생된 색 (별도 팔레트 없음 — 촌스러움 방지)
+let _sSurgeTintR = 0, _sSurgeTintG = 0, _sSurgeTintB = 0;
+
 // ── 추가 그라데이션 색상 쌍 (3번 패널 전용) ──
 const SCENE_GRAD_PAIRS = [
   { a:{r:160,g:135,b:100}, b:{r:70,g:130,b:140} },   // warm muted gold → teal
@@ -332,7 +342,7 @@ function updatePanelBackgrounds() {
     `;
   }
 
-  // ── SCENE(3번째) 패널 — 고급스러운 팔레트 연동 색변화 ──
+  // ── SCENE(3번째) 패널 — 고급스러운 팔레트 연동 + 서지(물들기) 색변화 ──
   const sceneEl = document.getElementById("panel-scene");
   const sceneBg = document.getElementById("scene-bg");
   if(sceneEl && sceneBg) {
@@ -344,17 +354,59 @@ function updatePanelBackgrounds() {
     _sMoodAir    += (S.air    - _sMoodAir)    * 0.010;
     _sMoodBass   += (S.bass   - _sMoodBass)   * 0.012;
 
+    // ═══════════════════════════════════════════════════════
+    // 서지(물들기) — 정말 확 커지는 순간에만, 현재 팔레트 톤으로
+    // ═══════════════════════════════════════════════════════
+    // 느린 베이스라인 (~4초 이동평균) — 평소 수준 추적
+    _sSurgeEnergyBaseline += (S.energy - _sSurgeEnergyBaseline) * 0.004;
+    _sSurgeBassBaseline   += (S.bass   - _sSurgeBassBaseline)   * 0.005;
+    _sSurgeCool = Math.max(0, _sSurgeCool - 1);
+
+    // 베이스라인 대비 상승폭 (순간 변화율은 제외 — 노이즈 감소)
+    const energyRise = Math.max(0, S.energy - _sSurgeEnergyBaseline);
+    const bassRise   = Math.max(0, S.bass   - _sSurgeBassBaseline);
+
+    // 서지 점수: 베이스라인 대비 큰 차이 + beat/bassShock 동기화
+    const surgeScore = energyRise * 1.8 + bassRise * 2.2
+                     + (S.beat > 0.6 ? S.beat * 0.8 : 0)
+                     + (LQ.bassShock > 0.4 ? LQ.bassShock * 1.0 : 0);
+
+    const isMicS = (mode === MODE_MIC);
+    // 높은 임계값 = 정말 큰 순간에만 발동
+    const surgeThreshold = isMicS ? 0.65 : 0.90;
+    // 긴 쿨다운 = 자주 안 바뀜 (약 1.5~2.5초)
+    const surgeCoolMax   = isMicS ? 55   : 80;
+
+    if (surgeScore > surgeThreshold && _sSurgeCool === 0) {
+      const intensity = Math.min(1.0, (surgeScore - surgeThreshold) * 1.2 + 0.25);
+      _sSurgeStrength = Math.max(_sSurgeStrength, intensity);
+
+      // 현재 팔레트 색에서 파생: 채도를 살짝 올리고 밝기를 높임 (별도 색 없음)
+      _sSurgeTintR = Math.min(255, curPal.r * 1.3 + 30);
+      _sSurgeTintG = Math.min(255, curPal.g * 1.2 + 20);
+      _sSurgeTintB = Math.min(255, curPal.b * 1.3 + 30);
+
+      _sSurgeCool = surgeCoolMax;
+    }
+
+    // 서지 강도 감쇠 — 아주 천천히 빠짐 (6~10초에 걸쳐 은은하게 사라짐)
+    _sSurgeStrength *= 0.992;
+    if (_sSurgeStrength < 0.003) _sSurgeStrength = 0;
+
+    _sSurgePrevEnergy = S.energy;
+    _sSurgePrevBass   = S.bass;
+
     // 팔레트 색상 부드럽게 추적 (곡 진행에 따른 색 변화의 핵심)
     _sPalR += (curPal.r - _sPalR) * 0.018;
     _sPalG += (curPal.g - _sPalG) * 0.018;
     _sPalB += (curPal.b - _sPalB) * 0.018;
 
-    // 팔레트 bloom — 에너지에 따라 팔레트 색이 얼마나 강하게 드러나는지
-    const bloomTarget = 0.20 + _sMoodEnergy * 0.40 + _sMoodMid * 0.16 + _sMoodBass * 0.12;
+    // 팔레트 bloom — 서지 시 은은하게 강화
+    const bloomTarget = 0.20 + _sMoodEnergy * 0.40 + _sMoodMid * 0.16 + _sMoodBass * 0.12
+                      + _sSurgeStrength * 0.18;
     _sPalBloom += (bloomTarget - _sPalBloom) * 0.022;
 
     // 색조 목표 — 팔레트 RGB에서 Hue 추출 + 시간 흐름
-    // 팔레트 색에서 대략적 Hue 계산
     const palMax = Math.max(_sPalR, _sPalG, _sPalB);
     const palMin = Math.min(_sPalR, _sPalG, _sPalB);
     const palDelta = palMax - palMin;
@@ -366,33 +418,37 @@ function updatePanelBackgrounds() {
       if(palHue < 0) palHue += 360;
     }
 
-    // 기본 싸이클 + 팔레트 Hue 혼합 (곡 진행 따라 자연스럽게 변화)
+    // 기본 싸이클 + 팔레트 Hue 혼합
     const cycleHue  = 200 + Math.sin(_sSceneT * 1.2) * 35
                     + Math.sin(_sSceneT * 0.45) * 15;
-    // 팔레트 영향력: 에너지가 높을수록 팔레트 색이 지배
     const palWeight = 0.35 + _sMoodEnergy * 0.45;
     const blendedHue = cycleHue * (1 - palWeight) + palHue * palWeight;
     const moodShift = _sMoodEnergy * 22 - _sMoodAir * 12 + _sMoodBass * 14;
     _sHueDrift += (blendedHue + moodShift - _sHueDrift) * 0.008;
 
-    // 채도 — 훨씬 넓은 범위로 (눈에 보이게)
-    const satTarget = 30 + _sMoodEnergy * 32 + _sMoodMid * 14 + _sMoodAir * 10;
-    // 명도 — 더 밝은 범위 (어둠 속에서 색이 살아남)
-    const lumTarget = 10 + _sMoodEnergy * 22 + _sMoodMid * 14 + _sMoodBass * 6;
+    // 채도 — 서지 시 살짝만 올라감
+    const satTarget = 30 + _sMoodEnergy * 32 + _sMoodMid * 14 + _sMoodAir * 10
+                    + _sSurgeStrength * 16;
+    // 명도 — 서지 시 은은하게 밝아짐
+    const lumTarget = 10 + _sMoodEnergy * 22 + _sMoodMid * 14 + _sMoodBass * 6
+                    + _sSurgeStrength * 10;
 
-    // 부드러운 lerp — 이전보다 빠르게 (변화를 잘 감지)
-    _sHueFast += (_sHueDrift - _sHueFast) * 0.020;
+    // 부드러운 lerp — 서지 시 약간 더 빠르게 (하지만 절제)
+    const hueLerpSpeed = 0.020 + _sSurgeStrength * 0.025;
+    const satLerpSpeed = 0.025 + _sSurgeStrength * 0.03;
+    const lumLerpSpeed = 0.022 + _sSurgeStrength * 0.03;
+    _sHueFast += (_sHueDrift - _sHueFast) * hueLerpSpeed;
     _sHueSlow += (_sHueFast  - _sHueSlow) * 0.008;
-    _sSatFast += (satTarget  - _sSatFast) * 0.025;
+    _sSatFast += (satTarget  - _sSatFast) * satLerpSpeed;
     _sSatSlow += (_sSatFast  - _sSatSlow) * 0.012;
-    _sLumFast += (lumTarget  - _sLumFast) * 0.022;
+    _sLumFast += (lumTarget  - _sLumFast) * lumLerpSpeed;
     _sLumSlow += (_sLumFast  - _sLumSlow) * 0.010;
 
     const hF  = _sHueFast;
     const hS  = _sHueSlow;
     const h2  = hF - 28;
     const h3  = hS + 22;
-    const h4  = hF + 45; // 보조 따뜻한 톤
+    const h4  = hF + 45;
     const sF  = _sSatFast.toFixed(1);
     const sS  = _sSatSlow.toFixed(1);
     const lF  = _sLumFast.toFixed(1);
@@ -400,24 +456,32 @@ function updatePanelBackgrounds() {
     const lD  = Math.max(4, _sLumSlow - 2).toFixed(1);
     const lBright = Math.min(40, _sLumFast * 1.5).toFixed(1);
 
-    // 투명도 — 팔레트 bloom 기반으로 더 강하게
-    const g1  = (0.62 + _sMoodEnergy * 0.30 + _sPalBloom * 0.25).toFixed(3);
-    const g2  = (0.40 + _sMoodBass   * 0.28 + _sPalBloom * 0.18).toFixed(3);
-    const g3  = (0.28 + _sMoodAir    * 0.22 + _sPalBloom * 0.12).toFixed(3);
+    // 투명도 — 팔레트 bloom + 서지 은은하게
+    const surgeAlphaBoost = _sSurgeStrength * 0.20;
+    const g1  = (0.62 + _sMoodEnergy * 0.30 + _sPalBloom * 0.25 + surgeAlphaBoost).toFixed(3);
+    const g2  = (0.40 + _sMoodBass   * 0.28 + _sPalBloom * 0.18 + surgeAlphaBoost * 0.5).toFixed(3);
+    const g3  = (0.28 + _sMoodAir    * 0.22 + _sPalBloom * 0.12 + surgeAlphaBoost * 0.3).toFixed(3);
 
-    // 팔레트 RGB 직접 그라디언트 (곡 진행 색이 직접 반영)
+    // 팔레트 RGB 직접 그라디언트
     const pR = Math.floor(_sPalR), pG = Math.floor(_sPalG), pB = Math.floor(_sPalB);
     const palGlowA = (_sPalBloom * 0.38 + _sMoodEnergy * 0.12).toFixed(3);
     const palGlowA2 = (_sPalBloom * 0.22 + _sMoodMid * 0.08).toFixed(3);
+
+    // ── 서지 물들기: 현재 팔레트 파생 색 1겹, 은은하게 ──
+    const sgStr = _sSurgeStrength;
+    const sgR = Math.floor(_sSurgeTintR);
+    const sgG = Math.floor(_sSurgeTintG);
+    const sgB = Math.floor(_sSurgeTintB);
+    // 서지 알파: 최대 0.38 — 은은하게 물드는 느낌
+    const sgAlpha = (sgStr * 0.38).toFixed(3);
 
     // ── 추가 그라데이션 쌍 사이클링 ──
     _sGradPhase += 0.0008 + _sMoodEnergy * 0.002;
     const gradIdx = Math.floor(_sGradPhase) % SCENE_GRAD_PAIRS.length;
     const gradNext = (gradIdx + 1) % SCENE_GRAD_PAIRS.length;
-    const gradT = _sGradPhase % 1;  // 0~1 사이 전환 비율
+    const gradT = _sGradPhase % 1;
     const curPair = SCENE_GRAD_PAIRS[gradIdx];
     const nxtPair = SCENE_GRAD_PAIRS[gradNext];
-    // 부드러운 lerp로 현재 색상 쌍 계산
     const lG = (a,b,t) => ({r:a.r+(b.r-a.r)*t, g:a.g+(b.g-a.g)*t, b:a.b+(b.b-a.b)*t});
     const gA = lG(curPair.a, nxtPair.a, gradT);
     const gB = lG(curPair.b, nxtPair.b, gradT);
@@ -434,6 +498,8 @@ function updatePanelBackgrounds() {
 
     sceneEl.style.background = '#020406';
     sceneBg.style.background = `
+      ${sgStr > 0.02 ? `radial-gradient(ellipse 100% 90% at 50% 42%,
+        rgba(${sgR},${sgG},${sgB},${sgAlpha}) 0%, transparent 65%),` : ''}
       radial-gradient(ellipse 80% 70% at 50% 38%,
         hsla(${hF.toFixed(1)},${sF}%,${lF}%,${g1}) 0%, transparent 68%),
       radial-gradient(ellipse 70% 60% at 52% 44%,
@@ -459,10 +525,10 @@ function updatePanelBackgrounds() {
       #020406
     `;
 
-    // scene-depth-layer에도 팔레트 tint 적용 (별빛 색 변화)
+    // scene-depth-layer 팔레트 tint
     const depthEl = document.getElementById("scene-depth");
     if(depthEl) {
-      depthEl.style.filter = `hue-rotate(${(hF - 210).toFixed(1)}deg) saturate(${(1.0 + _sPalBloom * 0.6).toFixed(2)})`;
+      depthEl.style.filter = `hue-rotate(${(hF - 210).toFixed(1)}deg) saturate(${(1.0 + _sPalBloom * 0.6 + sgStr * 0.3).toFixed(2)})`;
     }
   }
 }
@@ -1102,6 +1168,239 @@ function initSpinner(entry, glbFile) {
   canvas.style.touchAction = 'pan-y'; // 세로 스크롤 허용, 가로만 스피너
 }
 
+// ══════════════════════════════════════════════════════
+// BAPE 3축 자유 조작 — 드래그로 360° 자유 회전, 플릭 관성, 마그네틱 복귀
+// ══════════════════════════════════════════════════════
+function initBapeInteraction(entry, glbFile) {
+  entry._bapeCtrl = {
+    active: true,
+    dragging: false,
+    // 드래그 상태
+    dragStartX: 0, dragStartY: 0,
+    dragLastX: 0, dragLastY: 0,
+    dragLastTime: 0,
+    // 현재 유저 회전 오프셋 (자동 회전과 별도)
+    rotOffsetX: 0, rotOffsetY: 0,
+    // 플릭 관성 속도
+    velX: 0, velY: 0,
+    // 스프링 복귀
+    springX: new Spring({ value: 0, stiffness: 45, damping: 8, mass: 1.2, precision: 0.0005 }),
+    springY: new Spring({ value: 0, stiffness: 45, damping: 8, mass: 1.2, precision: 0.0005 }),
+    // 줌 효과 (핀치/스크롤)
+    zoomSpring: new Spring({ value: 1.0, stiffness: 160, damping: 18, mass: 0.8, precision: 0.001 }),
+    zoomTarget: 1.0,
+    // 탭 효과 — 탭하면 탱~ 튀는 bounce
+    tapBounce: new Spring({ value: 0, stiffness: 300, damping: 12, mass: 0.6, precision: 0.001 }),
+    // 상태
+    released: false,
+    flickActive: false,
+    returnToAuto: false,
+    idleTimer: 0,
+    // 마지막 드래그의 velocity 추적 (5프레임 이동평균)
+    velHistory: [],
+  };
+
+  const canvas = entry.canvas;
+  if (!canvas) return;
+
+  let pointerId = null;
+
+  const onDown = (clientX, clientY, id) => {
+    const bc = entry._bapeCtrl;
+    bc.dragging = true;
+    bc.released = false;
+    bc.flickActive = false;
+    bc.returnToAuto = false;
+    bc.idleTimer = 0;
+    bc.dragStartX = clientX;
+    bc.dragStartY = clientY;
+    bc.dragLastX = clientX;
+    bc.dragLastY = clientY;
+    bc.dragLastTime = performance.now();
+    bc.velX = 0;
+    bc.velY = 0;
+    bc.velHistory = [];
+    // 스프링 값을 현재 오프셋으로 설정 (이어잡기)
+    bc.springX.set(bc.rotOffsetX);
+    bc.springY.set(bc.rotOffsetY);
+    pointerId = id;
+    canvas.style.cursor = 'grabbing';
+  };
+
+  const onMove = (clientX, clientY) => {
+    const bc = entry._bapeCtrl;
+    if (!bc.dragging) return;
+    const now = performance.now();
+    const dtMs = Math.max(1, now - bc.dragLastTime);
+    const dx = clientX - bc.dragLastX;
+    const dy = clientY - bc.dragLastY;
+    // 감도 — Y축(상하)을 X축(좌우) 회전으로 매핑
+    const sensX = 0.008; // 좌우 드래그 → Y축 회전
+    const sensY = 0.006; // 상하 드래그 → X축 회전
+    bc.rotOffsetY += dx * sensX;
+    bc.rotOffsetX += dy * sensY;
+    // X축 회전 제한 (위아래 ±60도)
+    bc.rotOffsetX = Math.max(-1.05, Math.min(1.05, bc.rotOffsetX));
+    // velocity 기록 (플릭 감지용)
+    const vx = dx / dtMs * 16; // per-frame으로 정규화
+    const vy = dy / dtMs * 16;
+    bc.velHistory.push({ vx, vy, t: now });
+    // 최근 80ms만 유지
+    bc.velHistory = bc.velHistory.filter(v => now - v.t < 80);
+    bc.dragLastX = clientX;
+    bc.dragLastY = clientY;
+    bc.dragLastTime = now;
+  };
+
+  const onUp = () => {
+    const bc = entry._bapeCtrl;
+    if (!bc.dragging) return;
+    bc.dragging = false;
+    bc.released = true;
+    // 플릭 velocity 계산 (최근 기록 평균)
+    if (bc.velHistory.length > 0) {
+      let svx = 0, svy = 0;
+      bc.velHistory.forEach(v => { svx += v.vx; svy += v.vy; });
+      bc.velX = svx / bc.velHistory.length * 0.008;
+      bc.velY = svy / bc.velHistory.length * 0.006;
+    }
+    const speed = Math.sqrt(bc.velX * bc.velX + bc.velY * bc.velY);
+    if (speed > 0.005) {
+      bc.flickActive = true;
+    } else {
+      // 느린 놓기 → 바로 복귀 시작
+      bc.returnToAuto = true;
+      bc.springX.set(bc.rotOffsetX);
+      bc.springX.v = 0;
+      bc.springY.set(bc.rotOffsetY);
+      bc.springY.v = 0;
+    }
+    canvas.style.cursor = 'grab';
+    pointerId = null;
+  };
+
+  const onTap = () => {
+    // 탭 → 탱~ 튀는 bounce 효과
+    const bc = entry._bapeCtrl;
+    bc.tapBounce.set(0);
+    bc.tapBounce.impulse(8.0);
+  };
+
+  // 마우스 이벤트
+  let mouseDownTime = 0;
+  canvas.addEventListener('mousedown', (e) => {
+    e.preventDefault();
+    e.stopPropagation();
+    mouseDownTime = performance.now();
+    onDown(e.clientX, e.clientY, -1);
+
+    const mouseMoveHandler = (ev) => onMove(ev.clientX, ev.clientY);
+    const mouseUpHandler = (ev) => {
+      const dt = performance.now() - mouseDownTime;
+      const dist = Math.sqrt((ev.clientX - entry._bapeCtrl.dragStartX)**2 + (ev.clientY - entry._bapeCtrl.dragStartY)**2);
+      onUp();
+      // 짧은 클릭 + 이동 없으면 → 탭 bounce
+      if (dt < 200 && dist < 8) onTap();
+      window.removeEventListener('mousemove', mouseMoveHandler);
+      window.removeEventListener('mouseup', mouseUpHandler);
+    };
+    window.addEventListener('mousemove', mouseMoveHandler);
+    window.addEventListener('mouseup', mouseUpHandler);
+  });
+
+  // 마우스 줌 (스크롤)
+  canvas.addEventListener('wheel', (e) => {
+    e.preventDefault();
+    e.stopPropagation();
+    const bc = entry._bapeCtrl;
+    const zoomDelta = e.deltaY * 0.001;
+    bc.zoomTarget = Math.max(0.65, Math.min(1.45, bc.zoomTarget + zoomDelta));
+  }, { passive: false });
+
+  // 터치 이벤트
+  let touchStartTime = 0;
+  let touchStartY2 = 0;
+  let touchLocked2 = false;
+
+  canvas.addEventListener('touchstart', (e) => {
+    if (e.touches.length === 1) {
+      const t = e.touches[0];
+      touchStartY2 = t.clientY;
+      touchStartTime = performance.now();
+      touchLocked2 = false;
+      onDown(t.clientX, t.clientY, t.identifier);
+    }
+    // 2-finger pinch zoom
+    if (e.touches.length === 2) {
+      e.preventDefault();
+      const bc = entry._bapeCtrl;
+      bc._pinchDist = Math.sqrt(
+        (e.touches[0].clientX - e.touches[1].clientX)**2 +
+        (e.touches[0].clientY - e.touches[1].clientY)**2
+      );
+    }
+  }, { passive: false });
+
+  canvas.addEventListener('touchmove', (e) => {
+    const bc = entry._bapeCtrl;
+    // Pinch zoom
+    if (e.touches.length === 2 && bc._pinchDist) {
+      e.preventDefault();
+      const newDist = Math.sqrt(
+        (e.touches[0].clientX - e.touches[1].clientX)**2 +
+        (e.touches[0].clientY - e.touches[1].clientY)**2
+      );
+      const scale = newDist / bc._pinchDist;
+      bc.zoomTarget = Math.max(0.65, Math.min(1.45, bc.zoomTarget * (1 + (scale - 1) * 0.3)));
+      bc._pinchDist = newDist;
+      return;
+    }
+    if (!bc.dragging || e.touches.length !== 1) return;
+    const t = e.changedTouches[0];
+    if (t.identifier !== pointerId) return;
+    const dx = Math.abs(t.clientX - bc.dragStartX);
+    const dy = Math.abs(t.clientY - touchStartY2);
+    if (!touchLocked2 && (dx > 10 || dy > 10)) {
+      touchLocked2 = true;
+      if (dy > dx * 1.5) {
+        // 세로 방향이 더 크면 스크롤 허용
+        onUp(); touchLocked2 = false;
+        return;
+      }
+    }
+    if (touchLocked2) {
+      e.preventDefault();
+      onMove(t.clientX, t.clientY);
+    }
+  }, { passive: false });
+
+  canvas.addEventListener('touchend', (e) => {
+    const bc = entry._bapeCtrl;
+    bc._pinchDist = null;
+    if (bc.dragging) {
+      for (const t of e.changedTouches) {
+        if (t.identifier === pointerId) {
+          const dt = performance.now() - touchStartTime;
+          const dist = Math.sqrt((t.clientX - bc.dragStartX)**2 + (t.clientY - touchStartY2)**2);
+          onUp();
+          if (dt < 200 && dist < 12) onTap();
+          break;
+        }
+      }
+    }
+    touchLocked2 = false;
+  });
+
+  canvas.addEventListener('touchcancel', () => {
+    entry._bapeCtrl._pinchDist = null;
+    onUp();
+    touchLocked2 = false;
+  });
+
+  canvas.style.cursor = 'grab';
+  canvas.style.touchAction = 'pan-y';
+}
+
 const chronSections=document.querySelectorAll(".chron-section");
 const glbRenderers=Object.create(null);
 const glbLivePromises=new Map();
@@ -1154,6 +1453,9 @@ const DEF_PERS={wobble:0.010,wFreq:2.0,band:"bass",bRot:0.0022};
 
 // ── 스피너 대상 모델 (손으로 돌리기 가능)
 const SPINNER_MODELS = new Set(["vintage_metal_ashtray.glb", "20201.glb"]);
+
+// ── BAPE 3축 자유 조작 대상
+const BAPE_INTERACT_MODELS = new Set(["diamond_bape_buckle.glb"]);
 
 let sharedLoadingManager=null;
 let sharedGLTFLoader=null;
@@ -1647,6 +1949,11 @@ async function createLiveGLBEntry(idx){
     initSpinner(entry, glbFile);
   }
 
+  // BAPE 3축 자유 조작 인터랙션
+  if (BAPE_INTERACT_MODELS.has(glbFile)) {
+    initBapeInteraction(entry, glbFile);
+  }
+
   glbRenderers[idx]=entry;
   return entry;
 }
@@ -1847,22 +2154,72 @@ function renderChronEntry(entry){
     } else {
       if(glbFile==="diamond_bape_buckle.glb" || pers.bapeMode){
         if(entry._baseModelY==null) entry._baseModelY = model.position.y;
-        // ── Bape Spring: snappy with one clean overshoot ──
+
+        // ── BAPE 3축 인터랙션 제어 ──
+        const bc = entry._bapeCtrl;
+        let userRotX = 0, userRotY = 0, userZoom = 1.0, tapBounceVal = 0;
+
+        if (bc && bc.active) {
+          // 플릭 관성 처리
+          if (bc.flickActive && !bc.dragging) {
+            bc.rotOffsetY += bc.velX;
+            bc.rotOffsetX += bc.velY;
+            bc.rotOffsetX = Math.max(-1.05, Math.min(1.05, bc.rotOffsetX));
+            // 마찰 감속
+            bc.velX *= 0.94;
+            bc.velY *= 0.94;
+            const speed = Math.sqrt(bc.velX * bc.velX + bc.velY * bc.velY);
+            if (speed < 0.0003) {
+              bc.flickActive = false;
+              bc.returnToAuto = true;
+              bc.springX.set(bc.rotOffsetX);
+              bc.springX.v = 0;
+              bc.springY.set(bc.rotOffsetY);
+              bc.springY.v = 0;
+            }
+          }
+
+          // 마그네틱 복귀 (손 놓으면 탱~ 하고 원래 자세로)
+          if (bc.returnToAuto && !bc.dragging && !bc.flickActive) {
+            bc.rotOffsetX = bc.springX.update(0, delta);
+            bc.rotOffsetY = bc.springY.update(0, delta);
+            if (bc.springX.settled && bc.springY.settled) {
+              bc.returnToAuto = false;
+              bc.rotOffsetX = 0;
+              bc.rotOffsetY = 0;
+            }
+          }
+
+          // 줌 스프링
+          const zoom = bc.zoomSpring.update(bc.zoomTarget, delta);
+          userZoom = zoom;
+          // 줌이 원래대로 복귀하지 않았으면 천천히 1.0으로
+          if (!bc.dragging && !bc.flickActive) {
+            bc.zoomTarget += (1.0 - bc.zoomTarget) * 0.008;
+          }
+
+          // 탭 바운스
+          tapBounceVal = bc.tapBounce.update(0, delta);
+
+          userRotX = bc.rotOffsetX;
+          userRotY = bc.rotOffsetY;
+        }
+
+        // ── Bape Spring: 음악 반응 (유저 조작과 합성) ──
         if(!entry._springScale) entry._springScale = new Spring({
           value: model.scale.x,
-          stiffness: 220,      // snappier attack
-          damping: 14,         // lower → visible overshoot, higher → tighter
+          stiffness: 220,
+          damping: 14,
           mass: 0.85,
           precision: 0.00005,
         });
-        if(!entry._springY) entry._springY = new Spring({
+        if(!entry._springYPos) entry._springYPos = new Spring({
           value: model.position.y,
           stiffness: 190,
           damping: 13,
           mass: 0.9,
           precision: 0.00005,
         });
-        // Rotation spring for subtle wobble recovery
         if(!entry._springRotZ) entry._springRotZ = new Spring({
           value: 0,
           stiffness: 260,
@@ -1872,22 +2229,22 @@ function renderChronEntry(entry){
         });
 
         const diamondPulse = Math.min(1, S.high * 0.72 + speakerPulse * 0.32 + LQ.highShimmer * 0.14);
-        const scaleTarget = baseScale * (1 + diamondPulse * 0.028);
-        const yTarget = entry._baseModelY + diamondPulse * 0.034;
+        const scaleTarget = baseScale * (1 + diamondPulse * 0.028 + Math.abs(tapBounceVal) * 0.04) * userZoom;
+        const yTarget = entry._baseModelY + diamondPulse * 0.034 + tapBounceVal * 0.015;
 
-        // Impulse kick on beat — gives the spring a sudden push
+        // Impulse kick on beat
         if(!entry._bapePrevBeat) entry._bapePrevBeat = 0;
         const beatRise = S.beat - entry._bapePrevBeat;
         if(beatRise > 0.35){
           const kick = beatRise * 0.42 + S.bass * 0.18;
           entry._springScale.impulse(kick * 0.12);
-          entry._springY.impulse(kick * 0.22);
+          entry._springYPos.impulse(kick * 0.22);
           entry._springRotZ.impulse(kick * 0.55);
         }
         entry._bapePrevBeat = S.beat;
 
         const newScale = entry._springScale.update(scaleTarget, delta);
-        const newY = entry._springY.update(yTarget, delta);
+        const newY = entry._springYPos.update(yTarget, delta);
         const rotZSpring = entry._springRotZ.update(0, delta);
 
         model.scale.setScalar(newScale);
@@ -1895,9 +2252,14 @@ function renderChronEntry(entry){
 
         const bandVal = S.high;
         const sign=GLB_SPECIAL_REVERSE.has(glbFile)?-1:1;
-        model.rotation.y += pers.bRot * (0.55 + bandVal * 1.35 + speakerPulse * 0.18) * sign;
-        model.rotation.x = Math.sin(entry.wPhase * pers.wFreq) * pers.wobble * (0.42 + bandVal * 1.1);
-        model.rotation.z = Math.cos(entry.wPhase * pers.wFreq * 0.68) * pers.wobble * 0.30 + rotZSpring * 0.012;
+        // 자동 회전 — 유저 조작 중이면 약해짐
+        const autoRotAmount = (bc && (bc.dragging || bc.flickActive || bc.returnToAuto)) ? 0.15 : 1.0;
+        // 자동 회전 누적 (기존 += 방식 유지하되 속도 조절)
+        if (!entry._autoRotY) entry._autoRotY = model.rotation.y;
+        entry._autoRotY += pers.bRot * (0.55 + bandVal * 1.35 + speakerPulse * 0.18) * sign * autoRotAmount;
+        model.rotation.y = entry._autoRotY + userRotY;
+        model.rotation.x = userRotX + Math.sin(entry.wPhase * pers.wFreq) * pers.wobble * (0.42 + bandVal * 1.1) * autoRotAmount;
+        model.rotation.z = Math.cos(entry.wPhase * pers.wFreq * 0.68) * pers.wobble * 0.30 * autoRotAmount + rotZSpring * 0.012;
       } else if(glbFile==="kiki.glb"){
         if(entry._baseModelY==null) entry._baseModelY = model.position.y;
         if(entry._kikiVocalSmooth==null) entry._kikiVocalSmooth = 0;
@@ -2764,28 +3126,37 @@ function stepFluidSim(delta){
   const N = FLUID_SIZE;
   const dt = Math.min(delta, 0.035);
   const isMic = (mode === MODE_MIC);
-  // wave propagation speed — 빠를수록 물처럼
-  const c = isMic ? 0.36 : 0.30;
-  // 쫀득: 마이크 모드에서는 더 강한 감쇠로 무분별한 진동 억제
-  const baseDamp = isMic ? 0.988 : 0.994;
-  const damp = baseDamp - _poolOnsetStrength * (isMic ? 0.003 : 0.006);
+  // wave propagation speed — 마이크: 훨씬 빠른 전파로 파동이 풀 전체로 순식간에 퍼짐
+  const c = isMic ? 0.52 : 0.30;
+  // 마이크 모드: 감쇠를 약간 낮춰서 진동이 더 오래 울리게
+  const baseDamp = isMic ? 0.991 : 0.994;
+  const damp = baseDamp - _poolOnsetStrength * (isMic ? 0.002 : 0.006);
 
-  // ── onset 임펄스 — 도입부/조용→큰소리 순간만 반동 ──
+  // ── onset 임펄스 — 마이크: 풀 전체에 동시다발적 진동 ──
   if (_poolOnsetStrength > 0.04) {
     const str = _poolOnsetStrength;
-    // 마이크 모드: beat가 있을 때만 임펄스 발생 (박자에 맞게)
-    const shouldPulse = isMic ? (S.beat > 0.25 || LQ.bassShock > 0.15) : true;
+    const shouldPulse = isMic ? (S.beat > 0.15 || LQ.bassShock > 0.10 || S.energy > 0.2) : true;
     if (shouldPulse) {
-      const spots = [
+      // 마이크: 8개 스팟으로 풀 전체가 동시에 울림
+      const spots = isMic ? [
         { fx: 0.5,  fy: 0.5  },  // 중앙
-        { fx: 0.25, fy: 0.35 },  // 좌상
-        { fx: 0.75, fy: 0.65 },  // 우하
+        { fx: 0.2,  fy: 0.2  },  // 좌상
+        { fx: 0.8,  fy: 0.2  },  // 우상
+        { fx: 0.2,  fy: 0.8  },  // 좌하
+        { fx: 0.8,  fy: 0.8  },  // 우하
+        { fx: 0.5,  fy: 0.15 },  // 상단 중앙
+        { fx: 0.5,  fy: 0.85 },  // 하단 중앙
+        { fx: 0.15, fy: 0.5  },  // 좌측 중앙
+      ] : [
+        { fx: 0.5,  fy: 0.5  },
+        { fx: 0.25, fy: 0.35 },
+        { fx: 0.75, fy: 0.65 },
       ];
       spots.forEach(sp => {
         const cx = Math.floor(N * sp.fx);
         const cy = Math.floor(N * sp.fy);
-        const r  = Math.floor(N * (0.06 + str * (isMic ? 0.14 : 0.10)));
-        const amp = str * (isMic ? 0.55 : 0.38);
+        const r  = Math.floor(N * (0.06 + str * (isMic ? 0.18 : 0.10)));
+        const amp = str * (isMic ? 0.72 : 0.38);
         for (let dy=-r; dy<=r; dy++) for (let dx=-r; dx<=r; dx++) {
           const d = Math.sqrt(dx*dx+dy*dy);
           if (d > r) continue;
@@ -2797,32 +3168,64 @@ function stepFluidSim(delta){
     }
   }
 
-  // bass shock — 강한 저음 타격 (마이크 모드: 더 민감, 더 강함)
-  const shockThresh = isMic ? 0.08 : 0.18;
+  // bass shock — 마이크: 벽까지 울리는 강력한 저음 타격
+  const shockThresh = isMic ? 0.05 : 0.18;
   if (LQ.bassShock > shockThresh) {
-    const cx = Math.floor(N * 0.5), cy = Math.floor(N * 0.5);
-    const r = Math.floor(N * (isMic ? 0.18 : 0.14));
-    const shockAmp = isMic ? 0.38 : 0.22;
-    for(let dy=-r;dy<=r;dy++) for(let dx=-r;dx<=r;dx++){
-      const d = Math.sqrt(dx*dx+dy*dy);
-      if(d>r) continue;
-      const xi=cx+dx, yi=cy+dy;
-      if(xi<0||xi>=N||yi<0||yi>=N) continue;
-      fluidH0[yi*N+xi] += LQ.bassShock * shockAmp * (1-d/r) * (1-d/r);
-    }
+    // 마이크: 중앙 + 4면 가장자리에서 동시 충격
+    const shockSpots = isMic ? [
+      { fx: 0.5, fy: 0.5 },
+      { fx: 0.08, fy: 0.5 },   // 좌벽
+      { fx: 0.92, fy: 0.5 },   // 우벽
+      { fx: 0.5, fy: 0.08 },   // 상벽
+      { fx: 0.5, fy: 0.92 },   // 하벽
+    ] : [{ fx: 0.5, fy: 0.5 }];
+    shockSpots.forEach(sp => {
+      const cx = Math.floor(N * sp.fx), cy = Math.floor(N * sp.fy);
+      const r = Math.floor(N * (isMic ? 0.20 : 0.14));
+      const shockAmp = isMic ? 0.48 : 0.22;
+      for(let dy=-r;dy<=r;dy++) for(let dx=-r;dx<=r;dx++){
+        const d = Math.sqrt(dx*dx+dy*dy);
+        if(d>r) continue;
+        const xi=cx+dx, yi=cy+dy;
+        if(xi<0||xi>=N||yi<0||yi>=N) continue;
+        fluidH0[yi*N+xi] += LQ.bassShock * shockAmp * (1-d/r) * (1-d/r);
+      }
+    });
   }
 
-  // 마이크 모드: beat에 맞춘 리드미컬한 파동 추가 (무분별한 진동 대신)
-  if (isMic && S.beat > 0.35) {
-    const cx = Math.floor(N * 0.5), cy = Math.floor(N * 0.5);
-    const r = Math.floor(N * 0.12);
-    const beatAmp = S.beat * 0.35;
-    for(let dy=-r;dy<=r;dy++) for(let dx=-r;dx<=r;dx++){
-      const d = Math.sqrt(dx*dx+dy*dy);
-      if(d>r) continue;
-      const xi=cx+dx, yi=cy+dy;
-      if(xi<1||xi>=N-1||yi<1||yi>=N-1) continue;
-      fluidH0[yi*N+xi] += beatAmp * (1-d/r) * (1-d/r);
+  // 마이크 모드: beat에 맞춘 다중 파동 — 풀이 노래를 느끼는 flow
+  if (isMic && S.beat > 0.20) {
+    // beat마다 랜덤 위치 6곳에서 동시에 파동
+    const beatSpots = [
+      { fx: 0.5, fy: 0.5 },
+      { fx: 0.3, fy: 0.3 },
+      { fx: 0.7, fy: 0.3 },
+      { fx: 0.3, fy: 0.7 },
+      { fx: 0.7, fy: 0.7 },
+      { fx: 0.5, fy: 0.25 },
+    ];
+    beatSpots.forEach(sp => {
+      const cx = Math.floor(N * sp.fx), cy = Math.floor(N * sp.fy);
+      const r = Math.floor(N * (0.08 + S.beat * 0.08));
+      const beatAmp = S.beat * 0.45;
+      for(let dy=-r;dy<=r;dy++) for(let dx=-r;dx<=r;dx++){
+        const d = Math.sqrt(dx*dx+dy*dy);
+        if(d>r) continue;
+        const xi=cx+dx, yi=cy+dy;
+        if(xi<1||xi>=N-1||yi<1||yi>=N-1) continue;
+        fluidH0[yi*N+xi] += beatAmp * (1-d/r) * (1-d/r);
+      }
+    });
+  }
+
+  // 마이크 모드: mid/high에 반응하는 지속적 수면 흐름 (노래를 느끼는 풀)
+  if (isMic && S.energy > 0.08) {
+    const flowTime = poolTime || 0;
+    const flowStr = S.mid * 0.18 + S.high * 0.12 + S.air * 0.08;
+    for(let y=2;y<N-2;y+=4) for(let x=2;x<N-2;x+=4) {
+      const nx = x/N, ny = y/N;
+      const wave = Math.sin(nx * 12 + flowTime * 3.5) * Math.cos(ny * 10 - flowTime * 2.8);
+      fluidH0[y*N+x] += wave * flowStr * 0.06;
     }
   }
 
@@ -3177,12 +3580,12 @@ function updateWaterSurface(delta){
   if(u['tFluid']) u['tFluid'].value = poolFluidTex;
   if(u['tNormal']) u['tNormal'].value = poolWaterNormals;
 
-  // 유체 시뮬 반영 강도 — 음악 반응 (마이크 모드: 훨씬 강하게)
+  // 유체 시뮬 반영 강도 — 음악 반응 (마이크 모드: 풀이 완전히 노래에 빠진 느낌)
   const isMicW = (mode === MODE_MIC);
   const fluidStrength = isMicW
-    ? (1.4 + LQ.subPressure * 5.0 + poolMouseSpeed * 2.5 + S.beat * 1.5)
+    ? (2.0 + LQ.subPressure * 7.0 + poolMouseSpeed * 3.0 + S.beat * 2.5 + S.mid * 1.5 + S.energy * 2.0)
     : (1.05 + LQ.subPressure * 2.8 + poolMouseSpeed * 2.2 + S.beat * 0.72);
-  if(u['uFluidStrength']) u['uFluidStrength'].value += (fluidStrength - u['uFluidStrength'].value) * (isMicW ? 0.28 : 0.18);
+  if(u['uFluidStrength']) u['uFluidStrength'].value += (fluidStrength - u['uFluidStrength'].value) * (isMicW ? 0.35 : 0.18);
 
   if(u['uSub']) u['uSub'].value = isMicW ? Math.min(S.sub * 2.0, 1) : S.sub;
   if(u['uMid']) u['uMid'].value = isMicW ? Math.min(S.mid * 1.8, 1) : S.mid;
@@ -3232,30 +3635,71 @@ function updateWaterSurface(delta){
     m.opacity = 0.18 + LQ.midDensity * 0.06 + LQ.highShimmer * 0.03;
   }
 
-  poolGlassWalls.forEach((wall)=>{
+  poolGlassWalls.forEach((wall, wi)=>{
     const m = wall.material;
     if(!m) return;
     m.color.setRGB(0.86 + pr * 0.06, 0.94 + pg * 0.05, 0.99);
-    m.opacity = 0.18 + LQ.highShimmer * 0.07 + S.air * 0.04 + S.beat * 0.02;
+    const isMicWall = (mode === MODE_MIC);
+    // 마이크: 벽도 beat에 맞춰 밝아지고 진동
+    const wallBeatPulse = isMicWall ? (S.beat * 0.12 + LQ.bassShock * 0.10) : 0;
+    m.opacity = 0.18 + LQ.highShimmer * 0.07 + S.air * 0.04 + S.beat * 0.02 + wallBeatPulse;
+    // 마이크: 벽 위치 미세 진동 (안쪽으로 찔끔 움직이는 느낌)
+    if(isMicWall && wall._basePos) {
+      const vibAmt = S.beat * 0.06 + LQ.bassShock * 0.08 + S.sub * 0.03;
+      const vibPhase = (poolTime || 0) * 18 + wi * 1.57;
+      const vibX = Math.sin(vibPhase) * vibAmt * wall._vibDir.x;
+      const vibZ = Math.sin(vibPhase * 1.3) * vibAmt * wall._vibDir.z;
+      wall.position.x = wall._basePos.x + vibX;
+      wall.position.z = wall._basePos.z + vibZ;
+    } else if(isMicWall && !wall._basePos) {
+      wall._basePos = wall.position.clone();
+      // 벽 방향에 따른 진동 방향 (법선 방향)
+      const nx = Math.abs(wall.position.x) > Math.abs(wall.position.z) ? Math.sign(wall.position.x) : 0;
+      const nz = Math.abs(wall.position.z) > Math.abs(wall.position.x) ? Math.sign(wall.position.z) : 0;
+      wall._vibDir = { x: nx || 0.5, z: nz || 0.5 };
+    }
   });
 
-  poolWallPanels.forEach((wall)=>{
+  poolWallPanels.forEach((wall, wi)=>{
     const m = wall.material;
     if(!m) return;
+    const isMicPanel = (mode === MODE_MIC);
     m.color.setRGB(
       Math.min(1, 0.28 + pr * 0.18),
       Math.min(1, 0.70 + pg * 0.16),
       Math.min(1, 0.90 + pb * 0.10)
     );
     m.emissive.setRGB(0.05 + pr*0.06, 0.22 + pg*0.10, 0.30 + pb*0.08);
-    m.opacity = 0.24 + LQ.midDensity * 0.10 + LQ.highShimmer * 0.08 + S.beat * 0.03;
-    m.emissiveIntensity = 0.28 + LQ.highShimmer * 0.26 + S.air * 0.14 + S.beat * 0.06;
+    // 마이크: 벽 패널도 beat/bass에 맞춰 빛이 커짐
+    const panelBeatGlow = isMicPanel ? (S.beat * 0.16 + LQ.bassShock * 0.14 + S.sub * 0.08) : 0;
+    m.opacity = 0.24 + LQ.midDensity * 0.10 + LQ.highShimmer * 0.08 + S.beat * 0.03 + panelBeatGlow;
+    m.emissiveIntensity = 0.28 + LQ.highShimmer * 0.26 + S.air * 0.14 + S.beat * 0.06
+      + (isMicPanel ? (S.beat * 0.35 + LQ.bassShock * 0.28 + S.mid * 0.15) : 0);
+    // 마이크: 벽 패널 위치 진동
+    if(isMicPanel && wall._basePos) {
+      const vibAmt = S.beat * 0.05 + LQ.bassShock * 0.06 + S.bass * 0.025;
+      const vibPhase = (poolTime || 0) * 22 + wi * 2.09;
+      wall.position.x = wall._basePos.x + Math.sin(vibPhase) * vibAmt * (wall._vibDir?.x || 0);
+      wall.position.z = wall._basePos.z + Math.cos(vibPhase * 0.8) * vibAmt * (wall._vibDir?.z || 0);
+    } else if(isMicPanel && !wall._basePos) {
+      wall._basePos = wall.position.clone();
+      const nx = Math.abs(wall.position.x) > Math.abs(wall.position.z) ? Math.sign(wall.position.x) : 0;
+      const nz = Math.abs(wall.position.z) > Math.abs(wall.position.x) ? Math.sign(wall.position.z) : 0;
+      wall._vibDir = { x: nx || 0.5, z: nz || 0.5 };
+    }
   });
 
-  poolWallCaustics.forEach((wall)=>{
+  poolWallCaustics.forEach((wall, wi)=>{
     const m = wall.material;
     if(!m) return;
-    m.opacity = 0.08 + LQ.highShimmer * 0.16 + S.air * 0.07 + poolMouseSpeed * 0.05 + S.beat * 0.04;
+    const isMicC = (mode === MODE_MIC);
+    const caustBeat = isMicC ? (S.beat * 0.18 + LQ.bassShock * 0.14 + S.mid * 0.08) : 0;
+    m.opacity = 0.08 + LQ.highShimmer * 0.16 + S.air * 0.07 + poolMouseSpeed * 0.05 + S.beat * 0.04 + caustBeat;
+    // 마이크: caustics 패턴 진동 — scale pulse
+    if(isMicC) {
+      const pulseScale = 1 + S.beat * 0.04 + LQ.bassShock * 0.03;
+      wall.scale.set(pulseScale, pulseScale, 1);
+    }
   });
 
   // ── Dawn water: 물색이 맑고 투명하게 ──
@@ -3432,9 +3876,14 @@ function renderPoolScene(delta){
   }
 
   if(piaLoaded&&piaModel){
-    piaModel.position.y=piaModel._baseY+Math.sin(poolTime*0.8)*0.035*(1+LQ.subPressure*2.0)+S.beat*0.055+LQ.bassShock*0.08;
-    piaModel.rotation.z=Math.sin(poolTime*0.6)*0.008*(1+LQ.subPressure*2.2);
-    piaModel.rotation.x=Math.PI*0.02+Math.cos(poolTime*0.5)*0.007*(1+LQ.midDensity*1.4);
+    const isMicPia = (mode === MODE_MIC);
+    const subMul = isMicPia ? 3.5 : 1.0;
+    const beatMul = isMicPia ? 2.5 : 1.0;
+    piaModel.position.y=piaModel._baseY+Math.sin(poolTime*0.8)*0.035*(1+LQ.subPressure*2.0*subMul)+S.beat*0.055*beatMul+LQ.bassShock*0.08*beatMul;
+    piaModel.rotation.z=Math.sin(poolTime*0.6)*0.008*(1+LQ.subPressure*2.2*subMul)
+      + (isMicPia ? S.beat * 0.025 : 0);
+    piaModel.rotation.x=Math.PI*0.02+Math.cos(poolTime*0.5)*0.007*(1+LQ.midDensity*1.4)
+      + (isMicPia ? S.mid * 0.012 : 0);
     // 수면 caustics 물빛 — 아주 약하게 fluctuate
     piaModel.traverse((c)=>{
       if(!c.isMesh||!c.material) return;
@@ -3450,21 +3899,25 @@ function renderPoolScene(delta){
 
   if(poolScene._causticsLight){
     const l=poolScene._causticsLight;
-    // 수면 물빛 — mid + shimmer에 반응, 고급스럽게 절제
-    l.intensity = 1.0 + LQ.midDensity*1.8 + LQ.highShimmer*1.2 + poolMouseSpeed*0.8 + S.beat*0.6;
+    const isMicL = (mode === MODE_MIC);
+    // 마이크: caustics 조명이 beat에 맞춰 확 밝아짐
+    l.intensity = 1.0 + LQ.midDensity*1.8 + LQ.highShimmer*1.2 + poolMouseSpeed*0.8 + S.beat*0.6
+      + (isMicL ? (S.beat * 3.0 + LQ.bassShock * 2.5 + S.mid * 1.2) : 0);
     l.color.setRGB(0.45+curPal.r/255*0.18, 0.88+curPal.g/255*0.10, 1.0);
-    // 위치를 약간씩 움직여 caustics 이동 효과
     l.position.x = Math.sin(poolTime*0.4)*1.0;
     l.position.z = Math.cos(poolTime*0.32)*0.8;
   }
   if(poolScene._waterLight){
     const l=poolScene._waterLight;
-    l.intensity=2.5+S.sub*4.5+LQ.midDensity*2.8+LQ.highShimmer*2.0+poolMouseSpeed*2.0+S.beat*1.5;
+    const isMicL = (mode === MODE_MIC);
+    l.intensity=2.5+S.sub*4.5+LQ.midDensity*2.8+LQ.highShimmer*2.0+poolMouseSpeed*2.0+S.beat*1.5
+      + (isMicL ? (S.beat * 4.0 + S.energy * 3.0 + LQ.bassShock * 3.0) : 0);
     l.color.setRGB(0.30+curPal.r/255*0.25,0.82+curPal.g/255*0.16,1.0);
   }
   if(poolScene._beatLight){
     const l=poolScene._beatLight;
-    l.intensity=S.beat*9.0+LQ.bassShock*7.0;
+    const isMicL = (mode === MODE_MIC);
+    l.intensity = S.beat*9.0+LQ.bassShock*7.0 + (isMicL ? (S.beat * 8.0 + S.sub * 4.0) : 0);
     l.color.setRGB(0.40+curPal.r/255*0.30,0.92,1.0);
   }
   if(poolScene._caustic){
