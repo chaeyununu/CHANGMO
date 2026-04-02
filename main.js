@@ -1,4700 +1,6424 @@
-/**
- * CHANGMO — main.js
- * Three.js r163 ESM 모듈 방식으로 완전 재작성
- * - importmap 기반 import
- * - Water, GLTFLoader, EffectComposer, RenderPass, ShaderPass 모두 ESM
- * - ALBUM 패널: 세로 리스트로 변경 (가로 드래그 제거)
- * - POOL: 밝은 하늘 + 떠있는 풀박스 + 고급 water
- * - 3→4 패널 스와이프 완전 동작
- */
-
 import * as THREE from 'three';
-import { GLTFLoader }      from 'three/addons/loaders/GLTFLoader.js';
-import { DRACOLoader }     from 'three/addons/loaders/DRACOLoader.js';
-import { KTX2Loader }      from 'three/addons/loaders/KTX2Loader.js';
+import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
 import { clone as cloneSkeleton } from 'three/addons/utils/SkeletonUtils.js';
-import { EffectComposer }  from 'three/addons/postprocessing/EffectComposer.js';
-import { RenderPass }      from 'three/addons/postprocessing/RenderPass.js';
-import { ShaderPass }      from 'three/addons/postprocessing/ShaderPass.js';
 
-"use strict";
+const STORAGE_KEY = 'mind-room-memos-v3';
+const STORAGE_PAYLOAD_VERSION = 4;
+const NON_DESK_SCALE_MULTIPLIER = 2;
 
-// ══════════════════════════════════════════════════════
-// 오디오 / 스펙트럼 상태
-// ══════════════════════════════════════════════════════
-const S = {
-  sub:0, bass:0, mid:0, high:0, air:0, energy:0, beat:0,
-  mx: window.innerWidth * 0.5, my: window.innerHeight * 0.5,
-};
-const T  = { sub:0, bass:0, mid:0, high:0, air:0, energy:0 };
-const SM = { sub:.34, bass:.28, mid:.20, high:.16, air:.12, energy:.20, beat:.32 };
+/* ═══ Physics & Interaction Constants ═══ */
+const PHYSICS_FRICTION_RECENT = 0.96;
+const PHYSICS_FRICTION_OLD = 0.78;
+const PHYSICS_FRICTION_MID = 0.88;
+const PHYSICS_AGE_RECENT_HOURS = 72;
+const PHYSICS_AGE_OLD_DAYS = 3;
+const PHYSICS_TILT_FORCE = 0.044;
+const PHYSICS_TILT_SMOOTHING = 0.22;
+const PHYSICS_REST_THRESHOLD = 0.0008;
+const PHYSICS_MAX_VELOCITY = 0.35;
+const PHYSICS_THROW_MULTIPLIER = 0.018;
+const PHYSICS_THROW_FRICTION = 0.92;
+const PHYSICS_BOUNCE_FACTOR = 0.3;
+const PHYSICS_ROOM_BOUNDS = { minX: -8.5, maxX: 8.5, minZ: -5.8, maxZ: 5.4 };
+const PHYSICS_SEPARATION_RADIUS = 1.2;
+const PHYSICS_SEPARATION_FORCE = 0.012;
+const LONG_PRESS_MS = 500;
+const DRAG_DEAD_ZONE = 6;
+const VELOCITY_HISTORY_SIZE = 6;
+const IDB_DB_NAME = 'mind-room-db';
+const IDB_STORE_NAME = 'app-data';
+const IDB_DB_VERSION = 1;
 
-const LQ = {
-  subPressure:0, subPressureTarget:0,
-  midDensity:0,  midDensityTarget:0,
-  highShimmer:0, highShimmerTarget:0,
-  airGlow:0,     airGlowTarget:0,
-  refractionPhase:0,
-  surfaceTension:0, surfaceTensionTarget:0,
-  bassShock:0,   bassShockTarget:0,
-};
+const SILENCE_MS = 1800;
+const SPEECH_FINALIZE_GRACE_MS = 240;
+const RESTART_RECOGNITION_DELAY_MS = 35;
+const HYBRID_RECOGNITION_LANG = 'ko-KR';
+const CLUTTER_MERGE_DAYS = 5;
+const ROUTINE_SCATTER_DAYS = 3;
+const EMOTION_DECAY_DAYS = 7;
+const NEGATIVE_EMOTION_VISIBLE_MS = 6500;
+const POSITIVE_EMOTION_VISIBLE_MS = 5200;
+const VISUAL_CHECK_MS = 4000;
+const EMOTION_REWARD_DROP_MS = 920;
+const EMOTION_REWARD_DROP_HEIGHT = 1.55;
+const CLUTTER_DROP_MS = 980;
+const ROUTINE_DROP_MS = 920;
+const ROUTINE_DROP_HEIGHT = 1.38;
+const SURFACE_DROP_MS = 920;
+const SURFACE_DROP_HEIGHT = 1.44;
+const FLOOR_TUMBLER_DROP_MS = 1020;
+const FLOOR_TUMBLER_DROP_HEIGHT = 5.2;
+const CLUTTER_DROP_LOW_HEIGHT = 0.88;
+const CLUTTER_DROP_HIGH_HEIGHT = 5.85;
 
-let audioCtx, analyser, freqData, timeData;
-let micStream, srcNode;
-let fileCreated = false, fileSrc = null;
-const MODE_FILE = "file", MODE_MIC = "mic";
-let mode = MODE_FILE;
-let isPlaying = false;
-const audioEl = document.getElementById("audio-player");
-
-function ensureCtx() {
-  if (!audioCtx) {
-    audioCtx = new (window.AudioContext || window.webkitAudioContext)();
-    analyser = audioCtx.createAnalyser();
-    analyser.fftSize = 2048;
-    analyser.smoothingTimeConstant = 0.55;
-    freqData = new Uint8Array(analyser.frequencyBinCount);
-    timeData = new Uint8Array(analyser.fftSize);
-  }
-  if (audioCtx.state === "suspended") audioCtx.resume();
-}
-function dropSrc() { if (srcNode) { try { srcNode.disconnect(); } catch(_) {} } }
-
-function bandRMS(lo, hi) {
-  if (!analyser) return 0;
-  const ny = audioCtx.sampleRate / 2, bw = ny / freqData.length;
-  const li = Math.max(0, Math.floor(lo/bw));
-  const hi2 = Math.min(freqData.length-1, Math.ceil(hi/bw));
-  let s=0, n=hi2-li+1;
-  for (let i=li; i<=hi2; i++) s += freqData[i]*freqData[i];
-  return Math.sqrt(s/n)/255;
-}
-let prevSub=0, beatCool=0, prevBass=0, bassHitCool=0;
-// pool 물 도입부 감지용
-let _poolEnergySmooth = 0;   // 느리게 추적하는 에너지 baseline
-let _poolOnsetCool    = 0;   // onset 쿨다운 (연속 발화 방지)
-let _poolOnsetStrength= 0;   // 현재 onset 강도 (쫀득한 반동에 쓰임)
-
-
-function analyze() {
-  if (!analyser) { T.sub=T.bass=T.mid=T.high=T.air=T.energy=0; return; }
-  analyser.getByteFrequencyData(freqData);
-  const sv=bandRMS(20,70), bv=bandRMS(70,300),
-        mv=bandRMS(300,2500), hv=bandRMS(2500,8000), av=bandRMS(8000,20000);
-
-  // 마이크 모드: 훨씬 더 민감하게 증폭
-  const isMic = (mode === MODE_MIC);
-  const subMul  = isMic ? 3.2  : 1.35;
-  const bassMul = isMic ? 2.8  : 1.25;
-  const midMul  = isMic ? 2.6  : 1.15;
-  const highMul = isMic ? 2.4  : 1.10;
-  const airMul  = isMic ? 2.2  : 1.05;
-
-  T.sub=Math.min(sv*subMul,1); T.bass=Math.min(bv*bassMul,1); T.mid=Math.min(mv*midMul,1);
-  T.high=Math.min(hv*highMul,1); T.air=Math.min(av*airMul,1);
-  T.energy=Math.min(sv*.38+bv*.30+mv*.18+hv*.09+av*.05,1);
-  if(isMic) T.energy = Math.min(T.energy * 2.4, 1);
-
-  // 마이크 모드: beat 감지 임계값 낮춤
-  const beatThresh  = isMic ? 0.06 : 0.14;
-  const beatDelta   = isMic ? 0.03 : 0.08;
-  const beatCoolMax = isMic ? 4    : 7;
-
-  beatCool=Math.max(0,beatCool-1);
-  if (sv>beatThresh&&sv-prevSub>beatDelta&&beatCool===0) { S.beat=1.0; beatCool=beatCoolMax; }
-  prevSub=sv;
-
-  const bassHitThresh = isMic ? 0.08 : 0.20;
-  const bassHitDelta  = isMic ? 0.04 : 0.10;
-  const bassHitCoolMax= isMic ? 6    : 12;
-
-  bassHitCool=Math.max(0,bassHitCool-1);
-  if (bv>bassHitThresh&&bv-prevBass>bassHitDelta&&bassHitCool===0) {
-    LQ.bassShockTarget=1.0; bassHitCool=bassHitCoolMax;
-  }
-  prevBass=bv;
-}
-
-function smooth() {
-  // 마이크 모드: 훨씬 빠른 반응 (smoothing factor 증가)
-  const isMic = (mode === MODE_MIC);
-  const mf = isMic ? 2.2 : 1.0; // mic factor
-
-  S.sub    +=(T.sub    -S.sub)   *SM.sub   *mf;
-  S.bass   +=(T.bass   -S.bass)  *SM.bass  *mf;
-  S.mid    +=(T.mid    -S.mid)   *SM.mid   *mf;
-  S.high   +=(T.high   -S.high)  *SM.high  *mf;
-  S.air    +=(T.air    -S.air)   *SM.air   *mf;
-  S.energy +=(T.energy -S.energy)*SM.energy*mf;
-  S.beat   +=(0        -S.beat)  *SM.beat  *(isMic ? 0.7 : 1.0); // beat decay 느리게 (더 오래 유지)
-
-  LQ.subPressureTarget = S.sub * (isMic ? 1.6 : 0.92) + S.bass * (isMic ? 0.5 : 0.20);
-  LQ.subPressure += (LQ.subPressureTarget - LQ.subPressure) * (isMic ? 0.82 : 0.62);
-  LQ.subPressure += (0 - LQ.subPressure) * 0.09;
-
-  LQ.midDensityTarget = S.mid * (isMic ? 1.4 : 0.78) + S.bass * (isMic ? 0.7 : 0.35);
-  LQ.midDensity += (LQ.midDensityTarget - LQ.midDensity) * (isMic ? 0.48 : 0.28);
-
-  LQ.highShimmerTarget = S.high * (isMic ? 1.3 : 0.72) + S.air * (isMic ? 0.9 : 0.48);
-  LQ.highShimmer += (LQ.highShimmerTarget - LQ.highShimmer) * (isMic ? 0.55 : 0.36);
-  LQ.highShimmer += (0 - LQ.highShimmer) * 0.06;
-
-  LQ.airGlowTarget = S.air * (isMic ? 1.2 : 0.65) + S.high * (isMic ? 0.9 : 0.52);
-  LQ.airGlow += (LQ.airGlowTarget - LQ.airGlow) * (isMic ? 0.22 : 0.12);
-
-  LQ.surfaceTensionTarget = S.high * (isMic ? 1.1 : 0.58) + S.air * (isMic ? 1.0 : 0.55);
-  LQ.surfaceTension += (LQ.surfaceTensionTarget - LQ.surfaceTension) * (isMic ? 0.58 : 0.40);
-  LQ.surfaceTension += (0 - LQ.surfaceTension) * 0.09;
-
-  LQ.bassShock += (LQ.bassShockTarget - LQ.bassShock) * (isMic ? 0.78 : 0.62);
-  LQ.bassShock += (0 - LQ.bassShock) * (isMic ? 0.10 : 0.14);
-  LQ.bassShockTarget *= (isMic ? 0.45 : 0.55);
-
-  LQ.refractionPhase += 0.014 + S.energy * 0.035 + LQ.highShimmer * 0.024;
-
-  // ── Pool onset detector: 조용→큰소리 순간 감지 ──
-  // baseline은 느리게 추적 (약 2~3초 평균)
-  _poolEnergySmooth += (S.energy - _poolEnergySmooth) * (isMic ? 0.024 : 0.008);
-  _poolOnsetCool = Math.max(0, _poolOnsetCool - 1);
-  const _energyRise = S.energy - _poolEnergySmooth;
-  // 마이크 모드: 아주 낮은 임계값 + 짧은 쿨다운 → 거의 모든 박자에 반응
-  const onsetThresh  = isMic ? 0.025 : 0.10;
-  const onsetCoolMax = isMic ? 10    : 40;   // 10프레임 = ~0.16초 쿨다운
-  if (_energyRise > onsetThresh && _poolOnsetCool === 0) {
-    const beatSync = isMic ? (S.beat > 0.2 ? 1.8 : 1.0) : 1.0;
-    _poolOnsetStrength = Math.min(1.0, (_energyRise * (isMic ? 6.5 : 3.5) + S.bass * (isMic ? 1.6 : 0.6)) * beatSync);
-    _poolOnsetCool = onsetCoolMax;
-  }
-  // onset 강도 감쇠 — 마이크: 적절히 빠르게 감쇠하되 여운 남기기
-  _poolOnsetStrength *= (isMic ? 0.85 : 0.94);
-}
-
-const root = document.documentElement;
-function updateCSS() {
-  root.style.setProperty("--sub",    S.sub.toFixed(4));
-  root.style.setProperty("--bass",   S.bass.toFixed(4));
-  root.style.setProperty("--mid",    S.mid.toFixed(4));
-  root.style.setProperty("--high",   S.high.toFixed(4));
-  root.style.setProperty("--air",    S.air.toFixed(4));
-  root.style.setProperty("--energy", S.energy.toFixed(4));
-  root.style.setProperty("--beat",   S.beat.toFixed(4));
-  root.style.setProperty("--mx", (S.mx-window.innerWidth*.5).toFixed(2)+"px");
-  root.style.setProperty("--my", (S.my-window.innerHeight*.5).toFixed(2)+"px");
-  root.style.setProperty("--lq-sub",     LQ.subPressure.toFixed(4));
-  root.style.setProperty("--lq-mid",     LQ.midDensity.toFixed(4));
-  root.style.setProperty("--lq-shimmer", LQ.highShimmer.toFixed(4));
-  root.style.setProperty("--lq-air",     LQ.airGlow.toFixed(4));
-  root.style.setProperty("--lq-surface", LQ.surfaceTension.toFixed(4));
-  root.style.setProperty("--lq-shock",   LQ.bassShock.toFixed(4));
-}
-
-const hudFills = {
-  sub:  document.getElementById("hud-sub-fill"),
-  bass: document.getElementById("hud-bass-fill"),
-  mid:  document.getElementById("hud-mid-fill"),
-  high: document.getElementById("hud-high-fill"),
-  air:  document.getElementById("hud-air-fill"),
+const DESK_ASSET_Y_OFFSET = {
+  note: 0.1,
+  scribble: -0.78,
+  tumbler: -0.05,
 };
 
-function updateHUD() {
-  const set=(el,v)=>{ if(el) el.style.width=(v*100).toFixed(1)+"%"; };
-  set(hudFills.sub,S.sub); set(hudFills.bass,S.bass);
-  set(hudFills.mid,S.mid); set(hudFills.high,S.high); set(hudFills.air,S.air);
-
-  const poolSub  = document.getElementById("pool-hud-sub");
-  const poolMid  = document.getElementById("pool-hud-mid");
-  const poolAir  = document.getElementById("pool-hud-air");
-  const beatChip = document.getElementById("pool-chip-beat");
-  const waveChip = document.getElementById("pool-chip-wave");
-  set(poolSub,S.sub); set(poolMid,S.mid); set(poolAir,S.air);
-  if(beatChip) beatChip.classList.toggle("beat-active", S.beat > 0.48 || LQ.bassShock > 0.20);
-  if(waveChip) waveChip.classList.toggle("beat-active", LQ.highShimmer > 0.20 || LQ.surfaceTension > 0.18);
-}
-
-// ── 팔레트
-const PAL = {
-  base: { r:110, g:90,  b:240 },
-  p0:   { r:200, g:20,  b:20  }, p1:  { r:255, g:0,   b:0   },
-  p2:   { r:240, g:108, b:5   }, p3:  { r:21,  g:150, b:151 },
-  p4:   { r:14,  g:98,  b:132 }, p5:  { r:130, g:70,  b:255 },
-  p6:   { r:90,  g:40,  b:180 }, p7:  { r:60,  g:75,  b:160 },
-  p8:   { r:18,  g:55,  b:220 }, p9:  { r:95,  g:45,  b:215 },
-  p10:  { r:55,  g:155, b:255 }, p11: { r:75,  g:205, b:255 },
+const DESK_LAYOUT = {
+  x: -6.95,
+  floorY: 0.02,
+  backInset: 5.55,
 };
-let curPal = { r:110, g:90, b:240 };
-let micPhase=0, micVE=0;
 
-function lerpC(a,b,t) {
-  t=Math.max(0,Math.min(1,t));
-  return { r:a.r+(b.r-a.r)*t, g:a.g+(b.g-a.g)*t, b:a.b+(b.b-a.b)*t };
-}
-const SEG     = [0, 0.08, 0.18, 0.28, 0.40, 0.49, 0.52, 0.60, 0.69, 0.79, 0.89, 1.0];
-const SEG_PAL = [PAL.p0, PAL.p1, PAL.p2, PAL.p3, PAL.p4, PAL.p5, PAL.p6, PAL.p7, PAL.p8, PAL.p9, PAL.p10, PAL.p11];
+const DESK_TOP_ITEM_WORLD_COMP = {
+  x: 0.5,
+  z: 0,
+};
 
-function getPalette(p) {
-  for (let i=0; i<SEG.length-1; i++) {
-    if (p <= SEG[i+1]) {
-      const t = (p - SEG[i]) / (SEG[i+1] - SEG[i]);
-      return lerpC(SEG_PAL[i], SEG_PAL[i+1], t);
-    }
-  }
-  return PAL.p10;
-}
+const PREVIOUS_LAYOUT_CACHE_SLOT_MIGRATION_VERSION = 'non-desk-slot-baked-left-v2-right-tighten-floor-tumbler-inset-v5-floor-tumbler-bottom-right-extra-inset';
+const LAYOUT_CACHE_SLOT_MIGRATION_VERSION = 'non-desk-slot-baked-left-v2-right-tighten-floor-tumbler-inset-v7-floor-front-priority-v1-floor-tumbler-right-hard-inset-v2';
+const NON_DESK_SLOT_BAKED_X_SHIFT = -0.48;
+const RIGHT_SIDE_RANGE_TIGHTEN_START_X = 5.05;
+const RIGHT_SIDE_RANGE_TIGHTEN_EXTRA_START_X = 6.2;
+const RIGHT_SIDE_RANGE_TIGHTEN_X = -0.34;
+const RIGHT_SIDE_RANGE_TIGHTEN_EXTRA_X = -0.18;
+const FLOOR_TUMBLER_RIGHT_INSET_MIN_X = 3.55;
+const FLOOR_TUMBLER_RIGHT_INSET_X = -1.08;
+const FLOOR_TUMBLER_BOTTOM_RIGHT_EXTRA_MIN_X = 4.1;
+const FLOOR_TUMBLER_BOTTOM_RIGHT_EXTRA_MIN_Z = 1.55;
+const FLOOR_TUMBLER_BOTTOM_RIGHT_EXTRA_INSET_X = -1.42;
+const FLOOR_TUMBLER_FAR_RIGHT_HARD_MIN_X = 5.05;
+const FLOOR_TUMBLER_FAR_RIGHT_HARD_INSET_X = -1.08;
+const FLOOR_TUMBLER_MIN_DISTANCE = 3.05;
+const FLOOR_TUMBLER_CENTER_PULL_X = 0.42;
 
-function updatePalette() {
-  let target = PAL.base;
-  if (mode===MODE_FILE && audioEl.duration>0 && isPlaying) {
-    target = getPalette(audioEl.currentTime / audioEl.duration);
-    const pb = document.getElementById("progress-bar-inner");
-    if (pb) {
-      pb.style.width = (audioEl.currentTime/audioEl.duration*100).toFixed(2)+"%";
-      document.getElementById("progress-bar-wrap").style.opacity="1";
-    }
-  } else if (mode===MODE_MIC) {
-    micVE += S.energy*0.0004; micPhase += 0.00008;
-    const p = Math.min(((Math.sin(micPhase*Math.PI*2)*0.5+0.5)*0.7+micVE*0.3)%1.0,1.0);
-    target = getPalette(p);
-    const wrap=document.getElementById("progress-bar-wrap"); if(wrap) wrap.style.opacity="0";
-  } else {
-    const wrap=document.getElementById("progress-bar-wrap"); if(wrap) wrap.style.opacity="0";
-  }
-  const spd = 0.055;
-  curPal.r+=(target.r-curPal.r)*spd;
-  curPal.g+=(target.g-curPal.g)*spd;
-  curPal.b+=(target.b-curPal.b)*spd;
-  root.style.setProperty("--palette-r", curPal.r.toFixed(0));
-  root.style.setProperty("--palette-g", curPal.g.toFixed(0));
-  root.style.setProperty("--palette-b", curPal.b.toFixed(0));
+const MAX_DESK_NOTE_COUNT = 4;
+const MAX_DESK_TUMBLER_COUNT = 5;
 
-  // ── 배경 색상 반응: piano(2번째) & scene/albums(3번째) 패널 ──
-  updatePanelBackgrounds();
-}
+const CATEGORY_INFO = {
+  emotion: { label: '감정' },
+  record: { label: '기록' },
+  clutter: { label: '잡생각' },
+  routine: { label: '정리' },
+  snack: { label: '다짐' },
+};
 
-// 패널 배경 색상 음악 반응 (은은하고 고급스러운 색 변화)
-let _pianoHue = 0, _sceneHue = 0;
-// 3번째 패널 리듬 색상 전환용
-let _sceneColorPhase = 0;
-let _sceneColorSat   = 55;
-let _sceneColorLum   = 28;
-let _sceneAccum      = 0;
-let _scenePrevBeat   = 0;
+const ASSET_FILES = {
+  desk: 'desk.glb',
+  note: 'note.glb',
+  scribble: 'scribble_note.glb',
+  clothesFolded: 'clothes_folded.glb',
+  clothesScattered: 'clothes_scattered.glb',
+  paperSingle: 'paper_single.glb',
+  paperSingle2: 'paper_single2.glb',
+  paperPile: 'paper_pile.glb',
+  snack: 'snack.glb',
+  strawberry: 'strawberry.glb',
+  jar: 'jar.glb',
+  burn: 'burn.glb',
+  tumbler: 'tumbler.glb',
+};
 
-// ── 3번 패널 — 고급스럽고 부드러운 색 변화 (곡 진행 연동) ──
-let _sMoodEnergy = 0;
-let _sMoodMid    = 0;
-let _sMoodAir    = 0;
-let _sMoodBass   = 0;
-let _sBloom      = 0;
-let _sHueFast    = 210;
-let _sHueSlow    = 210;
-let _sHueDrift   = 210;
-let _sSatFast    = 32;
-let _sSatSlow    = 32;
-let _sLumFast    = 10;
-let _sLumSlow    = 10;
-let _sSceneT     = 0;
-// 팔레트 연동 보조 변수
-let _sPalR = 110, _sPalG = 90, _sPalB = 240;
-let _sPalBloom = 0;  // 팔레트 색의 부드러운 bloom 강도
+const TARGET_MAX_DIMENSION = {
+  desk: 7.75,
+  note: 1.64,
+  scribble: 1.98,
+  clothesFolded: 1.12,
+  clothesScattered: 1.4,
+  paperSingle: 0.58,
+  paperSingle2: 0.54,
+  paperPile: 1.0,
+  snack: 0.95,
+  strawberry: 0.92,
+  jar: 0.59,
+  burn: 0.99,
+  tumbler: 1.18,
+};
 
-// ── 3번 패널 — 서지(물들기) 효과: 진짜 확 커지는 순간에만 은은하게 물듦 ──
-let _sSurgeStrength = 0;        // 현재 서지 강도 (0~1)
-let _sSurgeCool     = 0;        // 쿨다운 (프레임)
-let _sSurgeEnergyBaseline = 0;  // 느린 에너지 평균 (~4초)
-let _sSurgeBassBaseline   = 0;  // 느린 베이스 평균
-let _sSurgePrevEnergy     = 0;
-let _sSurgePrevBass       = 0;
-// 서지 시 현재 팔레트에서 파생된 색 (별도 팔레트 없음 — 촌스러움 방지)
-let _sSurgeTintR = 0, _sSurgeTintG = 0, _sSurgeTintB = 0;
+const FLOOR_ONLY_SCALE_MULTIPLIERS = Object.freeze({
+  paperSingle: 1.35,
+  paperSingle2: 1.35,
+  paperPile: 1.3,
+  snack: 1.16,
+  strawberry: 1.16,
+  jar: 1.14,
+  burn: 1.16,
+  tumbler: 1.5,
+  clothesFolded: 1.12,
+  clothesScattered: 1.12,
+});
 
-// ── 추가 그라데이션 색상 쌍 (3번 패널 전용) ──
-const SCENE_GRAD_PAIRS = [
-  { a:{r:160,g:135,b:100}, b:{r:70,g:130,b:140} },   // warm muted gold → teal
-  { a:{r:80,g:70,b:150},   b:{r:50,g:100,b:160} },    // muted indigo → steel blue
-  { a:{r:180,g:170,b:145}, b:{r:28,g:30,b:40}   },    // warm ivory → charcoal
+const EMOTION_FLOOR_MIN_DISTANCE = 2.18;
+const EMOTION_DECAY_FLOOR_MIN_DISTANCE = 2.42;
+
+const DESK_SLOTS = [
+  { x: -1.2, z: -4.5, rotY: -0.25 },
+  { x: -0.5, z: -4.3, rotY: 0.12 },
+  { x: 0.15, z: -4.55, rotY: -0.1 },
+  { x: 0.82, z: -4.32, rotY: 0.18 },
+  { x: -0.82, z: -3.7, rotY: 0.22 },
+  { x: 0.4, z: -3.65, rotY: -0.2 },
+  { x: 1.08, z: -3.86, rotY: -0.08 },
 ];
-let _sGradPhase = 0;      // 색상 쌍 전환 위상
-let _sGradCurA = {r:160,g:135,b:100};
-let _sGradCurB = {r:70,g:130,b:140};
-let _sGradBlend = 0;      // 현재 쌍의 블렌드 비율
-function updatePanelBackgrounds() {
-  const e = S.energy;
-  const pr = curPal.r/255, pg = curPal.g/255, pb = curPal.b/255;
 
-  // PIANO 패널 — 밝은 배경 + 음악 반응 색조
-  const pianoEl = document.getElementById("panel-piano");
-  if(pianoEl) {
-    // 에너지에 따른 은은한 색조 변화 (보라 → 팔레트 색)
-    const baseLum = 0.18 + e * 0.06 + LQ.midDensity * 0.04;
-    const baseSat = 0.28 + LQ.highShimmer * 0.12;
-    const palInfluence = 0.12 + e * 0.10;
-    const bgR = Math.floor((32 + pr * 40 * palInfluence + LQ.subPressure * 18) * (1 + baseLum));
-    const bgG = Math.floor((18 + pg * 30 * palInfluence + LQ.midDensity * 12) * (1 + baseLum));
-    const bgB = Math.floor((48 + pb * 55 * palInfluence + LQ.highShimmer * 22) * (1 + baseLum));
-    // 하이라이트 glow
-    const glowA = (0.12 + LQ.midDensity * 0.20 + LQ.highShimmer * 0.14 + S.beat * 0.08).toFixed(3);
-    const glowA2 = (0.08 + LQ.airGlow * 0.16 + LQ.subPressure * 0.10).toFixed(3);
-    pianoEl.style.background = `
-      radial-gradient(ellipse at 25% 55%, rgba(${Math.min(255,bgR+60)},${Math.min(255,bgG+20)},${Math.min(255,bgB+40)},${glowA}) 0%, transparent 55%),
-      radial-gradient(ellipse at 85% 15%, rgba(${Math.min(255,bgR+40)},${Math.min(255,bgG+30)},${Math.min(255,bgB+60)},${glowA2}) 0%, transparent 48%),
-      radial-gradient(ellipse at 60% 90%, rgba(${Math.min(255,bgR+20)},${Math.min(255,bgG+10)},${Math.min(255,bgB+30)},0.35) 0%, transparent 50%),
-      linear-gradient(150deg, rgb(${Math.max(4,bgR-20)},${Math.max(2,bgG-14)},${Math.max(8,bgB-10)}) 0%, rgb(${Math.max(6,bgR-8)},${Math.max(4,bgG-6)},${Math.max(12,bgB)}) 45%, rgb(${Math.max(4,bgR-16)},${Math.max(2,bgG-10)},${Math.max(10,bgB-4)}) 100%)
-    `;
-  }
+const CLUTTER_SLOTS = [
+  { x: -4.92, z: 3.42, rotY: -0.18, rotZ: 0.06 },
+  { x: -3.3, z: 3.56, rotY: -0.14, rotZ: 0.05 },
+  { x: -1.66, z: 3.62, rotY: -0.1, rotZ: 0.04 },
+  { x: 0.18, z: 3.58, rotY: 0.1, rotZ: -0.04 },
+  { x: 1.8, z: 3.48, rotY: 0.12, rotZ: -0.05 },
+  { x: 3.46, z: 3.28, rotY: 0.16, rotZ: -0.06 },
+  { x: -4.4, z: -2.82, rotY: -0.16, rotZ: -0.04 },
+  { x: -3.24, z: -2.58, rotY: -0.14, rotZ: -0.04 },
+  { x: -2.02, z: -2.42, rotY: -0.10, rotZ: 0.03 },
+  { x: -0.76, z: -2.36, rotY: -0.08, rotZ: 0.03 },
+  { x: 0.58, z: -2.28, rotY: 0.08, rotZ: -0.03 },
+  { x: 1.84, z: -2.46, rotY: 0.10, rotZ: -0.04 },
+  { x: 3.04, z: -2.68, rotY: 0.14, rotZ: -0.05 },
+  { x: -3.82, z: -1.84, rotY: -0.14, rotZ: -0.03 },
+  { x: -2.6, z: -1.66, rotY: -0.10, rotZ: 0.04 },
+  { x: -1.3, z: -1.58, rotY: -0.08, rotZ: 0.03 },
+  { x: 0.04, z: -1.54, rotY: 0.08, rotZ: -0.03 },
+  { x: 1.36, z: -1.62, rotY: 0.10, rotZ: -0.04 },
+  { x: 2.66, z: -1.86, rotY: 0.12, rotZ: -0.05 },
+  { x: -7.42, z: 2.78, rotY: -0.22, rotZ: 0.08 },
+  { x: 6.5, z: 2.74, rotY: 0.2, rotZ: -0.08 },
+  { x: -6.2, z: 2.52, rotY: -0.16, rotZ: 0.06 },
+  { x: 5.4, z: 2.48, rotY: 0.18, rotZ: -0.06 },
+  { x: -4.94, z: 2.24, rotY: -0.14, rotZ: 0.05 },
+  { x: 4.2, z: 2.18, rotY: 0.14, rotZ: -0.05 },
+  { x: -3.66, z: 2.06, rotY: -0.12, rotZ: 0.04 },
+  { x: 2.78, z: 1.98, rotY: 0.12, rotZ: -0.04 },
+  { x: -2.2, z: 1.88, rotY: -0.1, rotZ: 0.04 },
+  { x: 1.38, z: 1.84, rotY: 0.1, rotZ: -0.04 },
+  { x: -8.03, z: -1.58, rotY: -0.42, rotZ: -0.07 },
+  { x: 6.44, z: -1.34, rotY: 0.24, rotZ: -0.05 },
+  { x: -7.34, z: -2.08, rotY: -0.28, rotZ: -0.06 },
+  { x: 5.86, z: -1.92, rotY: 0.18, rotZ: -0.05 },
+  { x: -6.7, z: -0.88, rotY: -0.16, rotZ: 0.05 },
+  { x: 5.68, z: -0.32, rotY: 0.18, rotZ: 0.04 },
+  { x: -7.14, z: 0.72, rotY: -0.2, rotZ: 0.08 },
+  { x: 6.24, z: 0.88, rotY: 0.22, rotZ: -0.08 },
+  { x: -6.6, z: -4.18, rotY: -0.34, rotZ: -0.08 },
+  { x: 5.98, z: -4.22, rotY: 0.22, rotZ: 0.06 },
+  { x: -7.82, z: -4.94, rotY: -0.52, rotZ: -0.12 },
+  { x: 6.48, z: -4.84, rotY: 0.26, rotZ: 0.08 },
+  { x: 6.8, z: -4.36, rotY: 0.22, rotZ: 0.05 },
+  { x: 6.94, z: -1.86, rotY: 0.18, rotZ: -0.05 },
+  { x: 6.7, z: -0.08, rotY: 0.16, rotZ: 0.05 },
+  { x: 6.56, z: 1.62, rotY: 0.18, rotZ: -0.06 },
+  { x: -6.2, z: -2.86, rotY: -0.2, rotZ: -0.04 },
+  { x: 5.4, z: -3.08, rotY: 0.18, rotZ: 0.06 },
+  { x: -5.52, z: -1.42, rotY: -0.18, rotZ: -0.03 },
+  { x: 4.48, z: -1.84, rotY: 0.16, rotZ: -0.06 },
+  { x: -4.66, z: -2.34, rotY: -0.12, rotZ: 0.04 },
+  { x: 3.88, z: -2.46, rotY: 0.14, rotZ: -0.05 },
+  { x: -6.32, z: 1.82, rotY: -0.18, rotZ: 0.08 },
+  { x: 5.6, z: 1.72, rotY: 0.18, rotZ: -0.09 },
+  { x: -5.54, z: 1.52, rotY: -0.18, rotZ: 0.07 },
+  { x: -6.9, z: -1.36, rotY: -0.16, rotZ: 0.03 },
+  { x: -6.66, z: -0.18, rotY: -0.14, rotZ: 0.04 },
+  { x: -5.82, z: -1.88, rotY: -0.16, rotZ: -0.02 },
+  { x: -4.94, z: -0.94, rotY: -0.1, rotZ: 0.03 },
+  { x: -6.26, z: -1.72, rotY: -0.16, rotZ: -0.02 },
+  { x: -6.44, z: -0.46, rotY: -0.12, rotZ: 0.04 },
+  { x: 4.86, z: 2.02, rotY: 0.16, rotZ: -0.07 },
+  { x: -1.66, z: 1.46, rotY: -0.16, rotZ: 0.07 },
+  { x: -3.14, z: -1.08, rotY: -0.14, rotZ: 0.05 },
+  { x: -2.24, z: -1.34, rotY: -0.1, rotZ: 0.04 },
+  { x: -1.26, z: -1.52, rotY: -0.08, rotZ: 0.03 },
+  { x: -0.2, z: -1.58, rotY: 0.08, rotZ: -0.03 },
+  { x: 0.94, z: -1.42, rotY: 0.12, rotZ: -0.04 },
+  { x: 2.06, z: -1.72, rotY: 0.14, rotZ: -0.05 },
+  { x: -2.56, z: -2.18, rotY: -0.12, rotZ: 0.04 },
+  { x: -1.4, z: -2.34, rotY: -0.08, rotZ: 0.03 },
+  { x: -0.04, z: -2.48, rotY: 0.08, rotZ: -0.03 },
+  { x: 1.3, z: -2.26, rotY: 0.1, rotZ: -0.04 },
+  { x: -3.66, z: -1.78, rotY: -0.14, rotZ: 0.05 },
+  { x: -3.36, z: -0.38, rotY: -0.12, rotZ: 0.04 },
+];
 
-  // ── SCENE(3번째) 패널 — 고급스러운 팔레트 연동 + 서지(물들기) 색변화 ──
-  const sceneEl = document.getElementById("panel-scene");
-  const sceneBg = document.getElementById("scene-bg");
-  if(sceneEl && sceneBg) {
-    _sSceneT += 0.0012;
+const RECORD_FLOOR_SLOTS = [
+  { x: -4.66, z: 3.34, rotY: -0.16, rotZ: 0.05 },
+  { x: -3.02, z: 3.48, rotY: -0.14, rotZ: 0.04 },
+  { x: -1.44, z: 3.54, rotY: -0.1, rotZ: 0.03 },
+  { x: 0.38, z: 3.46, rotY: 0.1, rotZ: -0.03 },
+  { x: 1.86, z: 3.34, rotY: 0.12, rotZ: -0.04 },
+  { x: 3.34, z: 3.16, rotY: 0.14, rotZ: -0.05 },
+  { x: -4.32, z: -2.74, rotY: -0.16, rotZ: -0.04 },
+  { x: -3.1, z: -2.48, rotY: -0.14, rotZ: -0.04 },
+  { x: -1.82, z: -2.28, rotY: -0.10, rotZ: 0.03 },
+  { x: -0.46, z: -2.18, rotY: 0.08, rotZ: -0.03 },
+  { x: 0.86, z: -2.14, rotY: 0.10, rotZ: -0.04 },
+  { x: 2.08, z: -2.32, rotY: 0.12, rotZ: -0.04 },
+  { x: 3.26, z: -2.58, rotY: 0.14, rotZ: -0.05 },
+  { x: -3.64, z: -1.78, rotY: -0.14, rotZ: -0.03 },
+  { x: -2.4, z: -1.52, rotY: -0.10, rotZ: 0.04 },
+  { x: -1.1, z: -1.42, rotY: -0.08, rotZ: 0.03 },
+  { x: 0.24, z: -1.36, rotY: 0.08, rotZ: -0.03 },
+  { x: 1.56, z: -1.42, rotY: 0.10, rotZ: -0.04 },
+  { x: 2.76, z: -1.68, rotY: 0.12, rotZ: -0.05 },
+  { x: -7.3, z: 2.68, rotY: -0.18, rotZ: 0.06 },
+  { x: 6.38, z: 2.64, rotY: 0.16, rotZ: -0.06 },
+  { x: -6.02, z: 2.42, rotY: -0.14, rotZ: 0.05 },
+  { x: 5.14, z: 2.38, rotY: 0.14, rotZ: -0.05 },
+  { x: -4.66, z: 2.12, rotY: -0.12, rotZ: 0.04 },
+  { x: 3.76, z: 2.08, rotY: 0.12, rotZ: -0.04 },
+  { x: -3.32, z: 1.94, rotY: -0.1, rotZ: 0.03 },
+  { x: 2.44, z: 1.92, rotY: 0.1, rotZ: -0.03 },
+  { x: -1.92, z: 1.78, rotY: -0.08, rotZ: 0.03 },
+  { x: 1.04, z: 1.74, rotY: 0.08, rotZ: -0.03 },
+  { x: -7.86, z: -1.26, rotY: -0.28, rotZ: -0.07 },
+  { x: 6.36, z: -1.08, rotY: 0.18, rotZ: 0.05 },
+  { x: -7.14, z: -2.04, rotY: -0.22, rotZ: -0.04 },
+  { x: 5.74, z: -1.88, rotY: 0.16, rotZ: -0.05 },
+  { x: -6.56, z: -0.38, rotY: -0.12, rotZ: 0.03 },
+  { x: 5.54, z: -0.02, rotY: 0.2, rotZ: 0.06 },
+  { x: -7, z: 0.74, rotY: -0.16, rotZ: 0.04 },
+  { x: 6.06, z: 0.92, rotY: 0.16, rotZ: -0.04 },
+  { x: -6.76, z: -4.08, rotY: -0.32, rotZ: -0.06 },
+  { x: 5.9, z: -4.02, rotY: 0.18, rotZ: 0.06 },
+  { x: -7.8, z: -4.64, rotY: -0.26, rotZ: -0.08 },
+  { x: 6.38, z: -4.56, rotY: 0.2, rotZ: 0.06 },
+  { x: 6.7, z: -4.12, rotY: 0.18, rotZ: 0.05 },
+  { x: 6.88, z: -1.74, rotY: 0.16, rotZ: -0.04 },
+  { x: 6.66, z: 0.22, rotY: 0.16, rotZ: 0.04 },
+  { x: 6.5, z: 1.36, rotY: 0.12, rotZ: 0.04 },
+  { x: -5.7, z: -1.06, rotY: -0.18, rotZ: -0.04 },
+  { x: -5.6, z: -1.94, rotY: -0.14, rotZ: -0.06 },
+  { x: -5.06, z: -0.92, rotY: -0.1, rotZ: 0.03 },
+  { x: -4.9, z: -2.58, rotY: -0.16, rotZ: -0.04 },
+  { x: -3.6, z: -1.82, rotY: -0.14, rotZ: -0.06 },
+  { x: -2.6, z: -0.86, rotY: 0.12, rotZ: 0.04 },
+  { x: 4.16, z: -2.08, rotY: 0.14, rotZ: -0.05 },
+  { x: -7.42, z: -2.94, rotY: -0.3, rotZ: 0.02 },
+  { x: 5.48, z: -2.82, rotY: 0.12, rotZ: -0.04 },
+  { x: -5.96, z: -3.06, rotY: -0.18, rotZ: 0.03 },
+  { x: 4.88, z: 1.5, rotY: 0.1, rotZ: 0.04 },
+  { x: -6.12, z: 1.52, rotY: -0.1, rotZ: 0.03 },
+  { x: -6.42, z: -1.58, rotY: -0.16, rotZ: -0.02 },
+  { x: -6.26, z: -0.18, rotY: -0.1, rotZ: 0.03 },
+  { x: -3.32, z: -1.02, rotY: -0.14, rotZ: -0.03 },
+  { x: -2.46, z: -1.18, rotY: -0.1, rotZ: 0.04 },
+  { x: -1.54, z: -1.28, rotY: -0.08, rotZ: 0.03 },
+  { x: -0.42, z: -1.36, rotY: 0.08, rotZ: -0.03 },
+  { x: 0.68, z: -1.3, rotY: 0.1, rotZ: -0.04 },
+  { x: 1.74, z: -1.48, rotY: 0.12, rotZ: -0.04 },
+  { x: -2.66, z: -2.02, rotY: -0.12, rotZ: -0.04 },
+  { x: -1.42, z: -2.18, rotY: -0.08, rotZ: 0.03 },
+  { x: -0.1, z: -2.26, rotY: 0.08, rotZ: -0.03 },
+  { x: 1.2, z: -2.08, rotY: 0.1, rotZ: -0.04 },
+  { x: -3.92, z: -1.54, rotY: -0.12, rotZ: -0.03 },
+  { x: -3.5, z: -0.42, rotY: -0.1, rotZ: 0.03 },
+];
 
-    // 무드 평균 — 적당히 빠른 lerp (곡 변화를 잘 반영)
-    _sMoodEnergy += (S.energy - _sMoodEnergy) * 0.012;
-    _sMoodMid    += (S.mid    - _sMoodMid)    * 0.014;
-    _sMoodAir    += (S.air    - _sMoodAir)    * 0.010;
-    _sMoodBass   += (S.bass   - _sMoodBass)   * 0.012;
+const RECORD_SECONDARY_SPREAD_SLOTS = [
+  { x: -4.2, z: 3.22, rotY: -0.16, rotZ: 0.05 },
+  { x: 3.1, z: 3.08, rotY: 0.14, rotZ: -0.05 },
+  { x: -2.34, z: 3.42, rotY: -0.12, rotZ: 0.04 },
+  { x: 1.48, z: 3.34, rotY: 0.12, rotZ: -0.04 },
+  { x: -4.2, z: -2.62, rotY: -0.16, rotZ: -0.04 },
+  { x: 3.16, z: -2.52, rotY: 0.14, rotZ: -0.05 },
+  { x: -2.7, z: -1.58, rotY: -0.12, rotZ: 0.04 },
+  { x: 1.78, z: -1.52, rotY: 0.12, rotZ: -0.04 },
+  { x: -7.3, z: 2.68, rotY: -0.18, rotZ: 0.06 },
+  { x: 6.38, z: 2.64, rotY: 0.16, rotZ: -0.06 },
+  { x: -6.02, z: 2.42, rotY: -0.14, rotZ: 0.05 },
+  { x: 5.14, z: 2.38, rotY: 0.14, rotZ: -0.05 },
+  { x: -4.66, z: 2.12, rotY: -0.12, rotZ: 0.04 },
+  { x: 3.76, z: 2.08, rotY: 0.12, rotZ: -0.04 },
+  { x: -3.32, z: 1.94, rotY: -0.1, rotZ: 0.03 },
+  { x: 2.44, z: 1.92, rotY: 0.1, rotZ: -0.03 },
+  { x: -7.86, z: -1.26, rotY: -0.28, rotZ: -0.07 },
+  { x: 6.36, z: -1.08, rotY: 0.18, rotZ: 0.05 },
+  { x: -6.76, z: -4.08, rotY: -0.32, rotZ: -0.06 },
+  { x: 5.9, z: -4.02, rotY: 0.18, rotZ: 0.06 },
+];
 
-    // ═══════════════════════════════════════════════════════
-    // 서지(물들기) — 정말 확 커지는 순간에만, 현재 팔레트 톤으로
-    // ═══════════════════════════════════════════════════════
-    // 느린 베이스라인 (~4초 이동평균) — 평소 수준 추적
-    _sSurgeEnergyBaseline += (S.energy - _sSurgeEnergyBaseline) * 0.004;
-    _sSurgeBassBaseline   += (S.bass   - _sSurgeBassBaseline)   * 0.005;
-    _sSurgeCool = Math.max(0, _sSurgeCool - 1);
+const FLOOR_TUMBLER_PREFERRED_SLOTS = [
+  ...RECORD_SECONDARY_SPREAD_SLOTS.map((slot) => ({ ...slot })),
+  { x: -2.48, z: 0.52, rotY: -0.12, rotZ: 0.04 },
+  { x: -0.92, z: 0.68, rotY: -0.08, rotZ: 0.03 },
+  { x: 0.54, z: 0.64, rotY: 0.1, rotZ: -0.03 },
+  { x: 1.98, z: 0.5, rotY: 0.12, rotZ: -0.04 },
+  { x: -2.82, z: 3.62, rotY: -0.14, rotZ: 0.05 },
+  { x: -1.08, z: 3.76, rotY: -0.1, rotZ: 0.03 },
+  { x: 0.84, z: 3.68, rotY: 0.1, rotZ: -0.03 },
+  { x: 2.58, z: 3.52, rotY: 0.12, rotZ: -0.04 },
+];
 
-    // 베이스라인 대비 상승폭 (순간 변화율은 제외 — 노이즈 감소)
-    const energyRise = Math.max(0, S.energy - _sSurgeEnergyBaseline);
-    const bassRise   = Math.max(0, S.bass   - _sSurgeBassBaseline);
+const CLUTTER_SECONDARY_SPREAD_SLOTS = [
+  { x: -4.54, z: 3.28, rotY: -0.18, rotZ: 0.06 },
+  { x: 3.48, z: 3.16, rotY: 0.16, rotZ: -0.06 },
+  { x: -2.64, z: 3.48, rotY: -0.14, rotZ: 0.05 },
+  { x: 1.64, z: 3.42, rotY: 0.12, rotZ: -0.05 },
+  { x: -7.42, z: 2.78, rotY: -0.22, rotZ: 0.08 },
+  { x: 6.5, z: 2.74, rotY: 0.2, rotZ: -0.08 },
+  { x: -6.2, z: 2.52, rotY: -0.16, rotZ: 0.06 },
+  { x: 5.4, z: 2.48, rotY: 0.18, rotZ: -0.06 },
+  { x: -4.94, z: 2.24, rotY: -0.14, rotZ: 0.05 },
+  { x: 4.2, z: 2.18, rotY: 0.14, rotZ: -0.05 },
+  { x: -8.03, z: -1.58, rotY: -0.42, rotZ: -0.07 },
+  { x: 6.44, z: -1.34, rotY: 0.24, rotZ: -0.05 },
+  { x: -6.6, z: -4.18, rotY: -0.34, rotZ: -0.08 },
+  { x: 5.98, z: -4.22, rotY: 0.22, rotZ: 0.06 },
+  { x: -6.32, z: 1.82, rotY: -0.18, rotZ: 0.08 },
+  { x: 5.6, z: 1.72, rotY: 0.18, rotZ: -0.09 },
+];
 
-    // 서지 점수: 베이스라인 대비 큰 차이 + beat/bassShock 동기화
-    const surgeScore = energyRise * 1.8 + bassRise * 2.2
-                     + (S.beat > 0.6 ? S.beat * 0.8 : 0)
-                     + (LQ.bassShock > 0.4 ? LQ.bassShock * 1.0 : 0);
+const CAMERA_FRONT_SLOT_ADJUST = {
+  frontBandMinZ: 1.55,
+  frontShiftZ: -0.22,
+  cornerBandMinZ: 0.0,
+  cornerEdgeAbsX: 6.15,
+  cornerPullX: 0.84,
+  cornerShiftZ: -0.12,
+};
 
-    const isMicS = (mode === MODE_MIC);
-    // 높은 임계값 = 정말 큰 순간에만 발동
-    const surgeThreshold = isMicS ? 0.65 : 0.90;
-    // 긴 쿨다운 = 자주 안 바뀜 (약 1.5~2.5초)
-    const surgeCoolMax   = isMicS ? 55   : 80;
+function applyCameraFrontSlotAdjustments(slotLists) {
+  slotLists.forEach((slotList) => {
+    slotList.forEach((slot) => {
+      const isFrontBand = slot.z >= CAMERA_FRONT_SLOT_ADJUST.frontBandMinZ;
+      const isNearFrontCorner = Math.abs(slot.x) >= CAMERA_FRONT_SLOT_ADJUST.cornerEdgeAbsX
+        && slot.z >= CAMERA_FRONT_SLOT_ADJUST.cornerBandMinZ;
 
-    if (surgeScore > surgeThreshold && _sSurgeCool === 0) {
-      const intensity = Math.min(1.0, (surgeScore - surgeThreshold) * 1.2 + 0.25);
-      _sSurgeStrength = Math.max(_sSurgeStrength, intensity);
+      if (isFrontBand) {
+        slot.z += CAMERA_FRONT_SLOT_ADJUST.frontShiftZ;
+      }
 
-      // 현재 팔레트 색에서 파생: 채도를 살짝 올리고 밝기를 높임 (별도 색 없음)
-      _sSurgeTintR = Math.min(255, curPal.r * 1.3 + 30);
-      _sSurgeTintG = Math.min(255, curPal.g * 1.2 + 20);
-      _sSurgeTintB = Math.min(255, curPal.b * 1.3 + 30);
-
-      _sSurgeCool = surgeCoolMax;
-    }
-
-    // 서지 강도 감쇠 — 아주 천천히 빠짐 (6~10초에 걸쳐 은은하게 사라짐)
-    _sSurgeStrength *= 0.992;
-    if (_sSurgeStrength < 0.003) _sSurgeStrength = 0;
-
-    _sSurgePrevEnergy = S.energy;
-    _sSurgePrevBass   = S.bass;
-
-    // 팔레트 색상 부드럽게 추적 (곡 진행에 따른 색 변화의 핵심)
-    _sPalR += (curPal.r - _sPalR) * 0.018;
-    _sPalG += (curPal.g - _sPalG) * 0.018;
-    _sPalB += (curPal.b - _sPalB) * 0.018;
-
-    // 팔레트 bloom — 서지 시 은은하게 강화
-    const bloomTarget = 0.20 + _sMoodEnergy * 0.40 + _sMoodMid * 0.16 + _sMoodBass * 0.12
-                      + _sSurgeStrength * 0.18;
-    _sPalBloom += (bloomTarget - _sPalBloom) * 0.022;
-
-    // 색조 목표 — 팔레트 RGB에서 Hue 추출 + 시간 흐름
-    const palMax = Math.max(_sPalR, _sPalG, _sPalB);
-    const palMin = Math.min(_sPalR, _sPalG, _sPalB);
-    const palDelta = palMax - palMin;
-    let palHue = 210;
-    if(palDelta > 5) {
-      if(palMax === _sPalR) palHue = 60 * (((_sPalG - _sPalB) / palDelta) % 6);
-      else if(palMax === _sPalG) palHue = 60 * ((_sPalB - _sPalR) / palDelta + 2);
-      else palHue = 60 * ((_sPalR - _sPalG) / palDelta + 4);
-      if(palHue < 0) palHue += 360;
-    }
-
-    // 기본 싸이클 + 팔레트 Hue 혼합
-    const cycleHue  = 200 + Math.sin(_sSceneT * 1.2) * 35
-                    + Math.sin(_sSceneT * 0.45) * 15;
-    const palWeight = 0.35 + _sMoodEnergy * 0.45;
-    const blendedHue = cycleHue * (1 - palWeight) + palHue * palWeight;
-    const moodShift = _sMoodEnergy * 22 - _sMoodAir * 12 + _sMoodBass * 14;
-    _sHueDrift += (blendedHue + moodShift - _sHueDrift) * 0.008;
-
-    // 채도 — 서지 시 살짝만 올라감
-    const satTarget = 30 + _sMoodEnergy * 32 + _sMoodMid * 14 + _sMoodAir * 10
-                    + _sSurgeStrength * 16;
-    // 명도 — 서지 시 은은하게 밝아짐
-    const lumTarget = 10 + _sMoodEnergy * 22 + _sMoodMid * 14 + _sMoodBass * 6
-                    + _sSurgeStrength * 10;
-
-    // 부드러운 lerp — 서지 시 약간 더 빠르게 (하지만 절제)
-    const hueLerpSpeed = 0.020 + _sSurgeStrength * 0.025;
-    const satLerpSpeed = 0.025 + _sSurgeStrength * 0.03;
-    const lumLerpSpeed = 0.022 + _sSurgeStrength * 0.03;
-    _sHueFast += (_sHueDrift - _sHueFast) * hueLerpSpeed;
-    _sHueSlow += (_sHueFast  - _sHueSlow) * 0.008;
-    _sSatFast += (satTarget  - _sSatFast) * satLerpSpeed;
-    _sSatSlow += (_sSatFast  - _sSatSlow) * 0.012;
-    _sLumFast += (lumTarget  - _sLumFast) * lumLerpSpeed;
-    _sLumSlow += (_sLumFast  - _sLumSlow) * 0.010;
-
-    const hF  = _sHueFast;
-    const hS  = _sHueSlow;
-    const h2  = hF - 28;
-    const h3  = hS + 22;
-    const h4  = hF + 45;
-    const sF  = _sSatFast.toFixed(1);
-    const sS  = _sSatSlow.toFixed(1);
-    const lF  = _sLumFast.toFixed(1);
-    const lS  = _sLumSlow.toFixed(1);
-    const lD  = Math.max(4, _sLumSlow - 2).toFixed(1);
-    const lBright = Math.min(40, _sLumFast * 1.5).toFixed(1);
-
-    // 투명도 — 팔레트 bloom + 서지 은은하게
-    const surgeAlphaBoost = _sSurgeStrength * 0.20;
-    const g1  = (0.62 + _sMoodEnergy * 0.30 + _sPalBloom * 0.25 + surgeAlphaBoost).toFixed(3);
-    const g2  = (0.40 + _sMoodBass   * 0.28 + _sPalBloom * 0.18 + surgeAlphaBoost * 0.5).toFixed(3);
-    const g3  = (0.28 + _sMoodAir    * 0.22 + _sPalBloom * 0.12 + surgeAlphaBoost * 0.3).toFixed(3);
-
-    // 팔레트 RGB 직접 그라디언트
-    const pR = Math.floor(_sPalR), pG = Math.floor(_sPalG), pB = Math.floor(_sPalB);
-    const palGlowA = (_sPalBloom * 0.38 + _sMoodEnergy * 0.12).toFixed(3);
-    const palGlowA2 = (_sPalBloom * 0.22 + _sMoodMid * 0.08).toFixed(3);
-
-    // ── 서지 물들기: 현재 팔레트 파생 색 1겹, 은은하게 ──
-    const sgStr = _sSurgeStrength;
-    const sgR = Math.floor(_sSurgeTintR);
-    const sgG = Math.floor(_sSurgeTintG);
-    const sgB = Math.floor(_sSurgeTintB);
-    // 서지 알파: 최대 0.38 — 은은하게 물드는 느낌
-    const sgAlpha = (sgStr * 0.38).toFixed(3);
-
-    // ── 추가 그라데이션 쌍 사이클링 ──
-    _sGradPhase += 0.0008 + _sMoodEnergy * 0.002;
-    const gradIdx = Math.floor(_sGradPhase) % SCENE_GRAD_PAIRS.length;
-    const gradNext = (gradIdx + 1) % SCENE_GRAD_PAIRS.length;
-    const gradT = _sGradPhase % 1;
-    const curPair = SCENE_GRAD_PAIRS[gradIdx];
-    const nxtPair = SCENE_GRAD_PAIRS[gradNext];
-    const lG = (a,b,t) => ({r:a.r+(b.r-a.r)*t, g:a.g+(b.g-a.g)*t, b:a.b+(b.b-a.b)*t});
-    const gA = lG(curPair.a, nxtPair.a, gradT);
-    const gB = lG(curPair.b, nxtPair.b, gradT);
-    _sGradCurA.r += (gA.r - _sGradCurA.r) * 0.015;
-    _sGradCurA.g += (gA.g - _sGradCurA.g) * 0.015;
-    _sGradCurA.b += (gA.b - _sGradCurA.b) * 0.015;
-    _sGradCurB.r += (gB.r - _sGradCurB.r) * 0.015;
-    _sGradCurB.g += (gB.g - _sGradCurB.g) * 0.015;
-    _sGradCurB.b += (gB.b - _sGradCurB.b) * 0.015;
-    const gaR = Math.floor(_sGradCurA.r), gaG = Math.floor(_sGradCurA.g), gaB = Math.floor(_sGradCurA.b);
-    const gbR = Math.floor(_sGradCurB.r), gbG = Math.floor(_sGradCurB.g), gbB = Math.floor(_sGradCurB.b);
-    const gradAlpha = (0.22 + _sMoodEnergy * 0.30 + _sPalBloom * 0.18).toFixed(3);
-    const gradAlpha2 = (0.16 + _sMoodBass * 0.22 + _sMoodMid * 0.12).toFixed(3);
-
-    sceneEl.style.background = '#020406';
-    sceneBg.style.background = `
-      ${sgStr > 0.02 ? `radial-gradient(ellipse 100% 90% at 50% 42%,
-        rgba(${sgR},${sgG},${sgB},${sgAlpha}) 0%, transparent 65%),` : ''}
-      radial-gradient(ellipse 80% 70% at 50% 38%,
-        hsla(${hF.toFixed(1)},${sF}%,${lF}%,${g1}) 0%, transparent 68%),
-      radial-gradient(ellipse 70% 60% at 52% 44%,
-        rgba(${pR},${pG},${pB},${palGlowA}) 0%, transparent 60%),
-      radial-gradient(ellipse 75% 65% at 28% 32%,
-        rgba(${gaR},${gaG},${gaB},${gradAlpha}) 0%, transparent 62%),
-      radial-gradient(ellipse 70% 55% at 78% 68%,
-        rgba(${gbR},${gbG},${gbB},${gradAlpha2}) 0%, transparent 58%),
-      radial-gradient(ellipse 90% 75% at 48% 40%,
-        hsla(${hS.toFixed(1)},${sS}%,${lS}%,${(+g1 * 0.40).toFixed(3)}) 0%, transparent 72%),
-      radial-gradient(ellipse 45% 38% at 14% 78%,
-        hsla(${h2.toFixed(1)},${sF}%,${lBright}%,${g2}) 0%, transparent 58%),
-      radial-gradient(ellipse 40% 35% at 86% 18%,
-        hsla(${h3.toFixed(1)},${sS}%,${lS}%,${(+g2 * 0.65).toFixed(3)}) 0%, transparent 52%),
-      radial-gradient(ellipse 35% 28% at 75% 72%,
-        rgba(${pR},${pG},${pB},${palGlowA2}) 0%, transparent 50%),
-      radial-gradient(ellipse 30% 22% at 50% 94%,
-        hsla(${h4.toFixed(1)},${(+sF * 0.8).toFixed(1)}%,${lD}%,${g3}) 0%, transparent 48%),
-      linear-gradient(135deg,
-        rgba(${gaR},${gaG},${gaB},${(+gradAlpha * 0.18).toFixed(3)}) 0%,
-        transparent 45%,
-        rgba(${gbR},${gbG},${gbB},${(+gradAlpha2 * 0.14).toFixed(3)}) 100%),
-      #020406
-    `;
-
-    // scene-depth-layer 팔레트 tint
-    const depthEl = document.getElementById("scene-depth");
-    if(depthEl) {
-      depthEl.style.filter = `hue-rotate(${(hF - 210).toFixed(1)}deg) saturate(${(1.0 + _sPalBloom * 0.6 + sgStr * 0.3).toFixed(2)})`;
-    }
-  }
-}
-
-// ── 2D Overlay
-const ovCv = document.getElementById("overlay-canvas");
-let ovCtx;
-const HLINES = Array.from({length:14},(_,i)=>({
-  y:(i+1)/15, phase:Math.random()*Math.PI*2, speed:0.18+Math.random()*0.22,
-  band:["mid","mid","high","air","mid","bass","mid","high","air","mid","bass","mid","high","air"][i],
-  thickness:i%3===0?1.2:0.7,
-}));
-const beatRings=[];
-const VLINES=Array.from({length:7},(_,i)=>({x:(i+1)/8,phase:Math.random()*Math.PI*2,speed:0.12+Math.random()*0.16}));
-
-function initOverlay(){ ovCtx=ovCv.getContext("2d"); resizeOverlay(); }
-function resizeOverlay(){
-  const dpr=window.devicePixelRatio||1;
-  ovCv.width=window.innerWidth*dpr; ovCv.height=window.innerHeight*dpr;
-  if(ovCtx) ovCtx.scale(dpr,dpr);
-}
-let ovTime=0;
-
-function drawOverlay(){
-  if(!ovCtx) return;
-  const W=window.innerWidth,H=window.innerHeight;
-  ovTime+=0.016;
-  ovCtx.clearRect(0,0,W,H);
-  const cx=W*.5,cy=H*.48;
-  const pr=curPal.r,pg=curPal.g,pb=curPal.b;
-  const eBoost=S.energy*S.energy;
-  const palFade=0.20+eBoost*0.65;
-  const isMicOv = (mode === MODE_MIC);
-  const micBoost = isMicOv ? 2.8 : 1.0; // 마이크 모드 선 반응 증폭
-
-  HLINES.forEach(l=>{
-    const bv=S[l.band]||0;
-    const lqVal = l.band==='air'||l.band==='high' ? LQ.airGlow*0.7+LQ.highShimmer*0.5 : LQ.midDensity*0.6+bv*0.5;
-    const al=(0.016+bv*0.085*micBoost+lqVal*0.055*micBoost)*(0.5+0.5*Math.sin(ovTime*l.speed*2+l.phase))*palFade;
-    if(al<0.004) return;
-    const y=l.y*H;
-    const waMid=LQ.midDensity*H*0.014*micBoost;
-    const waHigh=LQ.surfaceTension*H*0.006*micBoost*Math.sin(ovTime*8+l.phase);
-    const wa=(bv*H*0.012*micBoost)+waMid+waHigh;
-    ovCtx.beginPath();
-    ovCtx.strokeStyle=`rgba(${pr},${pg},${pb},${Math.min(al*micBoost,0.6).toFixed(3)})`;
-    ovCtx.lineWidth=l.thickness*(0.8+LQ.midDensity*0.4*micBoost);
-    for(let x=0;x<=W;x+=3){
-      const wBase=wa*Math.sin(x/W*Math.PI*6+ovTime*l.speed*3+l.phase);
-      const wShim=LQ.highShimmer*H*0.003*micBoost*Math.sin(x/W*Math.PI*22+ovTime*14+l.phase*2);
-      if(x===0) ovCtx.moveTo(x,y+wBase+wShim); else ovCtx.lineTo(x,y+wBase+wShim);
-    }
-    ovCtx.stroke();
+      if (isNearFrontCorner) {
+        slot.x += slot.x > 0 ? -CAMERA_FRONT_SLOT_ADJUST.cornerPullX : CAMERA_FRONT_SLOT_ADJUST.cornerPullX;
+        slot.z += CAMERA_FRONT_SLOT_ADJUST.cornerShiftZ;
+      }
+    });
   });
+}
 
-  if(S.beat>0.5&&(beatRings.length===0||beatRings[beatRings.length-1].age>8))
-    beatRings.push({cx,cy,r:0,maxR:Math.max(W,H)*0.72,age:0,strength:S.beat*(isMicOv?1.4:1.0)});
-  for(let i=beatRings.length-1;i>=0;i--){
-    const ring=beatRings[i];
-    ring.r+=(ring.maxR-ring.r)*0.048; ring.age++;
-    const prog=ring.r/ring.maxR;
-    const al=ring.strength*(1-prog)*(1-prog)*(1-prog)*0.20*palFade;
-    if(al<0.0025||ring.age>110){beatRings.splice(i,1);continue;}
-    ovCtx.beginPath();
-    ovCtx.arc(cx,cy,ring.r,0,Math.PI*2);
-    ovCtx.strokeStyle=`rgba(${pr},${pg},${pb},${al.toFixed(3)})`;
-    ovCtx.lineWidth=(1-prog)*2.2;
-    ovCtx.stroke();
+applyCameraFrontSlotAdjustments([
+  CLUTTER_SLOTS,
+  RECORD_FLOOR_SLOTS,
+  RECORD_SECONDARY_SPREAD_SLOTS,
+  CLUTTER_SECONDARY_SPREAD_SLOTS,
+]);
+
+const RIGHT_SIDE_RANGE_EXPAND = {
+  minX: 4.75,
+  frontMinZ: 0.5,
+  strongFrontMinZ: 1.45,
+  baseShiftX: 0.32,
+  frontShiftX: 1.01,
+  strongFrontShiftX: 1.04,
+  frontShiftZ: -0.14,
+  strongFrontShiftZ: -0.28,
+  rotYAdd: 0.06,
+};
+
+function applyRightSideRangeExpand(slotLists) {
+  slotLists.forEach((slotList) => {
+    slotList.forEach((slot) => {
+      if (slot.x < RIGHT_SIDE_RANGE_EXPAND.minX) return;
+
+      const isStrongFront = slot.z >= RIGHT_SIDE_RANGE_EXPAND.strongFrontMinZ;
+      const isFront = slot.z >= RIGHT_SIDE_RANGE_EXPAND.frontMinZ;
+
+      if (isStrongFront) {
+        slot.x += RIGHT_SIDE_RANGE_EXPAND.strongFrontShiftX;
+        slot.z += RIGHT_SIDE_RANGE_EXPAND.strongFrontShiftZ;
+      } else if (isFront) {
+        slot.x += RIGHT_SIDE_RANGE_EXPAND.frontShiftX;
+        slot.z += RIGHT_SIDE_RANGE_EXPAND.frontShiftZ;
+      } else {
+        slot.x += RIGHT_SIDE_RANGE_EXPAND.baseShiftX;
+      }
+
+      slot.rotY = (slot.rotY || 0) + RIGHT_SIDE_RANGE_EXPAND.rotYAdd;
+    });
+  });
+}
+
+const CLOTHES_SLOTS = [
+  { x: 3.22, z: 1.0, rotY: -0.4 },
+  { x: 4.22, z: 1.9, rotY: 0.18 },
+  { x: 4.67, z: 0.6, rotY: -0.1 },
+  { x: 3.07, z: 2.5, rotY: 0.28 },
+];
+
+const SNACK_SLOTS = [
+  { x: -3.73, z: 2.85, rotY: 0.38 },
+  { x: -2.43, z: 2.45, rotY: -0.16 },
+  { x: -1.33, z: 2.12, rotY: 0.12 },
+  { x: -4.63, z: 3.18, rotY: -0.24 },
+];
+
+const GOOD_EMOTION_ANCHORS = [
+  { x: -2.35, y: 3.04, z: -1.04 },
+  { x: -1.18, y: 2.78, z: -2.16 },
+  { x: 0.18, y: 3.32, z: -0.72 },
+  { x: 1.62, y: 2.84, z: -2.04 },
+  { x: 2.52, y: 3.08, z: -0.98 },
+  { x: -0.34, y: 2.48, z: -2.86 },
+  { x: -2.82, y: 2.7, z: -2.34 },
+  { x: 2.88, y: 2.78, z: -2.42 },
+];
+
+const BAD_EMOTION_ANCHORS = [
+  { x: -2.08, y: 2.56, z: -0.94 },
+  { x: -1.02, y: 2.34, z: -1.88 },
+  { x: 0.34, y: 2.82, z: -0.72 },
+  { x: 1.58, y: 2.28, z: -1.86 },
+  { x: 2.22, y: 2.48, z: -0.94 },
+  { x: -0.22, y: 2.12, z: -2.52 },
+  { x: 2.7, y: 2.2, z: -2.18 },
+];
+
+const EMOTION_REWARD_SLOTS = [
+  { x: -6.2, z: 3.18, rotY: 0.34 },
+  { x: 4.96, z: 3.12, rotY: -0.28 },
+  { x: -5.06, z: 2.42, rotY: 0.28 },
+  { x: 3.98, z: 2.38, rotY: -0.22 },
+  { x: -3.96, z: 3.28, rotY: -0.18 },
+  { x: 3.08, z: 3.22, rotY: 0.16 },
+  { x: -2.94, z: 2.02, rotY: 0.16 },
+  { x: 2.1, z: 1.98, rotY: -0.12 },
+  { x: -2.02, z: 2.76, rotY: 0.12 },
+  { x: 1.14, z: 2.68, rotY: -0.08 },
+  { x: -1.16, z: 1.96, rotY: 0.1 },
+  { x: 0.28, z: 1.92, rotY: -0.08 },
+  { x: -5.46, z: 1.52, rotY: 0.22 },
+  { x: 4.34, z: 1.58, rotY: -0.18 },
+  { x: -2.54, z: 3.36, rotY: 0.08 },
+  { x: 1.66, z: 3.32, rotY: -0.08 },
+];
+
+const DESK_EMOTION_REWARD_SLOTS = [
+  { u: 0.36, v: 0.36, rotY: -0.08, zOffset: -0.34, xOffset: -0.02 },
+  { u: 0.44, v: 0.44, rotY: 0.08, zOffset: -0.32, xOffset: 0.06 },
+];
+
+applyRightSideRangeExpand([
+  CLUTTER_SLOTS,
+  RECORD_FLOOR_SLOTS,
+  RECORD_SECONDARY_SPREAD_SLOTS,
+  CLUTTER_SECONDARY_SPREAD_SLOTS,
+  CLOTHES_SLOTS,
+  EMOTION_REWARD_SLOTS,
+]);
+
+const FRONT_INNER_GATHER_CONFIG = {
+  frontMinZ: 1.15,
+  centerBandAbsXMax: 2.35,
+  centerShiftZ: -0.34,
+  edgeBandAbsXMin: 4.9,
+  edgePullX: 1.18,
+  edgeShiftZ: -0.28,
+  extremeEdgeAbsXMin: 6.15,
+  extremeEdgePullX: 0.72,
+  extremeEdgeShiftZ: -0.14,
+};
+
+function applyFrontInnerGather(slotLists) {
+  slotLists.forEach((slotList) => {
+    slotList.forEach((slot) => {
+      if (slot.z < FRONT_INNER_GATHER_CONFIG.frontMinZ) return;
+
+      if (Math.abs(slot.x) <= FRONT_INNER_GATHER_CONFIG.centerBandAbsXMax) {
+        slot.z += FRONT_INNER_GATHER_CONFIG.centerShiftZ;
+      }
+
+      if (Math.abs(slot.x) >= FRONT_INNER_GATHER_CONFIG.edgeBandAbsXMin) {
+        slot.x += slot.x > 0 ? -FRONT_INNER_GATHER_CONFIG.edgePullX : FRONT_INNER_GATHER_CONFIG.edgePullX;
+        slot.z += FRONT_INNER_GATHER_CONFIG.edgeShiftZ;
+      }
+
+      if (Math.abs(slot.x) >= FRONT_INNER_GATHER_CONFIG.extremeEdgeAbsXMin) {
+        slot.x += slot.x > 0 ? -FRONT_INNER_GATHER_CONFIG.extremeEdgePullX : FRONT_INNER_GATHER_CONFIG.extremeEdgePullX;
+        slot.z += FRONT_INNER_GATHER_CONFIG.extremeEdgeShiftZ;
+      }
+    });
+  });
+}
+
+applyFrontInnerGather([
+  CLUTTER_SLOTS,
+  RECORD_FLOOR_SLOTS,
+  RECORD_SECONDARY_SPREAD_SLOTS,
+  CLUTTER_SECONDARY_SPREAD_SLOTS,
+]);
+
+const RIGHT_FRONT_FORBIDDEN = {
+  minX: 4.2,
+  minZ: -0.62,
+  strongFrontMinZ: 0.92,
+  targetMinX: 6.08,
+  targetMaxX: 7.78,
+  sidePushX: 1.48,
+  strongSidePushX: 1.92,
+  targetSideX: 6.82,
+  targetZ: -1.88,
+  strongTargetZ: -3.08,
+  rotYAdd: 0.16,
+  cacheFlag: '__rightFrontForbiddenV6',
+};
+
+function isInRightFrontForbiddenZone(slot) {
+  return !!slot
+    && Number.isFinite(slot.x)
+    && Number.isFinite(slot.z)
+    && slot.x >= RIGHT_FRONT_FORBIDDEN.minX
+    && slot.z >= RIGHT_FRONT_FORBIDDEN.minZ;
+}
+
+function applyRightFrontRedirectToSlot(slot) {
+  if (!slot || slot[RIGHT_FRONT_FORBIDDEN.cacheFlag]) return slot;
+  if (!isInRightFrontForbiddenZone(slot)) return slot;
+
+  const isStrongFront = slot.z >= RIGHT_FRONT_FORBIDDEN.strongFrontMinZ;
+  const pushedX = slot.x + (isStrongFront ? RIGHT_FRONT_FORBIDDEN.strongSidePushX : RIGHT_FRONT_FORBIDDEN.sidePushX);
+
+  slot.x = clamp(
+    Math.max(pushedX, RIGHT_FRONT_FORBIDDEN.targetSideX),
+    RIGHT_FRONT_FORBIDDEN.targetMinX,
+    RIGHT_FRONT_FORBIDDEN.targetMaxX,
+  );
+  slot.z = isStrongFront ? RIGHT_FRONT_FORBIDDEN.strongTargetZ : RIGHT_FRONT_FORBIDDEN.targetZ;
+  slot.rotY = (slot.rotY || 0) + RIGHT_FRONT_FORBIDDEN.rotYAdd;
+  slot[RIGHT_FRONT_FORBIDDEN.cacheFlag] = true;
+  return slot;
+}
+
+function applyRightFrontRedirect(slotLists) {
+  slotLists.forEach((slotList) => {
+    slotList.forEach((slot) => {
+      applyRightFrontRedirectToSlot(slot);
+    });
+  });
+}
+
+applyRightFrontRedirect([
+  CLUTTER_SLOTS,
+  RECORD_FLOOR_SLOTS,
+  RECORD_SECONDARY_SPREAD_SLOTS,
+  CLUTTER_SECONDARY_SPREAD_SLOTS,
+  CLOTHES_SLOTS,
+  EMOTION_REWARD_SLOTS,
+]);
+
+const LEFT_FRONT_FORBIDDEN = {
+  minX: -5.58,
+  maxX: -4.1,
+  minZ: 0.38,
+  strongFrontMinZ: 1.26,
+  targetMinX: -6.92,
+  targetMaxX: -5.62,
+  targetSideX: -6.24,
+  sidePushX: -0.92,
+  strongSidePushX: -1.26,
+  targetZ: -1.12,
+  strongTargetZ: -2.04,
+  rotYAdd: -0.16,
+};
+
+const FAR_LEFT_FRONT_FILL = {
+  maxX: -6.02,
+  minZ: 1.34,
+  maxZ: 3.22,
+  pullLeftX: -0.22,
+  pullForwardZ: 0.34,
+  extremeMaxX: -6.86,
+  extremeExtraLeftX: -0.12,
+  extremeExtraForwardZ: 0.22,
+  clampMaxZ: 3.48,
+  rotYAdd: -0.04,
+};
+
+const CENTER_FRONT_FORBIDDEN = {
+  minX: -2.5,
+  maxX: 2.5,
+  minZ: 1.42,
+  strongFrontMinZ: 2.32,
+  sideTargetAbsX: 2.88,
+  strongSideTargetAbsX: 3.52,
+  targetZ: 0.42,
+  strongTargetZ: -0.22,
+  rotYAdd: 0.08,
+};
+
+const DESK_UNDER_RIGHT_SOFT_AVOID = {
+  minX: 1.05,
+  maxX: 3.75,
+  minZ: -4.1,
+  maxZ: -1.02,
+};
+
+const DESK_LEG_RIGHT_LEFT_HARD_AVOID = {
+  minX: 0.18,
+  maxX: 1.72,
+  minZ: -4.34,
+  maxZ: -2.14,
+  targetX: -0.48,
+  targetZ: -1.86,
+  rotYAdd: -0.08,
+};
+
+const LEFT_EDGE_FORWARD_PULL = {
+  maxX: -5.72,
+  minZ: -2.82,
+  maxZ: 2.52,
+  pullForwardZ: 0.42,
+  clampMaxZ: 2.82,
+  extremeMaxX: -6.48,
+  extremeExtraPullForwardZ: 0.28,
+  extremeClampMaxZ: 3.08,
+};
+
+const BACK_CORNER_BLIND = {
+  minAbsX: 5.1,
+  maxZ: -3.58,
+  targetAbsX: 4.42,
+  targetZ: -2.54,
+  rotYAdd: 0.12,
+};
+
+const FLOOR_PLACEMENT_NORMALIZE_VERSION = '__floorPlacementNormalizedV9';
+
+function isInLeftFrontForbiddenZone(slot) {
+  return !!slot
+    && Number.isFinite(slot.x)
+    && Number.isFinite(slot.z)
+    && slot.x >= LEFT_FRONT_FORBIDDEN.minX
+    && slot.x <= LEFT_FRONT_FORBIDDEN.maxX
+    && slot.z >= LEFT_FRONT_FORBIDDEN.minZ;
+}
+
+function applyLeftFrontRedirectToSlot(slot) {
+  if (!slot) return slot;
+  if (!isInLeftFrontForbiddenZone(slot)) return slot;
+
+  const isStrongFront = slot.z >= LEFT_FRONT_FORBIDDEN.strongFrontMinZ;
+  const pushedX = slot.x + (isStrongFront ? LEFT_FRONT_FORBIDDEN.strongSidePushX : LEFT_FRONT_FORBIDDEN.sidePushX);
+
+  slot.x = clamp(
+    Math.min(pushedX, LEFT_FRONT_FORBIDDEN.targetSideX),
+    LEFT_FRONT_FORBIDDEN.targetMinX,
+    LEFT_FRONT_FORBIDDEN.targetMaxX,
+  );
+  slot.z = isStrongFront ? LEFT_FRONT_FORBIDDEN.strongTargetZ : LEFT_FRONT_FORBIDDEN.targetZ;
+  slot.rotY = (slot.rotY || 0) + LEFT_FRONT_FORBIDDEN.rotYAdd;
+  return slot;
+}
+
+function isInCenterFrontForbiddenZone(slot) {
+  return !!slot
+    && Number.isFinite(slot.x)
+    && Number.isFinite(slot.z)
+    && slot.x >= CENTER_FRONT_FORBIDDEN.minX
+    && slot.x <= CENTER_FRONT_FORBIDDEN.maxX
+    && slot.z >= CENTER_FRONT_FORBIDDEN.minZ;
+}
+
+function applyCenterFrontRedirectToSlot(slot) {
+  if (!slot) return slot;
+  if (!isInCenterFrontForbiddenZone(slot)) return slot;
+
+  const isStrongFront = slot.z >= CENTER_FRONT_FORBIDDEN.strongFrontMinZ;
+  const sideTargetAbsX = isStrongFront
+    ? CENTER_FRONT_FORBIDDEN.strongSideTargetAbsX
+    : CENTER_FRONT_FORBIDDEN.sideTargetAbsX;
+
+  const moveRight = slot.x > 0 ? true : slot.x < 0 ? false : (slot.rotY || 0) >= 0;
+  slot.x = moveRight ? sideTargetAbsX : -sideTargetAbsX;
+  slot.z = isStrongFront ? CENTER_FRONT_FORBIDDEN.strongTargetZ : CENTER_FRONT_FORBIDDEN.targetZ;
+  slot.rotY = (slot.rotY || 0) + (moveRight ? CENTER_FRONT_FORBIDDEN.rotYAdd : -CENTER_FRONT_FORBIDDEN.rotYAdd);
+  return slot;
+}
+
+function isInDeskUnderRightSoftAvoidZone(slot) {
+  return !!slot
+    && Number.isFinite(slot.x)
+    && Number.isFinite(slot.z)
+    && slot.x >= DESK_UNDER_RIGHT_SOFT_AVOID.minX
+    && slot.x <= DESK_UNDER_RIGHT_SOFT_AVOID.maxX
+    && slot.z >= DESK_UNDER_RIGHT_SOFT_AVOID.minZ
+    && slot.z <= DESK_UNDER_RIGHT_SOFT_AVOID.maxZ;
+}
+
+function applyDeskUnderRightReduceToSlot(slot) {
+  if (!slot) return slot;
+  if (!isInDeskUnderRightSoftAvoidZone(slot)) return slot;
+
+  slot.x -= 1.12;
+  slot.z += 0.58;
+  slot.rotY = (slot.rotY || 0) - 0.06;
+  return slot;
+}
+
+function isInDeskLegRightLeftHardAvoidZone(slot) {
+  return !!slot
+    && Number.isFinite(slot.x)
+    && Number.isFinite(slot.z)
+    && slot.x >= DESK_LEG_RIGHT_LEFT_HARD_AVOID.minX
+    && slot.x <= DESK_LEG_RIGHT_LEFT_HARD_AVOID.maxX
+    && slot.z >= DESK_LEG_RIGHT_LEFT_HARD_AVOID.minZ
+    && slot.z <= DESK_LEG_RIGHT_LEFT_HARD_AVOID.maxZ;
+}
+
+function applyDeskLegRightLeftRedirectToSlot(slot) {
+  if (!slot) return slot;
+  if (!isInDeskLegRightLeftHardAvoidZone(slot)) return slot;
+
+  slot.x = Math.min(slot.x - 1.04, DESK_LEG_RIGHT_LEFT_HARD_AVOID.targetX);
+  slot.z = Math.max(slot.z + 0.92, DESK_LEG_RIGHT_LEFT_HARD_AVOID.targetZ);
+  slot.rotY = (slot.rotY || 0) + DESK_LEG_RIGHT_LEFT_HARD_AVOID.rotYAdd;
+  return slot;
+}
+
+function isInBackCornerBlindZone(slot) {
+  return !!slot
+    && Number.isFinite(slot.x)
+    && Number.isFinite(slot.z)
+    && Math.abs(slot.x) >= BACK_CORNER_BLIND.minAbsX
+    && slot.z <= BACK_CORNER_BLIND.maxZ;
+}
+
+function applyBackCornerBlindRedirectToSlot(slot) {
+  if (!slot) return slot;
+  if (!isInBackCornerBlindZone(slot)) return slot;
+
+  const sign = slot.x >= 0 ? 1 : -1;
+  slot.x = sign * Math.min(Math.abs(slot.x) - 0.84, BACK_CORNER_BLIND.targetAbsX);
+  slot.x = sign * Math.max(Math.abs(slot.x), 3.72);
+  slot.z = Math.max(slot.z + 1.46, BACK_CORNER_BLIND.targetZ);
+  slot.rotY = (slot.rotY || 0) + (sign > 0 ? -BACK_CORNER_BLIND.rotYAdd : BACK_CORNER_BLIND.rotYAdd);
+  return slot;
+}
+
+function shouldPullLeftEdgeSlotForward(slot) {
+  return !!slot
+    && Number.isFinite(slot.x)
+    && Number.isFinite(slot.z)
+    && slot.x <= LEFT_EDGE_FORWARD_PULL.maxX
+    && slot.z >= LEFT_EDGE_FORWARD_PULL.minZ
+    && slot.z <= LEFT_EDGE_FORWARD_PULL.maxZ
+    && !isInBackCornerBlindZone(slot)
+    && !isInLeftFrontForbiddenZone(slot);
+}
+
+function applyLeftEdgeForwardPullToSlot(slot) {
+  if (!slot) return slot;
+  if (!shouldPullLeftEdgeSlotForward(slot)) return slot;
+
+  const isExtremeLeftEdge = Number.isFinite(slot.x) && slot.x <= LEFT_EDGE_FORWARD_PULL.extremeMaxX;
+  const forwardPull = LEFT_EDGE_FORWARD_PULL.pullForwardZ + (isExtremeLeftEdge ? LEFT_EDGE_FORWARD_PULL.extremeExtraPullForwardZ : 0);
+  const clampMaxZ = isExtremeLeftEdge ? LEFT_EDGE_FORWARD_PULL.extremeClampMaxZ : LEFT_EDGE_FORWARD_PULL.clampMaxZ;
+
+  slot.z = Math.min(slot.z + forwardPull, clampMaxZ);
+  return slot;
+}
+
+function shouldFillFarLeftFrontSlot(slot) {
+  return !!slot
+    && Number.isFinite(slot.x)
+    && Number.isFinite(slot.z)
+    && slot.x <= FAR_LEFT_FRONT_FILL.maxX
+    && slot.z >= FAR_LEFT_FRONT_FILL.minZ
+    && slot.z <= FAR_LEFT_FRONT_FILL.maxZ
+    && !isInBackCornerBlindZone(slot);
+}
+
+function applyFarLeftFrontFillToSlot(slot) {
+  if (!slot) return slot;
+  if (!shouldFillFarLeftFrontSlot(slot)) return slot;
+
+  const isExtremeFarLeft = Number.isFinite(slot.x) && slot.x <= FAR_LEFT_FRONT_FILL.extremeMaxX;
+  const leftShift = FAR_LEFT_FRONT_FILL.pullLeftX + (isExtremeFarLeft ? FAR_LEFT_FRONT_FILL.extremeExtraLeftX : 0);
+  const forwardShift = FAR_LEFT_FRONT_FILL.pullForwardZ + (isExtremeFarLeft ? FAR_LEFT_FRONT_FILL.extremeExtraForwardZ : 0);
+
+  slot.x += leftShift;
+  slot.z = Math.min(slot.z + forwardShift, FAR_LEFT_FRONT_FILL.clampMaxZ);
+  slot.rotY = (slot.rotY || 0) + FAR_LEFT_FRONT_FILL.rotYAdd;
+  return slot;
+}
+
+function isHardBlockedFloorSlot(slot) {
+  return isInRightFrontForbiddenZone(slot)
+    || isInLeftFrontForbiddenZone(slot)
+    || isInCenterFrontForbiddenZone(slot)
+    || isInDeskLegRightLeftHardAvoidZone(slot)
+    || isInBackCornerBlindZone(slot);
+}
+
+function stabilizeFloorSlotCandidate(slot) {
+  if (!slot) return slot;
+  normalizeFloorPlacementSlot(slot);
+
+  if (isHardBlockedFloorSlot(slot)) {
+    const sign = slot.x >= 0 ? 1 : -1;
+    slot.x = sign * Math.min(Math.max(Math.abs(slot.x), 2.8), 4.3);
+    slot.z = clamp(slot.z, -2.8, 2.6);
+    slot.rotY = (slot.rotY || 0) + (sign > 0 ? -0.06 : 0.06);
+    normalizeFloorPlacementSlot(slot);
   }
 
-  const sp=LQ.subPressure*0.8+S.sub*0.35;
-  const spMic = isMicOv ? sp * 2.5 : sp;
-  if(spMic>0.025) VLINES.forEach(l=>{
-    const al=spMic*0.072*(0.5+0.5*Math.sin(ovTime*l.speed+l.phase))*palFade;
-    if(al<0.004) return;
-    const x=l.x*W;
-    const wa=spMic*W*0.006+LQ.bassShock*W*0.003*(isMicOv?2.0:1.0);
-    ovCtx.beginPath();
-    ovCtx.strokeStyle=`rgba(${pr},${pg},${pb},${Math.min(al,0.5).toFixed(3)})`;
-    ovCtx.lineWidth=0.6+(isMicOv?LQ.subPressure*0.6:0);
-    for(let y=0;y<=H;y+=4){
-      const w=wa*Math.sin(y/H*Math.PI*4+ovTime*l.speed*2+l.phase);
-      if(y===0) ovCtx.moveTo(x+w,y); else ovCtx.lineTo(x+w,y);
-    }
-    ovCtx.stroke();
-  });
+  return slot;
+}
 
-  if(analyser&&timeData&&S.energy>0.012){
-    analyser.getByteTimeDomainData(timeData);
-    const wfAl=(0.14+S.energy*0.32*micBoost+LQ.midDensity*0.16*micBoost)*palFade;
-    const wfY=H*0.89, wfAmp=H*0.058*(0.4+S.energy*0.7*micBoost), step=W/timeData.length;
-    ovCtx.beginPath();
-    ovCtx.strokeStyle=`rgba(${pr},${pg},${pb},${wfAl.toFixed(3)})`;
-    ovCtx.lineWidth=1.1;
-    for(let i=0;i<timeData.length;i++){
-      const v=(timeData[i]/128.0-1.0)*wfAmp, x=i*step, y=wfY+v;
-      if(i===0) ovCtx.moveTo(x,y); else ovCtx.lineTo(x,y);
+function applyRightSidePullLeftToSlot(slot) {
+  if (!slot || !Number.isFinite(slot.x)) return slot;
+  if (slot.x < RIGHT_SIDE_RANGE_TIGHTEN_START_X) return slot;
+
+  slot.x += RIGHT_SIDE_RANGE_TIGHTEN_X;
+
+  if (slot.x >= RIGHT_SIDE_RANGE_TIGHTEN_EXTRA_START_X) {
+    slot.x += RIGHT_SIDE_RANGE_TIGHTEN_EXTRA_X;
+  }
+
+  return slot;
+}
+
+function normalizeFloorPlacementSlot(slot) {
+  if (!slot || slot[FLOOR_PLACEMENT_NORMALIZE_VERSION]) return slot;
+
+  applyRightFrontRedirectToSlot(slot);
+  applyLeftFrontRedirectToSlot(slot);
+  applyCenterFrontRedirectToSlot(slot);
+  applyDeskUnderRightReduceToSlot(slot);
+  applyDeskLegRightLeftRedirectToSlot(slot);
+  applyBackCornerBlindRedirectToSlot(slot);
+  applyLeftEdgeForwardPullToSlot(slot);
+  applyFarLeftFrontFillToSlot(slot);
+  applyRightSidePullLeftToSlot(slot);
+
+  slot[FLOOR_PLACEMENT_NORMALIZE_VERSION] = true;
+  return slot;
+}
+
+function applyFloorPlacementNormalization(slotLists) {
+  slotLists.forEach((slotList) => {
+    slotList.forEach((slot) => {
+      normalizeFloorPlacementSlot(slot);
+    });
+  });
+}
+
+function getFloorSlotSpreadBucket(slot) {
+  if (isInDeskUnderRightSoftAvoidZone(slot) || isInDeskLegRightLeftHardAvoidZone(slot)) return 8;
+  if (slot.z < -2.1 && slot.x < -1.0) return 0;
+  if (slot.z < -2.1 && slot.x > 1.0) return 1;
+  if (slot.z < 0.6 && Math.abs(slot.x) <= 2.4) return 2;
+  if (slot.z < 1.7 && slot.x < -1.0) return 3;
+  if (slot.z < 1.7 && slot.x > 1.0) return 4;
+  if (slot.z < 1.7) return 5;
+  if (slot.x < 0) return 6;
+  return 7;
+}
+
+function rebalanceFloorSlotSpread(slotLists) {
+  slotLists.forEach((slotList) => {
+    const buckets = Array.from({ length: 9 }, () => []);
+    slotList.forEach((slot) => {
+      buckets[getFloorSlotSpreadBucket(slot)].push(slot);
+    });
+
+    buckets.forEach((bucket) => {
+      bucket.sort((a, b) => {
+        const depthDiff = a.z - b.z;
+        if (depthDiff !== 0) return depthDiff;
+        return Math.abs(a.x) - Math.abs(b.x);
+      });
+    });
+
+    const next = [];
+    let added = true;
+    while (added) {
+      added = false;
+      for (let i = 0; i < buckets.length; i += 1) {
+        if (buckets[i].length) {
+          next.push(buckets[i].shift());
+          added = true;
+        }
+      }
     }
-    ovCtx.stroke();
+
+    slotList.splice(0, slotList.length, ...next);
+  });
+}
+
+applyFloorPlacementNormalization([
+  CLUTTER_SLOTS,
+  RECORD_FLOOR_SLOTS,
+  RECORD_SECONDARY_SPREAD_SLOTS,
+  CLUTTER_SECONDARY_SPREAD_SLOTS,
+  CLOTHES_SLOTS,
+  SNACK_SLOTS,
+  EMOTION_REWARD_SLOTS,
+]);
+
+rebalanceFloorSlotSpread([
+  CLUTTER_SLOTS,
+  RECORD_FLOOR_SLOTS,
+  RECORD_SECONDARY_SPREAD_SLOTS,
+  CLUTTER_SECONDARY_SPREAD_SLOTS,
+  CLOTHES_SLOTS,
+  EMOTION_REWARD_SLOTS,
+]);
+
+const EMOTION_REWARD_DESK_LIMIT = 1;
+
+const UI = {
+  appShell: document.getElementById('app'),
+  sceneRoot: document.getElementById('scene-root'),
+  permissionModal: document.getElementById('permission-modal'),
+  allowMic: document.getElementById('allow-mic'),
+  entryPanel: document.getElementById('entry-panel'),
+  categoryGrid: document.getElementById('category-grid'),
+  toneWrap: document.getElementById('emotion-tone-wrap'),
+  toneChips: Array.from(document.querySelectorAll('.tone-chip')),
+  selectionCopy: document.getElementById('selection-copy'),
+  recordBtn: document.getElementById('record-btn'),
+  transcriptText: document.getElementById('transcript-text'),
+  micBadge: document.getElementById('mic-badge'),
+  roomTitle: document.getElementById('room-title'),
+  roomSubtitle: document.getElementById('room-subtitle'),
+  memoCount: document.getElementById('memo-count'),
+  activeVisualCount: document.getElementById('active-visual-count'),
+  newMemoBtn: document.getElementById('new-memo-btn'),
+  closeEntryBtn: document.getElementById('close-entry-btn'),
+  openHistoryBtn: document.getElementById('open-history-btn'),
+  closeHistoryBtn: document.getElementById('close-history-btn'),
+  historyPanel: document.getElementById('history-panel'),
+  historyList: document.getElementById('history-list'),
+};
+
+
+const STATE = {
+  memos: [],
+  selection: {
+    category: '',
+    emotionTone: 'good',
+  },
+  recognition: null,
+  recognitionLanguage: HYBRID_RECOGNITION_LANG,
+  hasMicPermission: false,
+  isListening: false,
+  keepRecognitionAlive: false,
+  isFinalizing: false,
+  finalTranscript: '',
+  interimTranscript: '',
+  silenceTimer: null,
+  scene: null,
+  camera: null,
+  renderer: null,
+  clock: new THREE.Clock(),
+  pointer: new THREE.Vector2(),
+  pointerClient: { x: window.innerWidth * 0.5, y: window.innerHeight * 0.5 },
+  raycaster: new THREE.Raycaster(),
+  hoveredRoot: null,
+  hoverDebounceTimer: null,
+  hoverDebouncePendingRoot: null,
+  mixers: [],
+  templates: {},
+  visuals: [],
+  staticDecor: [],
+  room: {
+    desk: null,
+    deskTopY: 1.28,
+    deskCenter: new THREE.Vector3(0, 0, -4.2),
+    deskSurfaceBounds: null,
+    deskSurfaceYTolerance: 0.16,
+    chairSeatY: 0.72,
+    chairSurfaceBounds: null,
+    chairSurfaceYTolerance: 0.14,
+    deskMeshes: [],
+    deskBounds: null,
+  },
+  lastVisualSignature: '',
+  visualCheckElapsed: 0,
+  pendingVisualRebuild: false,
+  appReady: false,
+  loadingOverlay: null,
+  playedEmotionRewardDropMemoIds: new Set(),
+  layoutCache: Object.create(null),
+  /* physics & interaction */
+  tilt: { x: 0, z: 0, rawBeta: 0, rawGamma: 0, active: false },
+  grabbedVisual: null,
+  grabState: null, /* { startTime, startX, startY, pointerId, isDragging, velocityHistory, lastX, lastY, lastTime, liftY } */
+  longPressTimer: null,
+  physicsEnabled: true,
+  idbReady: false,
+  idbDatabase: null,
+  easter: {
+    overlayRoot: null,
+    deleteStreakCount: 0,
+    deleteStreakTriggered: false,
+    lastDeleteAt: 0,
+    sessionRa4Shown: false,
+    seen: {
+      ra1: false,
+      ra5: false,
+      ra6: false,
+    },
+    cooldowns: {
+      ra2: 0,
+      ra4: 0,
+    },
+  },
+};
+
+
+const CLICK_SOUND_PATH = './assets/click.mp3';
+const BUTTON_SOUND_VOLUME = 0.22;
+const BUTTON_SOUND_POOL_SIZE = 8;
+const BUTTON_SOUND_SELECTOR = 'button';
+
+const BUTTON_SOUND_POOL = [];
+let buttonSoundPoolIndex = 0;
+let buttonPressReleaseTimer = null;
+
+const EASTER_STORAGE_KEY = 'mind-room-easter-v1';
+const EASTER_ASSET_PATHS = Object.freeze({
+  ra1: './assets/ra1.png',
+  ra2: './assets/ra2.png',
+  ra3: './assets/ra3.png',
+  ra4: './assets/ra4.png',
+  ra5: './assets/ra5.png',
+  ra6: './assets/ra6.png',
+});
+const EASTER_DELETE_STREAK_WINDOW_MS = 4200;
+const EASTER_DELETE_STREAK_TRIGGER = 10;
+const EASTER_CREATION_DELAY_MS = 2000;
+const EASTER_SNACK_BATCH_SIZE = 5;
+const EASTER_EMOTION_BATCH_SIZE = 10;
+const EASTER_ROUTINE_BATCH_SIZE = 10;
+const EASTER_ULTRA_RARE_CHANCE = 0.0025;
+const EASTER_RA4_COOLDOWN_MS = 12 * 60 * 1000;
+
+
+function isDummyMemo(memo) {
+  return typeof memo?.id === 'string' && memo.id.startsWith('dummy-');
+}
+
+function cleanupLegacyDummyMemos() {
+  const previousCount = STATE.memos.length;
+  const filteredMemos = STATE.memos.filter((memo) => !isDummyMemo(memo));
+
+  if (filteredMemos.length === previousCount) return 0;
+
+  STATE.memos = filteredMemos;
+
+  const nextLayoutCache = Object.create(null);
+  Object.entries(STATE.layoutCache || {}).forEach(([key, entry]) => {
+    if (typeof key === 'string' && (key.includes('dummy-') || key === 'clutter-old:shared')) return;
+    nextLayoutCache[key] = entry;
+  });
+  STATE.layoutCache = nextLayoutCache;
+
+  return previousCount - filteredMemos.length;
+}
+
+function loadEasterState() {
+  try {
+    const raw = localStorage.getItem(EASTER_STORAGE_KEY);
+    if (!raw) return;
+    const parsed = JSON.parse(raw);
+    if (!parsed || typeof parsed !== 'object') return;
+
+    STATE.easter.seen = {
+      ...STATE.easter.seen,
+      ...(parsed.seen && typeof parsed.seen === 'object' ? parsed.seen : {}),
+    };
+    STATE.easter.cooldowns = {
+      ...STATE.easter.cooldowns,
+      ...(parsed.cooldowns && typeof parsed.cooldowns === 'object' ? parsed.cooldowns : {}),
+    };
+  } catch (error) {
+    console.warn('Failed to load easter state.', error);
   }
 }
 
-// ── WebGL Shader (배경 전체)
-const VERT=`attribute vec2 a_pos;varying vec2 v_uv;void main(){v_uv=a_pos*.5+.5;gl_Position=vec4(a_pos,0.,1.);}`;
-const FRAG=`
-precision highp float;
-varying vec2 v_uv;
-uniform vec2 u_res;uniform float u_time,u_sub,u_bass,u_mid,u_high,u_air,u_energy;
-uniform vec2 u_mouse;uniform vec3 u_palette;
-uniform float u_lq_sub,u_lq_mid,u_lq_shimmer,u_lq_air,u_lq_surface;
-float hash(vec2 p){return fract(sin(dot(p,vec2(127.1,311.7)))*43758.5453);}
-float noise(vec2 p){vec2 i=floor(p),f=fract(p);float a=hash(i),b=hash(i+vec2(1,0)),c=hash(i+vec2(0,1)),d=hash(i+vec2(1,1));vec2 u=f*f*(3.-2.*f);return mix(a,b,u.x)+(c-a)*u.y*(1.-u.x)+(d-b)*u.x*u.y;}
-float fbm(vec2 p){float v=0.,a=.5;for(int i=0;i<5;i++){v+=a*noise(p);p*=2.;a*=.5;}return v;}
-void main(){
-  vec2 p=v_uv-.5;p.x*=u_res.x/u_res.y;
-  vec2 m=u_mouse-.5;m.x*=u_res.x/u_res.y;
-  float t=u_time*0.20,dist=length(p-m*0.09);
-  vec2 warp=p;
-  warp+=0.022*sin(5.0*p.yx+u_time*0.85);
-  warp+=0.065*u_lq_sub*normalize(p+0.0001)*(0.5+0.5*sin(dist*14.0-u_time*1.8));
-  warp+=0.038*u_lq_mid*vec2(fbm(p*2.1+vec2(0.,t)),fbm(p*2.1-vec2(t,0.)));
-  warp+=0.012*u_lq_shimmer*vec2(sin(p.y*18.0+u_time*5.5),cos(p.x*18.0+u_time*4.8));
-  float n1=fbm(warp*2.8+vec2(0.,t)),n2=fbm(warp*4.0-vec2(t*0.65,0.));
-  float eBoost=u_energy*u_energy;
-  float haze=smoothstep(0.18,1.25,1.28-dist+n1*0.26);
-  float core=0.12/(dist+0.16);core*=0.32+u_lq_sub*0.82+eBoost*0.65;
-  float ring=smoothstep(0.42+u_lq_sub*0.07,0.12,dist);
-  float shimmer=sin((dist-u_time*0.20)*42.)*0.5+0.5;ring*=mix(0.35,1.0,shimmer*u_lq_shimmer);
-  float takeover=smoothstep(1.15,0.18,dist+n2*0.11);takeover*=0.10+eBoost*0.70;
-  float beamsV=smoothstep(0.92,0.,abs(p.x+sin(p.y*5.+t)*0.055));beamsV*=(0.020+u_lq_mid*0.16)*eBoost;
-  float beamsH=smoothstep(0.88,0.,abs(p.y+cos(p.x*4.+t*1.1)*0.035));beamsH*=(0.012+u_lq_air*0.10)*eBoost;
-  float edgeD=length(p),edge=smoothstep(0.55,0.80,edgeD)*smoothstep(1.10,0.75,edgeD);
-  edge*=0.020+u_lq_air*0.16+u_lq_shimmer*0.08+u_lq_surface*0.06;
-  vec3 bg=vec3(0.010,0.012,0.028),blue=vec3(0.40,0.52,0.95),violet=vec3(0.52,0.42,0.98),silver=vec3(0.84,0.88,1.00),cold=vec3(0.60,0.75,1.00);
-  vec3 pal=u_palette;
-  vec3 bB=mix(blue,pal,0.55),vB=mix(violet,pal,0.50);
-  vec3 color=bg;
-  color+=haze*mix(bB,vB,n1)*(0.045+u_lq_mid*0.12+eBoost*0.14);
-  color+=core*mix(bB,silver,0.42);
-  color+=ring*mix(vB,silver,0.32)*(0.06+u_lq_shimmer*0.18+eBoost*0.12);
-  color+=takeover*mix(bB,vB,n2)*0.18;
-  color+=beamsV*silver*0.10+beamsH*vB*0.06+edge*mix(cold,silver,0.4);
-  color+=u_lq_air*0.024*mix(cold,silver,0.5)*smoothstep(0.85,0.0,edgeD);
-  color*=smoothstep(1.30,0.22,length(p));
-  color=pow(max(color,vec3(0.)),vec3(0.90));
-  gl_FragColor=vec4(color,1.);
-}`;
-
-
-let gl,prog;
-let glContextLost=false;
-let glCanvasBound=false;
-let uRes,uTime,uSub,uBass,uMid,uHigh,uAir,uEnergy,uMouse,uPalette;
-let uLqSub,uLqMid,uLqShimmer,uLqAir,uLqSurface;
-let t0;
-
-function initGL(){
-  const cv=document.getElementById("glcanvas");
-  if(!cv) return false;
-
-  if(!glCanvasBound){
-    cv.addEventListener("webglcontextlost",(e)=>{
-      e.preventDefault();
-      glContextLost=true;
-    },false);
-
-    cv.addEventListener("webglcontextrestored",()=>{
-      glContextLost=false;
-      gl=null;
-      prog=null;
-      initGL();
-      resizeGL();
-    },false);
-
-    glCanvasBound=true;
+function persistEasterState() {
+  try {
+    localStorage.setItem(EASTER_STORAGE_KEY, JSON.stringify({
+      seen: STATE.easter.seen,
+      cooldowns: STATE.easter.cooldowns,
+    }));
+  } catch (error) {
+    console.warn('Failed to persist easter state.', error);
   }
+}
 
-  gl=cv.getContext("webgl",{ alpha:true, antialias:false, powerPreference:"high-performance", preserveDrawingBuffer:false })||
-     cv.getContext("experimental-webgl",{ alpha:true, antialias:false, powerPreference:"high-performance", preserveDrawingBuffer:false });
+function ensureEasterOverlayRoot() {
+  if (STATE.easter.overlayRoot) return STATE.easter.overlayRoot;
+  if (!UI.appShell) return null;
 
-  if(!gl){ console.error("WebGL없음"); return false; }
+  const root = document.createElement('div');
+  root.id = 'easter-overlay-root';
+  Object.assign(root.style, {
+    position: 'absolute',
+    inset: '0',
+    pointerEvents: 'none',
+    overflow: 'hidden',
+    zIndex: '90',
+  });
+  UI.appShell.appendChild(root);
+  STATE.easter.overlayRoot = root;
+  return root;
+}
 
-  const verts=new Float32Array([-1,-1,1,-1,-1,1,-1,1,1,-1,1,1]);
-  const buf=gl.createBuffer();
-  gl.bindBuffer(gl.ARRAY_BUFFER,buf);
-  gl.bufferData(gl.ARRAY_BUFFER,verts,gl.STATIC_DRAW);
+function createEasterImage(assetKey, style = {}) {
+  const root = ensureEasterOverlayRoot();
+  if (!root) return null;
 
-  const mkS=(type,src)=>{
-    const s=gl.createShader(type);
-    gl.shaderSource(s,src);
-    gl.compileShader(s);
-    if(!gl.getShaderParameter(s,gl.COMPILE_STATUS)) console.error(gl.getShaderInfoLog(s));
-    return s;
+  const img = document.createElement('img');
+  img.src = EASTER_ASSET_PATHS[assetKey];
+  img.alt = '';
+  img.draggable = false;
+  Object.assign(img.style, {
+    position: 'absolute',
+    left: '50%',
+    top: '50%',
+    transform: 'translate(-50%, -50%)',
+    transformOrigin: 'center center',
+    objectFit: 'contain',
+    userSelect: 'none',
+    willChange: 'transform, opacity',
+    opacity: '0',
+    filter: 'drop-shadow(0 18px 30px rgba(20, 16, 12, 0.22))',
+  }, style);
+  img.onerror = () => {
+    console.warn(`[easter] Failed to load ${assetKey}: ${EASTER_ASSET_PATHS[assetKey]}`);
+    img.remove();
   };
+  root.appendChild(img);
+  return img;
+}
 
-  prog=gl.createProgram();
-  gl.attachShader(prog,mkS(gl.VERTEX_SHADER,VERT));
-  gl.attachShader(prog,mkS(gl.FRAGMENT_SHADER,FRAG));
-  gl.linkProgram(prog);
-  if(!gl.getProgramParameter(prog,gl.LINK_STATUS)){
-    console.error(gl.getProgramInfoLog(prog));
-    return false;
+function animateAndRemove(element, keyframes, options) {
+  if (!element) return;
+  const animation = element.animate(keyframes, options);
+  animation.onfinish = () => {
+    element.remove();
+  };
+}
+
+function showEasterRa1() {
+  const img = createEasterImage('ra1', { width: 'min(54vw, 520px)', maxWidth: '78vw', maxHeight: '58vh' });
+  animateAndRemove(img, [
+    { opacity: 0, transform: 'translate(-50%, -50%) scale(0.82)' },
+    { opacity: 1, transform: 'translate(-50%, -50%) scale(1)', offset: 0.18 },
+    { opacity: 1, transform: 'translate(-50%, -50%) scale(1.03)', offset: 0.78 },
+    { opacity: 0, transform: 'translate(-50%, -50%) scale(1.1)' },
+  ], { duration: 1320, easing: 'cubic-bezier(0.22, 0.8, 0.25, 1)', fill: 'forwards' });
+}
+
+function showEasterRa2() {
+  const img = createEasterImage('ra2', { width: 'min(36vw, 320px)', maxWidth: '48vw', maxHeight: '48vh' });
+  animateAndRemove(img, [
+    { opacity: 0, transform: 'translate(-50%, -50%) scale(0.18)' },
+    { opacity: 1, transform: 'translate(-50%, -50%) scale(0.32)', offset: 0.18 },
+    { opacity: 1, transform: 'translate(-50%, -50%) scale(0.88)', offset: 0.5 },
+    { opacity: 1, transform: 'translate(-50%, -50%) scale(2.2)', offset: 0.72 },
+    { opacity: 1, transform: 'translate(-50%, -50%) scale(5.4)', offset: 0.86 },
+    { opacity: 1, transform: 'translate(-50%, -50%) scale(12.8)' },
+  ], { duration: 2060, easing: 'cubic-bezier(0.1, 0.66, 0.16, 1)', fill: 'forwards' });
+}
+
+function showEasterRa3() {
+  const top = `${18 + Math.random() * 46}%`;
+  const img = createEasterImage('ra3', {
+    width: 'min(38vw, 360px)',
+    maxWidth: '54vw',
+    maxHeight: '38vh',
+    left: '108vw',
+    top,
+    transform: 'translateY(-50%) scale(1.18)',
+    opacity: '1',
+  });
+  animateAndRemove(img, [
+    { opacity: 0, transform: 'translateY(-50%) translateX(0vw) scale(1.12)' },
+    { opacity: 1, transform: 'translateY(-50%) translateX(-8vw) scale(1.18)', offset: 0.14 },
+    { opacity: 1, transform: 'translateY(-50%) translateX(-86vw) scale(1.22)', offset: 0.86 },
+    { opacity: 0, transform: 'translateY(-50%) translateX(-124vw) scale(1.26)' },
+  ], { duration: 2380, easing: 'cubic-bezier(0.2, 0.72, 0.24, 1)', fill: 'forwards' });
+}
+
+function showEasterRa4() {
+  const left = `${14 + Math.random() * 72}%`;
+  const top = `${14 + Math.random() * 66}%`;
+  const img = createEasterImage('ra4', {
+    width: 'min(16vw, 150px)',
+    maxWidth: '24vw',
+    maxHeight: '24vh',
+    left,
+    top,
+    transform: 'translate(-50%, -50%) scale(0.84)',
+  });
+  animateAndRemove(img, [
+    { opacity: 0, transform: 'translate(-50%, -50%) scale(0.78)' },
+    { opacity: 1, transform: 'translate(-50%, -50%) scale(1)', offset: 0.22 },
+    { opacity: 1, transform: 'translate(-50%, -50%) scale(1.02)', offset: 0.76 },
+    { opacity: 0, transform: 'translate(-50%, -50%) scale(1.08)' },
+  ], { duration: 1120, easing: 'ease-out', fill: 'forwards' });
+}
+
+function showEasterRa5() {
+  const img = createEasterImage('ra5', { width: 'min(32vw, 300px)', maxWidth: '46vw', maxHeight: '36vh', top: '42%' });
+  animateAndRemove(img, [
+    { opacity: 0, transform: 'translate(-50%, -50%) scale(0.84)' },
+    { opacity: 1, transform: 'translate(-50%, -50%) scale(1)', offset: 0.2 },
+    { opacity: 1, transform: 'translate(-50%, -50%) scale(1.03)', offset: 0.78 },
+    { opacity: 0, transform: 'translate(-50%, -50%) scale(1.1)' },
+  ], { duration: 1180, easing: 'cubic-bezier(0.23, 0.82, 0.24, 1)', fill: 'forwards' });
+}
+
+function showEasterRa6() {
+  const img = createEasterImage('ra6', { width: 'min(34vw, 320px)', maxWidth: '48vw', maxHeight: '38vh', top: '36%' });
+  animateAndRemove(img, [
+    { opacity: 0, transform: 'translate(-50%, -50%) scale(0.82)' },
+    { opacity: 1, transform: 'translate(-50%, -50%) scale(1)', offset: 0.2 },
+    { opacity: 1, transform: 'translate(-50%, -50%) scale(1.02)', offset: 0.76 },
+    { opacity: 0, transform: 'translate(-50%, -50%) scale(1.08)' },
+  ], { duration: 1160, easing: 'ease-out', fill: 'forwards' });
+}
+
+function getRealMemoCountByCategory(category) {
+  return STATE.memos.filter((memo) => memo && !isDummyMemo(memo) && memo.category === category).length;
+}
+
+function resetDeleteStreak() {
+  STATE.easter.deleteStreakCount = 0;
+  STATE.easter.lastDeleteAt = 0;
+  STATE.easter.deleteStreakTriggered = false;
+}
+
+function maybeTriggerUltraRareRa4() {
+  const now = Date.now();
+  if (STATE.easter.sessionRa4Shown) return;
+  if (now - (STATE.easter.cooldowns.ra4 || 0) < EASTER_RA4_COOLDOWN_MS) return;
+  if (Math.random() >= EASTER_ULTRA_RARE_CHANCE) return;
+
+  STATE.easter.sessionRa4Shown = true;
+  STATE.easter.cooldowns.ra4 = now;
+  persistEasterState();
+  showEasterRa4();
+}
+
+function maybeTriggerReloadRa3() {
+  if (Math.random() >= 0.1) return;
+  window.setTimeout(() => {
+    showEasterRa3();
+  }, 380 + Math.random() * 540);
+}
+
+function scheduleCreationEaster(triggerCount, validator, callback) {
+  window.setTimeout(() => {
+    if (typeof validator === 'function' && !validator(triggerCount)) return;
+    callback();
+  }, EASTER_CREATION_DELAY_MS);
+}
+
+function maybeTriggerCreationEasters(memo) {
+  if (!memo || isDummyMemo(memo)) return;
+
+  if (memo.category === 'snack') {
+    const snackCount = getRealMemoCountByCategory('snack');
+    const previousSnackCount = Math.max(0, snackCount - 1);
+    const crossedSnackBatch = Math.floor(snackCount / EASTER_SNACK_BATCH_SIZE)
+      > Math.floor(previousSnackCount / EASTER_SNACK_BATCH_SIZE);
+
+    if (crossedSnackBatch) {
+      scheduleCreationEaster(
+        snackCount,
+        (requiredCount) => getRealMemoCountByCategory('snack') >= requiredCount,
+        () => {
+          console.info(`[easter] ra1 triggered at snack count ${snackCount}`);
+          showEasterRa1();
+        },
+      );
+    }
   }
 
-  gl.useProgram(prog);
-  const loc=gl.getAttribLocation(prog,"a_pos");
-  gl.enableVertexAttribArray(loc);
-  gl.vertexAttribPointer(loc,2,gl.FLOAT,false,0,0);
+  if (memo.category === 'emotion') {
+    const emotionCount = getRealMemoCountByCategory('emotion');
+    const previousEmotionCount = Math.max(0, emotionCount - 1);
+    const crossedEmotionBatch = Math.floor(emotionCount / EASTER_EMOTION_BATCH_SIZE)
+      > Math.floor(previousEmotionCount / EASTER_EMOTION_BATCH_SIZE);
 
-  uRes=gl.getUniformLocation(prog,"u_res");
-  uTime=gl.getUniformLocation(prog,"u_time");
-  uSub=gl.getUniformLocation(prog,"u_sub");
-  uBass=gl.getUniformLocation(prog,"u_bass");
-  uMid=gl.getUniformLocation(prog,"u_mid");
-  uHigh=gl.getUniformLocation(prog,"u_high");
-  uAir=gl.getUniformLocation(prog,"u_air");
-  uEnergy=gl.getUniformLocation(prog,"u_energy");
-  uMouse=gl.getUniformLocation(prog,"u_mouse");
-  uPalette=gl.getUniformLocation(prog,"u_palette");
-  uLqSub=gl.getUniformLocation(prog,"u_lq_sub");
-  uLqMid=gl.getUniformLocation(prog,"u_lq_mid");
-  uLqShimmer=gl.getUniformLocation(prog,"u_lq_shimmer");
-  uLqAir=gl.getUniformLocation(prog,"u_lq_air");
-  uLqSurface=gl.getUniformLocation(prog,"u_lq_surface");
+    if (crossedEmotionBatch) {
+      scheduleCreationEaster(
+        emotionCount,
+        (requiredCount) => getRealMemoCountByCategory('emotion') >= requiredCount,
+        () => {
+          console.info(`[easter] ra5 triggered at emotion count ${emotionCount}`);
+          showEasterRa5();
+        },
+      );
+    }
+  }
 
-  t0=performance.now();
-  resizeGL();
+  if (memo.category === 'routine') {
+    const routineCount = getRealMemoCountByCategory('routine');
+    const previousRoutineCount = Math.max(0, routineCount - 1);
+    const crossedRoutineBatch = Math.floor(routineCount / EASTER_ROUTINE_BATCH_SIZE)
+      > Math.floor(previousRoutineCount / EASTER_ROUTINE_BATCH_SIZE);
+
+    if (crossedRoutineBatch) {
+      scheduleCreationEaster(
+        routineCount,
+        (requiredCount) => getRealMemoCountByCategory('routine') >= requiredCount,
+        () => {
+          console.info(`[easter] ra6 triggered at routine count ${routineCount}`);
+          showEasterRa6();
+        },
+      );
+    }
+  }
+
+  maybeTriggerUltraRareRa4();
+}
+
+function registerDeleteActionForEaster() {
+  const now = Date.now();
+  const elapsed = now - (STATE.easter.lastDeleteAt || 0);
+
+  if (!STATE.easter.lastDeleteAt || elapsed > EASTER_DELETE_STREAK_WINDOW_MS) {
+    STATE.easter.deleteStreakCount = 1;
+    STATE.easter.deleteStreakTriggered = false;
+  } else {
+    STATE.easter.deleteStreakCount += 1;
+  }
+
+  STATE.easter.lastDeleteAt = now;
+
+  if (STATE.easter.deleteStreakCount >= EASTER_DELETE_STREAK_TRIGGER
+      && STATE.easter.deleteStreakCount % EASTER_DELETE_STREAK_TRIGGER === 0) {
+    window.setTimeout(() => {
+      showEasterRa2();
+    }, EASTER_CREATION_DELAY_MS);
+  }
+
+  maybeTriggerUltraRareRa4();
+}
+
+function initButtonSoundPool() {
+  if (BUTTON_SOUND_POOL.length) return;
+
+  for (let index = 0; index < BUTTON_SOUND_POOL_SIZE; index += 1) {
+    const audio = new Audio(CLICK_SOUND_PATH);
+    audio.preload = 'auto';
+    audio.volume = BUTTON_SOUND_VOLUME;
+    BUTTON_SOUND_POOL.push(audio);
+  }
+}
+
+function playButtonClickSound() {
+  if (!BUTTON_SOUND_POOL.length) return;
+
+  const audio = BUTTON_SOUND_POOL[buttonSoundPoolIndex];
+  buttonSoundPoolIndex = (buttonSoundPoolIndex + 1) % BUTTON_SOUND_POOL.length;
+
+  try {
+    audio.currentTime = 0;
+    const playPromise = audio.play();
+    if (playPromise && typeof playPromise.catch === 'function') {
+      playPromise.catch(() => {});
+    }
+  } catch (error) {
+    // intentionally ignore optional UI sound errors
+  }
+}
+
+function clearPressedButtons() {
+  document.querySelectorAll('.is-pressing').forEach((element) => {
+    element.classList.remove('is-pressing');
+  });
+}
+
+function markButtonPress(button) {
+  if (!(button instanceof HTMLElement)) return;
+  button.classList.add('is-pressing');
+
+  if (buttonPressReleaseTimer) {
+    clearTimeout(buttonPressReleaseTimer);
+  }
+
+  buttonPressReleaseTimer = setTimeout(() => {
+    clearPressedButtons();
+    buttonPressReleaseTimer = null;
+  }, 180);
+}
+
+function setupButtonSoundUI() {
+  initButtonSoundPool();
+
+  const isValidButtonTarget = (button) => (
+    button
+    && !button.disabled
+    && button.getAttribute('aria-disabled') !== 'true'
+  );
+
+  document.addEventListener('pointerdown', (event) => {
+    const button = event.target instanceof Element ? event.target.closest(BUTTON_SOUND_SELECTOR) : null;
+    if (!isValidButtonTarget(button)) return;
+    markButtonPress(button);
+    playButtonClickSound();
+  }, true);
+
+  document.addEventListener('keydown', (event) => {
+    if (event.repeat || (event.key !== 'Enter' && event.key !== ' ')) return;
+    const button = event.target instanceof Element ? event.target.closest(BUTTON_SOUND_SELECTOR) : null;
+    if (!isValidButtonTarget(button)) return;
+    markButtonPress(button);
+    playButtonClickSound();
+  }, true);
+
+  ['pointerup', 'pointercancel', 'dragend', 'keyup', 'blur'].forEach((eventName) => {
+    window.addEventListener(eventName, () => {
+      clearPressedButtons();
+    }, true);
+  });
+}
+
+
+init();
+
+async function init() {
+  await openIDB();
+  await loadStorage();
+  loadEasterState();
+  setupButtonSoundUI();
+  ensureEasterOverlayRoot();
+  const removedLegacyDummyMemoCount = cleanupLegacyDummyMemos();
+  if (removedLegacyDummyMemoCount > 0) persistStorage();
+  seedPlayedEmotionRewardDropsFromExistingMemos();
+  setupUI();
+  renderCategoryChips();
+  syncSelectionUI();
+  setupScene();
+  await loadAssets();
+  buildDeskAndDecor();
+  rebuildVisuals();
+  renderHistory();
+  setupDeviceOrientation();
+  setupInteraction();
+  maybeTriggerReloadRa3();
+  startLoop();
+  STATE.appReady = true;
+  hideLoadingOverlay();
+}
+
+function setupUI() {
+  UI.allowMic.addEventListener('click', async () => {
+    const ok = await requestMicrophonePermission();
+    if (!ok) return;
+    UI.permissionModal.classList.remove('visible');
+    ensureRecognition();
+
+    if (!STATE.appReady) {
+      showLoadingOverlay('...');
+    } else {
+      hideLoadingOverlay();
+    }
+  });
+
+  UI.recordBtn.addEventListener('click', async () => {
+    if (!canRecord()) return;
+
+    if (!STATE.recognition) {
+      const ok = await requestMicrophonePermission();
+      if (!ok) return;
+      ensureRecognition();
+    }
+
+    if (STATE.isListening || STATE.keepRecognitionAlive) {
+      finalizeListening(true);
+      return;
+    }
+
+    beginListening();
+  });
+
+  UI.newMemoBtn.addEventListener('click', () => {
+    openEntryPanel();
+    hideMemoHover();
+  });
+
+  UI.openHistoryBtn.addEventListener('click', () => {
+    openHistoryPanel();
+    hideMemoHover();
+  });
+
+  if (UI.closeEntryBtn) {
+    UI.closeEntryBtn.addEventListener('click', () => {
+      closeEntryPanel();
+      hideMemoHover();
+    });
+  }
+
+  UI.closeHistoryBtn.addEventListener('click', () => {
+    closeHistoryPanel();
+    hideMemoHover();
+  });
+
+  UI.toneChips.forEach((button) => {
+    button.addEventListener('click', () => {
+      STATE.selection.emotionTone = button.dataset.tone;
+      syncSelectionUI();
+    });
+  });
+
+  document.addEventListener('keydown', (event) => {
+    if (event.key !== 'Escape') return;
+
+    if (!UI.historyPanel.classList.contains('hidden')) {
+      closeHistoryPanel();
+      hideMemoHover();
+      return;
+    }
+
+    if (!UI.entryPanel.classList.contains('hidden')) {
+      closeEntryPanel();
+      hideMemoHover();
+    }
+  });
+
+  createLoadingOverlay();
+  window.addEventListener('resize', onResize);
+  window.addEventListener('pointermove', onPointerMove);
+  window.addEventListener('pointerleave', hideMemoHover);
+  UI.sceneRoot.addEventListener('pointerleave', hideMemoHover);
+}
+
+function openEntryPanel() {
+  closeDetailPanel();
+  UI.entryPanel.classList.remove('hidden');
+  UI.historyPanel.classList.add('hidden');
+}
+
+function closeEntryPanel() {
+  UI.entryPanel.classList.add('hidden');
+}
+
+function openHistoryPanel() {
+  closeDetailPanel();
+  UI.historyPanel.classList.remove('hidden');
+  UI.entryPanel.classList.add('hidden');
+}
+
+function closeHistoryPanel() {
+  UI.historyPanel.classList.add('hidden');
+}
+
+function createLoadingOverlay() {
+  if (STATE.loadingOverlay) return STATE.loadingOverlay;
+
+  const style = document.createElement('style');
+  style.textContent = `
+    .app-loading-overlay {
+      position: absolute;
+      inset: 0;
+      z-index: 45;
+      display: none;
+      align-items: center;
+      justify-content: center;
+      padding: 24px;
+      background: rgba(44, 36, 32, 0.12);
+      backdrop-filter: blur(8px);
+      -webkit-backdrop-filter: blur(8px);
+    }
+    .app-loading-overlay.visible {
+      display: flex;
+    }
+    .app-loading-card {
+      width: min(240px, calc(100vw - 40px));
+      min-height: 116px;
+      padding: 0 22px 6px;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      text-align: center;
+      color: #1f160f;
+      background-image: url('./assets/ui2.png');
+      background-repeat: no-repeat;
+      background-position: center center;
+      background-size: 100% 100%;
+      filter: drop-shadow(0 12px 22px rgba(28, 21, 14, 0.16));
+    }
+    .app-loading-ellipsis {
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      gap: 0.18em;
+      transform: translateY(-1px);
+    }
+    .app-loading-dot-char {
+      display: inline-block;
+      font-size: clamp(1.9rem, 5vw, 2.4rem);
+      line-height: 1;
+      font-weight: 800;
+      color: #1f160f;
+      opacity: 0.18;
+      animation: appLoadingEllipsis 1.15s infinite ease-in-out;
+    }
+    .app-loading-dot-char:nth-child(2) {
+      animation-delay: 0.14s;
+    }
+    .app-loading-dot-char:nth-child(3) {
+      animation-delay: 0.28s;
+    }
+    @keyframes appLoadingEllipsis {
+      0%, 80%, 100% {
+        opacity: 0.18;
+        transform: translateY(0) scale(1);
+      }
+      40% {
+        opacity: 1;
+        transform: translateY(-1px) scale(1.06);
+      }
+    }
+    @media (max-width: 640px) {
+      .app-loading-card {
+        width: min(210px, calc(100vw - 32px));
+        min-height: 102px;
+      }
+      .app-loading-dot-char {
+        font-size: clamp(1.7rem, 7vw, 2.1rem);
+      }
+    }
+  `;
+  document.head.appendChild(style);
+
+  const overlay = document.createElement('div');
+  overlay.className = 'app-loading-overlay';
+  overlay.innerHTML = `
+    <div class="app-loading-card" role="status" aria-live="polite" aria-label="로딩 중">
+      <div class="app-loading-ellipsis" aria-hidden="true">
+        <span class="app-loading-dot-char">.</span>
+        <span class="app-loading-dot-char">.</span>
+        <span class="app-loading-dot-char">.</span>
+      </div>
+    </div>
+  `;
+
+  UI.appShell.appendChild(overlay);
+  STATE.loadingOverlay = overlay;
+  return overlay;
+}
+
+function showLoadingOverlay(title = '...', copy = '') {
+  const overlay = createLoadingOverlay();
+  overlay.classList.add('visible');
+}
+
+function hideLoadingOverlay() {
+  if (!STATE.loadingOverlay) return;
+  STATE.loadingOverlay.classList.remove('visible');
+}
+
+function renderCategoryChips() {
+  UI.categoryGrid.innerHTML = '';
+  Object.entries(CATEGORY_INFO).forEach(([category, info]) => {
+    const button = document.createElement('button');
+    button.type = 'button';
+    button.className = 'chip';
+    button.dataset.category = category;
+    button.textContent = info.label;
+    button.addEventListener('click', () => {
+      STATE.selection.category = category;
+      syncSelectionUI();
+    });
+    UI.categoryGrid.appendChild(button);
+  });
+}
+
+function syncSelectionUI() {
+  UI.categoryGrid.querySelectorAll('[data-category]').forEach((button) => {
+    button.classList.toggle('active', button.dataset.category === STATE.selection.category);
+  });
+
+  const isEmotion = STATE.selection.category === 'emotion';
+  UI.toneWrap.classList.toggle('hidden', !isEmotion);
+
+  UI.toneChips.forEach((button) => {
+    button.classList.toggle('active', isEmotion && button.dataset.tone === STATE.selection.emotionTone);
+  });
+
+  if (!STATE.selection.category) {
+    UI.selectionCopy.textContent = '';
+  } else if (isEmotion) {
+    UI.selectionCopy.textContent = '';
+  } else {
+    UI.selectionCopy.textContent = '';
+  }
+
+  UI.recordBtn.disabled = !canRecord();
+}
+
+function canRecord() {
+  if (!STATE.selection.category) return false;
+  if (STATE.selection.category === 'emotion' && !STATE.selection.emotionTone) return false;
   return true;
 }
 
-function resizeGL(){
-  const cv=document.getElementById("glcanvas");
-  if(!cv) return;
-  cv.width=window.innerWidth;
-  cv.height=window.innerHeight;
-  if(gl && !glContextLost) gl.viewport(0,0,cv.width,cv.height);
-}
+async function requestMicrophonePermission() {
+  if (STATE.hasMicPermission) return true;
 
-function renderGL(){
-  if(!gl||!prog||glContextLost) return;
-  const t=(performance.now()-t0)*0.001;
-  gl.uniform2f(uRes,window.innerWidth,window.innerHeight);
-  gl.uniform1f(uTime,t);
-  gl.uniform1f(uSub,S.sub);
-  gl.uniform1f(uBass,S.bass);
-  gl.uniform1f(uMid,S.mid);
-  gl.uniform1f(uHigh,S.high);
-  gl.uniform1f(uAir,S.air);
-  gl.uniform1f(uEnergy,S.energy);
-  gl.uniform2f(uMouse,S.mx/window.innerWidth,1.-S.my/window.innerHeight);
-  gl.uniform3f(uPalette,curPal.r/255,curPal.g/255,curPal.b/255);
-  gl.uniform1f(uLqSub,LQ.subPressure);
-  gl.uniform1f(uLqMid,LQ.midDensity);
-  gl.uniform1f(uLqShimmer,LQ.highShimmer);
-  gl.uniform1f(uLqAir,LQ.airGlow);
-  gl.uniform1f(uLqSurface,LQ.surfaceTension);
-  gl.drawArrays(gl.TRIANGLES,0,6);
-}
-
-
-// ══════════════════════════════════════════════════════
-// 레이아웃 — 4패널 400vw
-// ══════════════════════════════════════════════════════
-const mc=document.getElementById("main-container");
-const LS={hIdx:0,vIdx:0,hOff:0,vOff:0,cHoff:0,cVoff:0,anim:false};
-const TOTAL_H=4, TOTAL_V=10;
-
-function goTo(hIdx,vIdx){
-  if(LS.anim) return;
-  hIdx=Math.max(0,Math.min(TOTAL_H-1,hIdx));
-  vIdx=Math.max(0,Math.min(TOTAL_V-1,vIdx));
-  if(hIdx>=1) vIdx=0;
-  if(vIdx>0)   hIdx=0;
-  LS.hIdx=hIdx; LS.vIdx=vIdx;
-  LS.hOff=hIdx*window.innerWidth; LS.vOff=vIdx*window.innerHeight;
-  animateLayout(); updateActiveGLB(vIdx);
-
-  const hint=document.getElementById("scroll-hint");
-  if(hint) hint.style.opacity=(vIdx===0&&hIdx===0)?"":"0";
-
-  const sh=document.getElementById("swipe-hint");
-  if(sh){
-    const isLastSection = (vIdx===TOTAL_V-1 && hIdx===0);
-    if(isLastSection) sh.classList.add("visible");
-    else sh.classList.remove("visible");
-  }
-  if(hIdx===2){ startSceneRenderer(); initAlbumPanel(); }
-  poolActive = (hIdx===3);
-  if(hIdx===3){ startPoolRenderer(); }
-}
-
-function animateLayout(){
-  const fH=LS.cHoff,fV=LS.cVoff,tH=LS.hOff,tV=LS.vOff,t0s=performance.now();
-  LS.anim=true;
-  function step(now){
-    const p=Math.min((now-t0s)/680,1),e=p<.5?4*p*p*p:1-Math.pow(-2*p+2,3)/2;
-    LS.cHoff=fH+(tH-fH)*e; LS.cVoff=fV+(tV-fV)*e;
-    mc.style.transform=`translate(${-LS.cHoff}px,${-LS.cVoff}px)`;
-    if(p<1) requestAnimationFrame(step);
-    else{LS.anim=false;LS.cHoff=tH;LS.cVoff=tV;}
-  }
-  requestAnimationFrame(step);
-}
-
-let wAccum=0,txS=0,tyS=0,navCooldown=false,lastWheelTime=0;
-function triggerNav(fn){
-  if(LS.anim||navCooldown) return;
-  navCooldown=true; wAccum=0; fn();
-  setTimeout(()=>{navCooldown=false;wAccum=0;},1050);
-}
-
-// 덱 넘기기 쿨다운 (스크롤/스와이프 연속 입력 방지)
-let deckNavCool=false;
-function triggerDeckNav(dir){
-  // dir: +1 = 다음 카드, -1 = 이전 카드
-  if(deckNavCool) return;
-  deckNavCool=true;
-  const total=ALBUM_DATA.length;
-  selectedIdx=-1;
-  deckTopIdx=(deckTopIdx+dir+total)%total;
-  layoutDeck();
-  showDeckDetail(deckTopIdx);
-  setTimeout(()=>{ deckNavCool=false; },800);
-}
-
-function bindLayoutEvents(){
-  window.addEventListener("wheel",(e)=>{
-    if(LS.anim||navCooldown){wAccum=0;return;}
-    const dx=e.deltaX,dy=e.deltaY;
-
-    // ── ALBUM 패널(hIdx===2): wheel을 덱 넘기기로 사용, 패널 전환 차단 ──
-    if(LS.hIdx===2){
-      // 세로/가로 모두 덱 넘기기
-      const dominant = Math.abs(dx)>Math.abs(dy) ? dx : dy;
-      if(Math.abs(dominant)>100){
-        triggerDeckNav(dominant>0?1:-1);
-      }
-      return; // 패널 전환 완전 차단
-    }
-
-    // 가로 스와이프 (다른 패널)
-    if(Math.abs(dx)>Math.abs(dy)+10){
-      const threshold = 40;
-      if(dx>threshold)  triggerNav(()=>goTo(LS.hIdx+1,0));
-      if(dx<-threshold) triggerNav(()=>goTo(LS.hIdx-1,LS.vIdx));
-      return;
-    }
-
-    if(Math.abs(dy)<8) return;
-    const now=Date.now();
-    if(now-lastWheelTime<60){lastWheelTime=now;return;}
-    lastWheelTime=now;
-    if(LS.hIdx>=1) return;
-    wAccum+=dy;
-    if(Math.abs(wAccum)>55){
-      const dir=wAccum>0?1:-1;
-      triggerNav(()=>goTo(0,LS.vIdx+dir));
-    }
-  },{passive:true});
-
-  window.addEventListener("touchstart",(e)=>{
-    txS=e.touches[0].clientX;
-    tyS=e.touches[0].clientY;
-  },{passive:true});
-
-  window.addEventListener("touchend",(e)=>{
-    if(LS.anim||navCooldown) return;
-    const dx=e.changedTouches[0].clientX-txS;
-    const dy=e.changedTouches[0].clientY-tyS;
-
-    // ── ALBUM 패널: 스와이프로 덱 넘기기, 패널 전환 차단 ──
-    if(LS.hIdx===2){
-      if(Math.abs(dx)>90){
-        triggerDeckNav(dx<0?1:-1);
-      } else if(Math.abs(dy)>90){
-        triggerDeckNav(dy<0?1:-1);
-      }
-      return;
-    }
-
-    if(Math.abs(dx)>Math.abs(dy)&&Math.abs(dx)>70){
-      if(dx<0) triggerNav(()=>goTo(LS.hIdx+1,0));
-      else     triggerNav(()=>goTo(LS.hIdx-1,LS.vIdx));
-    } else if(Math.abs(dy)>45&&LS.hIdx===0){
-      triggerNav(()=>goTo(0,LS.vIdx+(dy<0?1:-1)));
-    }
-  },{passive:true});
-
-  window.addEventListener("keydown",(e)=>{
-    // ALBUM 패널에서는 좌우/상하 화살표 = 덱 넘기기
-    if(LS.hIdx===2){
-      if(e.key==="ArrowRight"||e.key==="ArrowDown")  { triggerDeckNav(1);  return; }
-      if(e.key==="ArrowLeft" ||e.key==="ArrowUp")    { triggerDeckNav(-1); return; }
-      // Escape / Backspace로만 패널 이탈
-      if(e.key==="Escape"||e.key==="Backspace") triggerNav(()=>goTo(LS.hIdx-1,0));
-      return;
-    }
-    if(e.key==="ArrowRight") triggerNav(()=>goTo(LS.hIdx+1,0));
-    if(e.key==="ArrowLeft")  triggerNav(()=>goTo(LS.hIdx-1,LS.vIdx));
-    if(e.key==="ArrowDown")  triggerNav(()=>goTo(0,LS.vIdx+1));
-    if(e.key==="ArrowUp")    triggerNav(()=>goTo(0,LS.vIdx-1));
-  });
-
-  document.querySelectorAll(".back-hint").forEach(bh=>{
-    // album/pool 전용 back 버튼은 별도 핸들러 사용
-    if(bh.id==='album-back-btn') return;
-    bh.addEventListener("click",()=>{
-      // 현재 패널에서 이전 패널로 이동
-      if(LS.hIdx>0) triggerNav(()=>goTo(LS.hIdx-1,0));
-      else triggerNav(()=>goTo(0,0));
+  try {
+    const stream = await navigator.mediaDevices.getUserMedia({
+      audio: {
+        echoCancellation: true,
+        noiseSuppression: true,
+        autoGainControl: true,
+        channelCount: 1,
+      },
     });
-  });
-
-  // down 힌트 — 다음 섹션으로 이동
-  document.querySelectorAll(".down-hint").forEach(dh=>{
-    dh.addEventListener("click",()=>{
-      if(LS.hIdx===0) triggerNav(()=>goTo(0,LS.vIdx+1));
-    });
-  });
-
-  const brand = document.querySelector(".brand");
-  if(brand){
-    brand.style.cursor = "pointer";
-    brand.addEventListener("click", ()=>{ location.reload(); });
+    stream.getTracks().forEach((track) => track.stop());
+    STATE.hasMicPermission = true;
+    setMicBadge('idle', '대기');
+    return true;
+  } catch (error) {
+    console.warn('Microphone permission error:', error);
+    setMicBadge('idle', '불가');
+    UI.selectionCopy.textContent = '';
+    return false;
   }
 }
 
-// ══════════════════════════════════════════════════════
-// GLB 렌더러
-// ══════════════════════════════════════════════════════
-// 1D 댐핑 탄성 스프링(오버슈트가 자연스럽게 생기도록)
-class Spring {
-  /**
-   * Critically-tuned spring with semi-implicit Euler + sub-stepping.
-   * Produces controlled overshoot that feels hand-tweaked, not bouncy.
-   *
-   * @param {number} value      – initial position
-   * @param {number} velocity   – initial velocity
-   * @param {number} stiffness  – spring constant k  (higher = snappier)
-   * @param {number} damping    – viscous drag c      (higher = less overshoot)
-   * @param {number} mass       – inertia             (higher = sluggish)
-   * @param {number} precision  – sleep threshold (avoids micro-jitter)
-   */
-  constructor({
-    value = 0, velocity = 0,
-    stiffness = 170, damping = 20, mass = 1,
-    precision = 0.0001,
-  } = {}) {
-    this.x = value;
-    this.v = velocity;
-    this.k = stiffness;
-    this.c = damping;
-    this.m = mass;
-    this.precision = precision;
-    this._settled = false;
+function ensureRecognition() {
+  if (STATE.recognition) return;
+
+  const SpeechRecognition = window.SpeechRecognition || window.webkitSpeechRecognition;
+  if (!SpeechRecognition) {
+    UI.selectionCopy.textContent = '';
+    UI.recordBtn.disabled = true;
+    return;
   }
 
-  update(target, dt) {
-    if (!dt || dt <= 0) return this.x;
+  const recognition = new SpeechRecognition();
+  recognition.lang = HYBRID_RECOGNITION_LANG;
+  recognition.interimResults = true;
+  recognition.continuous = true;
+  recognition.maxAlternatives = 1;
 
-    // Sub-step: cap each step at 4 ms for numerical stability
-    const SUB = 0.004;
-    let remaining = Math.min(dt, 0.064);   // hard-cap total delta
-    while (remaining > 0) {
-      const h = Math.min(remaining, SUB);
-      // Semi-implicit Euler: update velocity first, then position
-      const displacement = this.x - target;
-      const springForce  = -this.k * displacement;
-      const dampForce    = -this.c * this.v;
-      const a = (springForce + dampForce) / this.m;
-      this.v += a * h;
-      this.x += this.v * h;
-      remaining -= h;
+  recognition.onstart = () => {
+    STATE.isListening = true;
+    setMicBadge('live', getRecognitionLanguageBadgeLabel());
+    UI.recordBtn.textContent = '중지';
+  };
+
+  recognition.onresult = (event) => {
+    let interimText = '';
+
+    for (let i = event.resultIndex; i < event.results.length; i += 1) {
+      const result = event.results[i];
+      const text = getBestRecognitionText(result);
+      if (!text) continue;
+      if (result.isFinal) {
+        STATE.finalTranscript = [STATE.finalTranscript, text].filter(Boolean).join(' ').trim();
+      } else {
+        interimText = [interimText, text].filter(Boolean).join(' ').trim();
+      }
     }
 
-    // Sleep when close enough — prevents perpetual micro-vibration
-    if (Math.abs(this.x - target) < this.precision &&
-        Math.abs(this.v) < this.precision) {
-      this.x = target;
-      this.v = 0;
-      this._settled = true;
-    } else {
-      this._settled = false;
+    STATE.interimTranscript = interimText;
+    const combined = getCombinedTranscript();
+    UI.transcriptText.textContent = combined || '듣는 중...';
+
+    if (combined) scheduleRecognitionFinalize();
+  };
+
+  recognition.onspeechend = () => {
+    if (!STATE.keepRecognitionAlive || STATE.isFinalizing) return;
+    if (!getCombinedTranscript()) return;
+    scheduleRecognitionFinalize(SPEECH_FINALIZE_GRACE_MS);
+  };
+
+  recognition.onerror = (event) => {
+    console.warn('Speech recognition error:', event.error);
+
+    if (event.error === 'not-allowed' || event.error === 'service-not-allowed') {
+      STATE.keepRecognitionAlive = false;
+      setMicBadge('idle', '권한');
+      return;
     }
 
-    return this.x;
-  }
+    if ((event.error === 'no-speech' || event.error === 'aborted' || event.error === 'audio-capture') && STATE.keepRecognitionAlive && !STATE.isFinalizing) {
+      window.setTimeout(() => safeStartRecognition(), RESTART_RECOGNITION_DELAY_MS);
+      return;
+    }
 
-  /** Hard-set without spring transition */
-  set(value) {
-    this.x = value;
-    this.v = 0;
-    this._settled = false;
-  }
+    if (STATE.keepRecognitionAlive && !STATE.isFinalizing) {
+      window.setTimeout(() => safeStartRecognition(), RESTART_RECOGNITION_DELAY_MS);
+    }
+  };
 
-  /** Inject an impulse (additive velocity kick) */
-  impulse(force) {
-    this.v += force / this.m;
-    this._settled = false;
-  }
+  recognition.onend = () => {
+    STATE.isListening = false;
 
-  get settled() { return this._settled; }
+    if (STATE.keepRecognitionAlive && !STATE.isFinalizing) {
+      window.setTimeout(() => safeStartRecognition(), RESTART_RECOGNITION_DELAY_MS);
+      return;
+    }
+
+    if (!STATE.isFinalizing) {
+      setMicBadge('idle', '대기');
+      UI.recordBtn.textContent = '말하기';
+    }
+  };
+
+  STATE.recognition = recognition;
 }
 
-// ══════════════════════════════════════════════════════
-// 스피너 시스템 — 손으로 돌리기 (담배떨이, 20201)
-// ══════════════════════════════════════════════════════
-function initSpinner(entry, glbFile) {
-  const isFriction = (glbFile === '20201.glb');
-  entry._spinner = {
-    enabled: true,
-    mode: isFriction ? 'friction' : 'spring',
-    sensitivity: isFriction ? 0.005 : 0.012,
-    dragging: false,
-    dragLastX: 0,
-    dragStartX: 0,
-    // ── 핵심: 매 프레임 회전 속도 (per-frame increment) ──
-    spinVel: 0,            // 현재 스피너 각속도
-    spinVelSpring: isFriction ? null : new Spring({
-      value: 0,
-      stiffness: 80,
-      damping: 8,
-      mass: 1.2,
-      precision: 0.0005,
+function beginListening() {
+  if (!canRecord() || !STATE.recognition) return;
+
+  clearTimeout(STATE.silenceTimer);
+  STATE.finalTranscript = '';
+  STATE.interimTranscript = '';
+  STATE.keepRecognitionAlive = true;
+  STATE.isFinalizing = false;
+  STATE.recognition.lang = HYBRID_RECOGNITION_LANG;
+  UI.transcriptText.textContent = '듣는 중...';
+  safeStartRecognition();
+}
+
+function safeStartRecognition() {
+  if (!STATE.recognition) return;
+  try {
+    STATE.recognition.start();
+  } catch (error) {
+    // Chrome active session guard
+  }
+}
+
+function finalizeListening(cancelOnly) {
+  clearTimeout(STATE.silenceTimer);
+  STATE.keepRecognitionAlive = false;
+  STATE.isFinalizing = true;
+  const transcript = getCombinedTranscript();
+
+  if (STATE.isListening && STATE.recognition) {
+    try {
+      STATE.recognition.stop();
+    } catch (error) {
+      // noop
+    }
+  }
+
+  setMicBadge('processing', cancelOnly ? '중지' : '저장');
+  UI.recordBtn.textContent = '말하기';
+
+  window.setTimeout(() => {
+    STATE.isFinalizing = false;
+    setMicBadge('idle', '대기');
+
+    if (cancelOnly || !transcript) {
+      UI.transcriptText.textContent = transcript || '...';
+      return;
+    }
+
+    createMemoFromTranscript(transcript);
+    STATE.finalTranscript = '';
+    STATE.interimTranscript = '';
+  }, 40);
+}
+
+function getCombinedTranscript() {
+  return [STATE.finalTranscript, STATE.interimTranscript].filter(Boolean).join(' ').replace(/\s+/g, ' ').trim();
+}
+
+function scheduleRecognitionFinalize(delay = SILENCE_MS) {
+  clearTimeout(STATE.silenceTimer);
+  STATE.silenceTimer = window.setTimeout(() => finalizeListening(false), delay);
+}
+
+function getBestRecognitionText(result) {
+  if (!result) return '';
+
+  return (result[0]?.transcript || '')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
+function getRecognitionLanguageBadgeLabel() {
+  return 'KO·EN';
+}
+
+function createMemoFromTranscript(transcript) {
+  const memo = {
+    id: crypto.randomUUID(),
+    category: STATE.selection.category,
+    emotionTone: STATE.selection.category === 'emotion' ? STATE.selection.emotionTone : null,
+    transcript,
+    createdAt: new Date().toISOString(),
+    clearedAt: null,
+  };
+
+  snapshotLiveVisualTransformsToLayoutCache();
+  STATE.memos.unshift(memo);
+  const handledIncrementally = createAndAttachVisualForMemo(memo, memo.id);
+  persistStorage();
+  if (!handledIncrementally) {
+    rebuildVisuals(memo.id);
+  }
+  renderHistory();
+  resetDeleteStreak();
+  maybeTriggerCreationEasters(memo);
+  updateRoomCopy(memo);
+  UI.entryPanel.classList.add('hidden');
+  UI.historyPanel.classList.add('hidden');
+  UI.transcriptText.textContent = transcript;
+}
+
+function updateRoomCopy(memo) {
+  if (!UI.roomTitle || !UI.roomSubtitle) return;
+
+  const label = CATEGORY_INFO[memo.category]?.label || memo.category;
+
+  if (memo.category === 'emotion') {
+    UI.roomTitle.textContent = memo.emotionTone === 'good' ? '감정 GLB가 바로 방 안에 놓였어' : '감정 GLB가 바로 방 안에 놓였어';
+    UI.roomSubtitle.textContent = `감정 메모도 다른 GLB처럼 바로 배치되고, 추가·삭제돼도 나머지는 같은 자리를 유지해. 범주: ${label}`;
+  } else if (memo.category === 'record') {
+    UI.roomTitle.textContent = '기록이 책상 위에 놓였어';
+    UI.roomSubtitle.textContent = 'note는 책상 왼쪽, tumbler는 책상 오른쪽에 놓이도록 정리돼.';
+  } else if (memo.category === 'clutter') {
+    UI.roomTitle.textContent = '잡생각이 바닥 쪽 시야 안에서 흩어졌어';
+    UI.roomSubtitle.textContent = '2일이 지나면 오래된 잡생각 메모가 한 덩이 pile로 합쳐져 보여.';
+  } else if (memo.category === 'routine') {
+    UI.roomTitle.textContent = '정리 메모가 방 한쪽에 쌓였어';
+    UI.roomSubtitle.textContent = '1일이 지나면 folded에서 scattered 상태로 바뀌어.';
+  } else {
+    UI.roomTitle.textContent = '다짐이 텀블러로 책상 위에 놓였어';
+    UI.roomSubtitle.textContent = '다짐 텀블러도 책상 위 가까운 쪽에서 생성돼.';
+  }
+}
+
+function setupScene() {
+  const width = UI.sceneRoot.clientWidth || window.innerWidth;
+  const height = UI.sceneRoot.clientHeight || window.innerHeight;
+  const isMobile = width < 768;
+
+  const roomColor = 0xf6f1eb;
+
+  STATE.scene = new THREE.Scene();
+  STATE.scene.background = new THREE.Color(roomColor);
+  STATE.scene.fog = new THREE.FogExp2(roomColor, 0.0018);
+
+  const fov = isMobile ? 54 : 43;
+  STATE.camera = new THREE.PerspectiveCamera(fov, width / height, 0.1, 100);
+  if (isMobile) {
+    STATE.camera.position.set(-0.2, 7.6, 14.5);
+    STATE.camera.lookAt(-0.2, 0.6, -2.2);
+  } else {
+    STATE.camera.position.set(-0.55, 5.1, 11.6);
+    STATE.camera.lookAt(-0.55, 1.35, -2.35);
+  }
+
+  STATE.renderer = new THREE.WebGLRenderer({ antialias: true, alpha: false });
+  STATE.renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, 1.8));
+  STATE.renderer.setSize(width, height);
+  STATE.renderer.outputColorSpace = THREE.SRGBColorSpace;
+  STATE.renderer.shadowMap.enabled = true;
+  STATE.renderer.shadowMap.type = THREE.PCFSoftShadowMap;
+  STATE.renderer.toneMappingExposure = 1.08;
+  UI.sceneRoot.innerHTML = '';
+  UI.sceneRoot.appendChild(STATE.renderer.domElement);
+
+  const hemi = new THREE.HemisphereLight(0xfffbf4, 0xe9dfd3, 1.7);
+  STATE.scene.add(hemi);
+
+  const key = new THREE.DirectionalLight(0xffe2c6, 1.9);
+  key.position.set(5.6, 9.5, 6.4);
+  key.castShadow = true;
+  key.shadow.mapSize.set(2048, 2048);
+  key.shadow.camera.left = -14;
+  key.shadow.camera.right = 14;
+  key.shadow.camera.top = 12;
+  key.shadow.camera.bottom = -12;
+  key.shadow.camera.near = 0.5;
+  key.shadow.camera.far = 40;
+  STATE.scene.add(key);
+
+  const fill = new THREE.PointLight(0xfff0e0, 12, 30, 2.0);
+  fill.position.set(-6, 3.6, 1.5);
+  STATE.scene.add(fill);
+
+  const backGlow = new THREE.PointLight(0xfff8ef, 8.5, 24, 2.0);
+  backGlow.position.set(1, 4.2, -5.2);
+  STATE.scene.add(backGlow);
+
+  buildRoomShell();
+}
+
+function buildRoomShell() {
+  const group = new THREE.Group();
+  STATE.scene.add(group);
+
+  const floor = new THREE.Mesh(
+    new THREE.PlaneGeometry(18, 14),
+    new THREE.MeshStandardMaterial({ color: 0xe8e0d5, roughness: 0.96, metalness: 0.005 })
+  );
+  floor.rotation.x = -Math.PI / 2;
+  floor.receiveShadow = true;
+  group.add(floor);
+
+  const backWall = new THREE.Mesh(
+    new THREE.PlaneGeometry(18, 10),
+    new THREE.MeshStandardMaterial({ color: 0xf7f1ea, roughness: 0.95, metalness: 0 })
+  );
+  backWall.position.set(0, 5, -6.2);
+  group.add(backWall);
+
+  const leftWall = new THREE.Mesh(
+    new THREE.PlaneGeometry(14, 10),
+    new THREE.MeshStandardMaterial({ color: 0xf4ede5, roughness: 0.96, metalness: 0 })
+  );
+  leftWall.position.set(-9, 5, 0);
+  leftWall.rotation.y = Math.PI / 2;
+  group.add(leftWall);
+
+  const rightWall = new THREE.Mesh(
+    new THREE.PlaneGeometry(14, 10),
+    new THREE.MeshStandardMaterial({ color: 0xf2ebe3, roughness: 0.96, metalness: 0 })
+  );
+  rightWall.position.set(9, 5, 0);
+  rightWall.rotation.y = -Math.PI / 2;
+  group.add(rightWall);
+
+  const ceiling = new THREE.Mesh(
+    new THREE.PlaneGeometry(18, 14),
+    new THREE.MeshStandardMaterial({ color: 0xfcf9f5, roughness: 1, metalness: 0 })
+  );
+  ceiling.position.set(0, 10, 0);
+  ceiling.rotation.x = Math.PI / 2;
+  group.add(ceiling);
+
+  const wallGlow = new THREE.Mesh(
+    new THREE.PlaneGeometry(6.5, 3.4),
+    new THREE.MeshBasicMaterial({ color: 0xfff4df, transparent: true, opacity: 0.045 })
+  );
+  wallGlow.position.set(0.2, 5.2, -6.08);
+  group.add(wallGlow);
+}
+
+async function loadAssets() {
+  const loader = new GLTFLoader();
+
+  STATE.templates.note = await loadTemplate(loader, 'note', ASSET_FILES.note, createNoteFallback);
+  STATE.templates.scribble = await loadTemplate(loader, 'scribble', ASSET_FILES.scribble, createScribbleFallback);
+  STATE.templates.clothesFolded = await loadTemplate(loader, 'clothesFolded', ASSET_FILES.clothesFolded, createClothesFoldedFallback);
+  STATE.templates.clothesScattered = await loadTemplate(loader, 'clothesScattered', ASSET_FILES.clothesScattered, createClothesScatteredFallback);
+  STATE.templates.paperSingle = await loadTemplate(loader, 'paperSingle', ASSET_FILES.paperSingle, () => createPaperFallback(0xe5dacb));
+  STATE.templates.paperSingle2 = await loadTemplate(loader, 'paperSingle2', ASSET_FILES.paperSingle2, () => createPaperFallback(0xd9d0e2));
+  STATE.templates.paperPile = await loadTemplate(loader, 'paperPile', ASSET_FILES.paperPile, createPaperPileFallback);
+  STATE.templates.snack = await loadTemplate(loader, 'snack', ASSET_FILES.snack, createSnackFallback);
+  STATE.templates.strawberry = await loadTemplate(loader, 'strawberry', ASSET_FILES.strawberry, createStrawberryFallback);
+  STATE.templates.jar = await loadTemplate(loader, 'jar', ASSET_FILES.jar, createJarFallback);
+  STATE.templates.burn = await loadTemplate(loader, 'burn', ASSET_FILES.burn, createBurnFallback);
+  STATE.templates.tumbler = await loadTemplate(loader, 'tumbler', ASSET_FILES.tumbler, createTumblerFallback);
+  STATE.templates.desk = await loadTemplate(loader, 'desk', ASSET_FILES.desk, createDeskFallback);
+}
+
+async function loadTemplate(loader, key, filename, fallbackFactory) {
+  let root;
+
+  try {
+    const gltf = await loader.loadAsync(`./assets/${filename}`);
+    root = gltf.scene;
+    root.animations = gltf.animations || [];
+  } catch (error) {
+    console.warn(`Failed to load ${filename}. Using fallback.`, error);
+    root = fallbackFactory();
+    root.animations = [];
+  }
+
+  normalizeTemplate(root, key);
+  applyShadowSettings(root);
+
+  return {
+    key,
+    root,
+    animations: root.animations || [],
+  };
+}
+
+function normalizeTemplate(root, key) {
+  const box = new THREE.Box3().setFromObject(root);
+  const size = box.getSize(new THREE.Vector3());
+  const center = box.getCenter(new THREE.Vector3());
+  const maxDim = Math.max(size.x, size.y, size.z) || 1;
+  const baseTargetMax = TARGET_MAX_DIMENSION[key] || 1;
+  const targetMax = key === 'desk' ? baseTargetMax : baseTargetMax * NON_DESK_SCALE_MULTIPLIER;
+  const scale = targetMax / maxDim;
+
+  root.position.x -= center.x;
+  root.position.z -= center.z;
+  root.position.y -= box.min.y;
+  root.scale.multiplyScalar(scale);
+  root.updateMatrixWorld(true);
+}
+
+function applyShadowSettings(object) {
+  object.traverse((child) => {
+    if (!child.isMesh) return;
+    child.castShadow = true;
+    child.receiveShadow = true;
+    if (child.material && !Array.isArray(child.material) && 'envMapIntensity' in child.material) {
+      child.material.envMapIntensity = 1.1;
+      if (child.material.roughness !== undefined) {
+        child.material.roughness = Math.min(child.material.roughness + 0.02, 1);
+      }
+    }
+  });
+}
+
+
+const TMP_BOX_3 = new THREE.Box3();
+const TMP_VEC3_A = new THREE.Vector3();
+const TMP_VEC3_B = new THREE.Vector3();
+const TMP_VEC3_C = new THREE.Vector3();
+const TMP_VEC3_D = new THREE.Vector3();
+const TMP_NORMAL_MATRIX = new THREE.Matrix3();
+const TMP_MATRIX_4 = new THREE.Matrix4();
+const CAMERA_FRUSTUM = new THREE.Frustum();
+const DESK_RAYCASTER = new THREE.Raycaster();
+
+const HOVER_PROXY_SETTINGS = {
+  default: { padX: 1.14, padY: 1.14, padZ: 1.14, minX: 0.18, minY: 0.22, minZ: 0.18 },
+  note: { padX: 1.28, padY: 1.9, padZ: 1.3, minX: 0.26, minY: 0.46, minZ: 0.28 },
+  scribble: { padX: 1.32, padY: 2.05, padZ: 1.34, minX: 0.28, minY: 0.5, minZ: 0.3 },
+  tumbler: { padX: 1.2, padY: 1.22, padZ: 1.2, minX: 0.24, minY: 0.34, minZ: 0.24 },
+  snack: { padX: 1.16, padY: 1.18, padZ: 1.16, minX: 0.22, minY: 0.24, minZ: 0.22 },
+  strawberry: { padX: 1.18, padY: 1.18, padZ: 1.18, minX: 0.24, minY: 0.24, minZ: 0.24 },
+  jar: { padX: 1.2, padY: 1.24, padZ: 1.2, minX: 0.24, minY: 0.28, minZ: 0.24 },
+  burn: { padX: 1.22, padY: 1.18, padZ: 1.22, minX: 0.26, minY: 0.2, minZ: 0.26 },
+};
+
+const VISIBLE_SAFE_ZONE = {
+  minX: -6.45,
+  maxX: 7.25,
+  minZ: -5.78,
+  maxZ: 3.1,
+};
+
+const FLOOR_RECORD_CLUTTER_VISIBLE_ZONE = {
+  minX: -8.45,
+  maxX: 9.85,
+  minZ: -6.05,
+  maxZ: 4.78,
+};
+
+const DEFAULT_CAMERA_VISIBILITY_BOUNDS = {
+  minX: -1.3,
+  maxX: 1.48,
+  minY: -1.2,
+  maxY: 1.2,
+  maxZ: 1.2,
+};
+
+const FLOOR_RECORD_CLUTTER_CAMERA_VISIBILITY_BOUNDS = {
+  minX: -1.5,
+  maxX: 1.86,
+  minY: -1.34,
+  maxY: 1.38,
+  maxZ: 1.36,
+};
+
+const DEFAULT_VISIBILITY_NUDGES = [
+  { x: 0, z: 0.45 },
+  { x: 0.35, z: 0.35 },
+  { x: -0.35, z: 0.35 },
+  { x: 0.55, z: 0.18 },
+  { x: -0.55, z: 0.18 },
+  { x: 0, z: 0.75 },
+];
+
+const FLOOR_VISIBILITY_NUDGES = [
+  { x: 0, z: 0.38 },
+  { x: 0, z: 0.72 },
+  { x: 0.18, z: 0.22 },
+  { x: -0.18, z: 0.22 },
+  { x: 0.42, z: 0.1 },
+  { x: -0.42, z: 0.1 },
+  { x: 0, z: 0.96 },
+];
+
+function getWorldUpNormal(hit) {
+  if (!hit?.face || !hit.object) return null;
+  TMP_NORMAL_MATRIX.getNormalMatrix(hit.object.matrixWorld);
+  return hit.face.normal.clone().applyMatrix3(TMP_NORMAL_MATRIX).normalize();
+}
+
+function getDeskMeshes() {
+  const meshes = [];
+  STATE.room.desk?.traverse((child) => {
+    if (child.isMesh) meshes.push(child);
+  });
+  return meshes;
+}
+
+function analyzeDeskSurface() {
+  if (!STATE.room.desk) return null;
+
+  const box = new THREE.Box3().setFromObject(STATE.room.desk);
+  const size = box.getSize(new THREE.Vector3());
+  const meshes = getDeskMeshes();
+  if (!meshes.length) return null;
+
+  const samples = [];
+  const padX = size.x * 0.05;
+  const padZ = size.z * 0.05;
+  const originY = box.max.y + Math.max(0.8, size.y * 0.28);
+  const stepsX = 18;
+  const stepsZ = 16;
+
+  for (let ix = 0; ix < stepsX; ix += 1) {
+    for (let iz = 0; iz < stepsZ; iz += 1) {
+      const x = THREE.MathUtils.lerp(box.min.x + padX, box.max.x - padX, ix / Math.max(stepsX - 1, 1));
+      const z = THREE.MathUtils.lerp(box.min.z + padZ, box.max.z - padZ, iz / Math.max(stepsZ - 1, 1));
+      DESK_RAYCASTER.set(new THREE.Vector3(x, originY, z), new THREE.Vector3(0, -1, 0));
+      const hits = DESK_RAYCASTER.intersectObjects(meshes, false);
+      const hit = hits.find((entry) => {
+        const worldNormal = getWorldUpNormal(entry);
+        return worldNormal && worldNormal.y >= 0.35;
+      }) || hits[0];
+
+      if (!hit) continue;
+      if (hit.point.y < box.min.y + size.y * 0.28) continue;
+      samples.push({ x: hit.point.x, y: hit.point.y, z: hit.point.z });
+    }
+  }
+
+  if (samples.length < 8) return null;
+
+  const sortedY = samples.map((sample) => sample.y).sort((a, b) => a - b);
+  const topSliceStart = Math.floor(sortedY.length * 0.72);
+  const topSlice = sortedY.slice(topSliceStart);
+  const surfaceY = topSlice[Math.floor(topSlice.length * 0.5)] ?? (box.min.y + size.y * 0.46);
+  const tolerance = Math.max(0.055, size.y * 0.065);
+  const surfaceBand = samples.filter((sample) => Math.abs(sample.y - surfaceY) <= tolerance);
+
+  if (surfaceBand.length < 6) {
+    return {
+      y: surfaceY,
+      tolerance,
+      bounds: {
+        minX: box.min.x + size.x * 0.16,
+        maxX: box.max.x - size.x * 0.16,
+        minZ: box.min.z + size.z * 0.12,
+        maxZ: box.min.z + size.z * 0.36,
+      },
+    };
+  }
+
+  const minX = Math.min(...surfaceBand.map((sample) => sample.x));
+  const maxX = Math.max(...surfaceBand.map((sample) => sample.x));
+  const minZ = Math.min(...surfaceBand.map((sample) => sample.z));
+  const maxZ = Math.max(...surfaceBand.map((sample) => sample.z));
+  const insetX = Math.max(0.03, (maxX - minX) * 0.08);
+  const insetZ = Math.max(0.03, (maxZ - minZ) * 0.08);
+
+  return {
+    y: surfaceY,
+    tolerance,
+    bounds: {
+      minX: minX + insetX,
+      maxX: maxX - insetX,
+      minZ: minZ + insetZ,
+      maxZ: maxZ - insetZ,
+    },
+  };
+}
+
+function findClosestHorizontalSurfacePoint(meshes, bounds, targetY, tolerance, x, z, options = {}) {
+  if (!meshes?.length || !bounds) return null;
+
+  const size = bounds.getSize(TMP_VEC3_A);
+  const originY = bounds.max.y + Math.max(0.8, size.y * 0.28);
+  const minNormalY = options.minNormalY ?? 0.45;
+  const searchRadius = Math.max(0, options.searchRadius ?? 0.16);
+  const steps = Math.max(0, options.steps ?? 2);
+  const maxVerticalDistance = Math.max(options.maxVerticalDistance ?? tolerance * 2.25, tolerance);
+
+  let bestHit = null;
+  let bestScore = Number.POSITIVE_INFINITY;
+
+  for (let ix = -steps; ix <= steps; ix += 1) {
+    for (let iz = -steps; iz <= steps; iz += 1) {
+      const sampleX = x + ((steps ? ix / steps : 0) * searchRadius);
+      const sampleZ = z + ((steps ? iz / steps : 0) * searchRadius);
+      DESK_RAYCASTER.set(new THREE.Vector3(sampleX, originY, sampleZ), new THREE.Vector3(0, -1, 0));
+      const hits = DESK_RAYCASTER.intersectObjects(meshes, false);
+
+      hits.forEach((hit) => {
+        const worldNormal = getWorldUpNormal(hit);
+        if (worldNormal && worldNormal.y < minNormalY) return;
+        const verticalDistance = Math.abs(hit.point.y - targetY);
+        if (verticalDistance > maxVerticalDistance) return;
+
+        const planarDistance = distance2D(x, z, hit.point.x, hit.point.z);
+        const score = (verticalDistance * 3.5) + planarDistance;
+
+        if (score < bestScore) {
+          bestScore = score;
+          bestHit = hit;
+        }
+      });
+    }
+  }
+
+  return bestHit ? { x: bestHit.point.x, y: bestHit.point.y, z: bestHit.point.z } : null;
+}
+
+function getDeskSurfaceYAt(x, z) {
+  const { deskMeshes, deskBounds, deskTopY, deskSurfaceYTolerance } = STATE.room;
+  if (!deskMeshes?.length || !deskBounds) return deskTopY;
+
+  const point = findClosestHorizontalSurfacePoint(
+    deskMeshes,
+    deskBounds,
+    deskTopY,
+    Math.max(deskSurfaceYTolerance * 2, 0.24),
+    x,
+    z,
+    { searchRadius: 0.14, steps: 2, minNormalY: 0.42 },
+  );
+
+  return point?.y ?? deskTopY;
+}
+
+function analyzeChairSeatSurface() {
+  const { deskBounds, deskMeshes, deskTopY } = STATE.room;
+  const deskSurfaceBounds = getDeskSurfaceBounds();
+  if (!deskBounds || !deskMeshes?.length || !deskSurfaceBounds) return null;
+
+  const size = deskBounds.getSize(new THREE.Vector3());
+  const minX = Math.max(deskBounds.min.x + size.x * 0.26, deskSurfaceBounds.minX + 0.08);
+  const maxX = Math.min(deskBounds.max.x - size.x * 0.26, deskSurfaceBounds.maxX - 0.08);
+  const minZ = Math.max(deskSurfaceBounds.maxZ + Math.max(0.14, size.z * 0.02), deskBounds.min.z + size.z * 0.34);
+  const maxZ = Math.min(deskBounds.max.z - Math.max(0.12, size.z * 0.08), deskSurfaceBounds.maxZ + Math.max(0.48, size.z * 0.15));
+
+  if (minX >= maxX || minZ >= maxZ) return null;
+
+  const samples = [];
+  const originY = deskBounds.max.y + Math.max(0.8, size.y * 0.28);
+  const stepsX = 10;
+  const stepsZ = 10;
+
+  for (let ix = 0; ix < stepsX; ix += 1) {
+    for (let iz = 0; iz < stepsZ; iz += 1) {
+      const x = THREE.MathUtils.lerp(minX, maxX, ix / Math.max(stepsX - 1, 1));
+      const z = THREE.MathUtils.lerp(minZ, maxZ, iz / Math.max(stepsZ - 1, 1));
+      DESK_RAYCASTER.set(new THREE.Vector3(x, originY, z), new THREE.Vector3(0, -1, 0));
+      const hits = DESK_RAYCASTER.intersectObjects(deskMeshes, false);
+      const hit = hits.find((entry) => {
+        const worldNormal = getWorldUpNormal(entry);
+        return worldNormal && worldNormal.y >= 0.55
+          && entry.point.y <= deskTopY - 0.22
+          && entry.point.y >= deskBounds.min.y + size.y * 0.12;
+      });
+
+      if (hit) samples.push({ x: hit.point.x, y: hit.point.y, z: hit.point.z });
+    }
+  }
+
+  if (samples.length >= 6) {
+    const sortedY = samples.map((sample) => sample.y).sort((a, b) => b - a);
+    const seatY = sortedY[Math.min(sortedY.length - 1, Math.floor(sortedY.length * 0.25))] ?? sortedY[0];
+    const tolerance = Math.max(0.05, size.y * 0.055);
+    const surfaceBand = samples.filter((sample) => Math.abs(sample.y - seatY) <= tolerance);
+
+    if (surfaceBand.length >= 4) {
+      const seatMinX = Math.min(...surfaceBand.map((sample) => sample.x));
+      const seatMaxX = Math.max(...surfaceBand.map((sample) => sample.x));
+      const seatMinZ = Math.min(...surfaceBand.map((sample) => sample.z));
+      const seatMaxZ = Math.max(...surfaceBand.map((sample) => sample.z));
+      const insetX = Math.max(0.02, (seatMaxX - seatMinX) * 0.1);
+      const insetZ = Math.max(0.02, (seatMaxZ - seatMinZ) * 0.1);
+
+      return {
+        y: seatY,
+        tolerance,
+        bounds: {
+          minX: seatMinX + insetX,
+          maxX: seatMaxX - insetX,
+          minZ: seatMinZ + insetZ,
+          maxZ: seatMaxZ - insetZ,
+        },
+      };
+    }
+  }
+
+  const centerX = (minX + maxX) * 0.5;
+  const width = Math.min(0.82, Math.max(0.46, (maxX - minX) * 0.62));
+  const depth = Math.min(0.62, Math.max(0.34, (maxZ - minZ) * 0.7));
+  const seatY = Math.max(deskBounds.min.y + size.y * 0.24, deskTopY - Math.max(0.54, size.y * 0.24));
+  const centerZ = Math.min(maxZ - depth * 0.5, Math.max(minZ + depth * 0.5, deskSurfaceBounds.maxZ + 0.28));
+
+  return {
+    y: seatY,
+    tolerance: Math.max(0.06, size.y * 0.06),
+    bounds: {
+      minX: centerX - width * 0.5,
+      maxX: centerX + width * 0.5,
+      minZ: centerZ - depth * 0.5,
+      maxZ: centerZ + depth * 0.5,
+    },
+  };
+}
+
+function getChairSurfaceYAt(x, z) {
+  const { deskMeshes, deskBounds, chairSeatY, chairSurfaceYTolerance } = STATE.room;
+  if (!deskMeshes?.length || !deskBounds) return chairSeatY;
+
+  const point = findClosestHorizontalSurfacePoint(
+    deskMeshes,
+    deskBounds,
+    chairSeatY,
+    Math.max(chairSurfaceYTolerance * 2, 0.2),
+    x,
+    z,
+    { searchRadius: 0.12, steps: 2, minNormalY: 0.52 },
+  );
+
+  return point?.y ?? chairSeatY;
+}
+
+function placeObjectOnDeskSurface(object, slot, key) {
+  const bounds = getDeskSurfaceBounds();
+  const isTumbler = key === 'tumbler';
+  const backOverflow = isTumbler ? 0.02 : key === 'note' ? 0.38 : 0.12;
+  const frontOverflow = isTumbler ? -0.1 : 0.08;
+  const xInset = isTumbler ? 0.22 : 0;
+  const zInsetBack = isTumbler ? 0.22 : 0;
+  const zInsetFront = isTumbler ? 0.18 : 0;
+  const minX = bounds.minX + xInset;
+  const maxX = bounds.maxX - xInset;
+  const minZ = bounds.minZ + zInsetBack;
+  const maxZ = bounds.maxZ - zInsetFront;
+  const clampedX = clamp(slot.x, minX, maxX);
+  const clampedZ = clamp(slot.z, minZ - backOverflow, maxZ + frontOverflow);
+  const surfacePoint = findClosestHorizontalSurfacePoint(
+    STATE.room.deskMeshes,
+    STATE.room.deskBounds,
+    STATE.room.deskTopY,
+    Math.max(STATE.room.deskSurfaceYTolerance * (isTumbler ? 2.3 : 2), isTumbler ? 0.28 : 0.24),
+    clampedX,
+    clamp(clampedZ, minZ, maxZ),
+    { searchRadius: isTumbler ? 0.1 : 0.14, steps: isTumbler ? 3 : 2, minNormalY: isTumbler ? 0.68 : 0.42 },
+  );
+
+  object.position.x = clamp(surfacePoint?.x ?? clampedX, minX, maxX);
+  object.position.z = clamp(surfacePoint?.z ?? clampedZ, minZ - backOverflow, maxZ + frontOverflow);
+  object.rotation.y = slot.rotY || 0;
+  object.rotation.z = slot.rotZ || 0;
+
+  const surfaceProbeZ = clamp(object.position.z, minZ, maxZ);
+  const surfaceY = surfacePoint?.y ?? getDeskSurfaceYAt(object.position.x, surfaceProbeZ);
+  restObjectOnY(object, surfaceY);
+  liftDeskObject(object, key);
+}
+
+function placeObjectOnChairSurface(object, slot, key) {
+  const bounds = getChairSurfaceBounds();
+  object.position.x = clamp(slot.x, bounds.minX, bounds.maxX);
+  object.position.z = clamp(slot.z, bounds.minZ, bounds.maxZ);
+  object.rotation.y = slot.rotY || 0;
+  object.rotation.z = slot.rotZ || 0;
+
+  const surfaceY = getChairSurfaceYAt(object.position.x, object.position.z);
+  restObjectOnY(object, surfaceY);
+  liftDeskObject(object, key);
+}
+
+function updateCameraFrustum() {
+  if (!STATE.camera) return;
+  STATE.camera.updateMatrixWorld(true);
+  TMP_MATRIX_4.multiplyMatrices(STATE.camera.projectionMatrix, STATE.camera.matrixWorldInverse);
+  CAMERA_FRUSTUM.setFromProjectionMatrix(TMP_MATRIX_4);
+}
+
+function isObjectVisibleToCamera(object, bounds = DEFAULT_CAMERA_VISIBILITY_BOUNDS) {
+  if (!object || !STATE.camera) return true;
+  updateCameraFrustum();
+  TMP_BOX_3.setFromObject(object);
+  if (!Number.isFinite(TMP_BOX_3.min.x)) return true;
+  if (!CAMERA_FRUSTUM.intersectsBox(TMP_BOX_3)) return false;
+
+  TMP_BOX_3.getCenter(TMP_VEC3_D);
+  TMP_VEC3_D.project(STATE.camera);
+  return TMP_VEC3_D.z <= bounds.maxZ
+    && TMP_VEC3_D.x >= bounds.minX
+    && TMP_VEC3_D.x <= bounds.maxX
+    && TMP_VEC3_D.y >= bounds.minY
+    && TMP_VEC3_D.y <= bounds.maxY;
+}
+
+function keepObjectWithinVisibleZone(object, zone = VISIBLE_SAFE_ZONE) {
+  if (!object) return;
+
+  object.updateMatrixWorld(true);
+  TMP_BOX_3.setFromObject(object);
+  if (!Number.isFinite(TMP_BOX_3.min.x)) return;
+
+  TMP_BOX_3.getCenter(TMP_VEC3_A);
+  TMP_BOX_3.getSize(TMP_VEC3_B);
+
+  const halfX = TMP_VEC3_B.x * 0.5;
+  const halfZ = TMP_VEC3_B.z * 0.5;
+  const minCenterX = zone.minX + halfX;
+  const maxCenterX = zone.maxX - halfX;
+  const minCenterZ = zone.minZ + halfZ;
+  const maxCenterZ = zone.maxZ - halfZ;
+
+  const nextCenterX = minCenterX <= maxCenterX ? clamp(TMP_VEC3_A.x, minCenterX, maxCenterX) : TMP_VEC3_A.x;
+  const nextCenterZ = minCenterZ <= maxCenterZ ? clamp(TMP_VEC3_A.z, minCenterZ, maxCenterZ) : TMP_VEC3_A.z;
+
+  object.position.x += nextCenterX - TMP_VEC3_A.x;
+  object.position.z += nextCenterZ - TMP_VEC3_A.z;
+  object.updateMatrixWorld(true);
+}
+
+function ensureObjectStartsVisible(
+  object,
+  zone = VISIBLE_SAFE_ZONE,
+  nudges = DEFAULT_VISIBILITY_NUDGES,
+  cameraBounds = DEFAULT_CAMERA_VISIBILITY_BOUNDS,
+) {
+  if (!object) return;
+
+  keepObjectWithinVisibleZone(object, zone);
+  if (isObjectVisibleToCamera(object, cameraBounds)) return;
+
+  for (const nudge of nudges) {
+    object.position.x += nudge.x;
+    object.position.z += nudge.z;
+    keepObjectWithinVisibleZone(object, zone);
+    if (isObjectVisibleToCamera(object, cameraBounds)) return;
+  }
+}
+
+function syncHoverProxyBounds(proxy, owner) {
+  if (!proxy || !owner) return;
+  TMP_BOX_3.setFromObject(owner);
+  if (!Number.isFinite(TMP_BOX_3.min.x)) return;
+
+  const assetKey = owner.userData?.assetKey || 'default';
+  const settings = HOVER_PROXY_SETTINGS[assetKey] || HOVER_PROXY_SETTINGS.default;
+
+  TMP_BOX_3.getCenter(TMP_VEC3_A);
+  TMP_BOX_3.getSize(TMP_VEC3_B);
+
+  proxy.position.copy(TMP_VEC3_A);
+  proxy.scale.set(
+    Math.max(TMP_VEC3_B.x * settings.padX, settings.minX),
+    Math.max(TMP_VEC3_B.y * settings.padY, settings.minY),
+    Math.max(TMP_VEC3_B.z * settings.padZ, settings.minZ),
+  );
+  proxy.updateMatrixWorld(true);
+}
+
+function createMemoHoverProxy(object) {
+  const proxy = new THREE.Mesh(
+    new THREE.BoxGeometry(1, 1, 1),
+    new THREE.MeshBasicMaterial({
+      transparent: true,
+      opacity: 0,
+      depthWrite: false,
+      colorWrite: false,
     }),
-    released: false,
-  };
+  );
 
-  const canvas = entry.canvas;
-  if (!canvas) return;
+  proxy.userData.memoVisual = true;
+  proxy.userData.hoverOwner = object;
+  proxy.userData.memoIds = [...(object.userData.memoIds || [])];
+  proxy.userData.memoPreview = object.userData.memoPreview;
+  proxy.userData.memoLabel = object.userData.memoLabel;
+  proxy.renderOrder = -1000;
+  proxy.frustumCulled = false;
+  syncHoverProxyBounds(proxy, object);
+  STATE.scene.add(proxy);
+  object.userData.hoverProxy = proxy;
+  return proxy;
+}
 
-  let pointerId = null;
+function buildDeskAndDecor() {
+  if (STATE.room.desk) {
+    STATE.scene.remove(STATE.room.desk);
+  }
 
-  const onDown = (clientX, id) => {
-    const sp = entry._spinner;
-    sp.dragging = true;
-    sp.released = false;
-    sp.dragLastX = clientX;
-    sp.dragStartX = clientX;
-    sp.spinVel = 0;
-    if (sp.spinVelSpring) sp.spinVelSpring.set(0);
-    pointerId = id;
-    canvas.style.cursor = 'grabbing';
-  };
+  const deskInstance = createAssetInstance('desk');
+  STATE.room.desk = deskInstance.root;
+  STATE.room.desk.position.set(DESK_LAYOUT.x, 0, -5.12);
+  STATE.room.desk.rotation.y = 0;
+  restObjectOnY(STATE.room.desk, DESK_LAYOUT.floorY);
+  STATE.scene.add(STATE.room.desk);
 
-  const onMove = (clientX) => {
-    const sp = entry._spinner;
-    if (!sp.dragging) return;
-    const dx = clientX - sp.dragLastX;
-    const frameVel = dx * sp.sensitivity;
-    // 미끌미끌: 이전 속도와 새 속도 블렌딩
-    sp.spinVel = sp.spinVel * 0.5 + frameVel * 0.5;
-    sp.dragLastX = clientX;
-  };
+  let box = new THREE.Box3().setFromObject(STATE.room.desk);
+  STATE.room.desk.position.z += (-6.2 + DESK_LAYOUT.backInset) - box.min.z;
+  STATE.room.desk.updateMatrixWorld(true);
 
-  const onUp = () => {
-    const sp = entry._spinner;
-    if (!sp.dragging) return;
-    sp.dragging = false;
-    sp.released = true;
-    if (sp.mode === 'spring') {
-      // 현재 속도를 스프링에 전달 → 탱~ 복귀
-      sp.spinVelSpring.set(sp.spinVel);
-      sp.spinVelSpring.v = 0;
-    }
-    // friction 모드: spinVel 그대로 보존 → 마찰로 감속
-    canvas.style.cursor = 'grab';
-    pointerId = null;
-  };
+  box = new THREE.Box3().setFromObject(STATE.room.desk);
+  const fallbackSize = box.getSize(new THREE.Vector3());
+  const fallbackCenterX = (box.min.x + box.max.x) / 2;
+  const fallbackBackZ = box.min.z;
+  const fallbackTopGuess = box.min.y + fallbackSize.y * 0.46;
+  const fallbackDeskHalfWidth = Math.min(1.32, fallbackSize.x * 0.25);
+  const fallbackDeskDepth = Math.min(1.34, Math.max(0.92, fallbackSize.z * 0.24));
 
-  // 마우스 이벤트
-  canvas.addEventListener('mousedown', (e) => {
-    e.preventDefault();
-    e.stopPropagation();
-    onDown(e.clientX, -1);
+  STATE.room.deskMeshes = getDeskMeshes();
+  STATE.room.deskBounds = box.clone();
 
-    const mouseMoveHandler = (ev) => onMove(ev.clientX);
-    const mouseUpHandler = () => {
-      onUp();
-      window.removeEventListener('mousemove', mouseMoveHandler);
-      window.removeEventListener('mouseup', mouseUpHandler);
+  const analyzedSurface = analyzeDeskSurface();
+  if (analyzedSurface) {
+    STATE.room.deskTopY = analyzedSurface.y;
+    STATE.room.deskCenter.set(
+      (analyzedSurface.bounds.minX + analyzedSurface.bounds.maxX) * 0.5,
+      analyzedSurface.y,
+      (analyzedSurface.bounds.minZ + analyzedSurface.bounds.maxZ) * 0.5,
+    );
+    STATE.room.deskSurfaceBounds = analyzedSurface.bounds;
+    STATE.room.deskSurfaceYTolerance = analyzedSurface.tolerance;
+  } else {
+    STATE.room.deskTopY = fallbackTopGuess;
+    STATE.room.deskCenter.set(fallbackCenterX, STATE.room.deskTopY, fallbackBackZ + fallbackDeskDepth * 0.5);
+    STATE.room.deskSurfaceBounds = {
+      minX: fallbackCenterX - fallbackDeskHalfWidth,
+      maxX: fallbackCenterX + fallbackDeskHalfWidth,
+      minZ: fallbackBackZ + 0.16,
+      maxZ: fallbackBackZ + fallbackDeskDepth,
     };
-    window.addEventListener('mousemove', mouseMoveHandler);
-    window.addEventListener('mouseup', mouseUpHandler);
-  });
+    STATE.room.deskSurfaceYTolerance = Math.max(0.08, fallbackSize.y * 0.08);
+  }
 
-  // 터치 이벤트
-  let touchStartY = 0;
-  let touchLocked = false; // true = 스피너 모드, false = 스크롤 허용
-
-  canvas.addEventListener('touchstart', (e) => {
-    if (e.touches.length !== 1) return;
-    const t = e.touches[0];
-    touchStartY = t.clientY;
-    touchLocked = false;
-    onDown(t.clientX, t.identifier);
-  }, { passive: true }); // passive: 스크롤 차단 안함
-
-  canvas.addEventListener('touchmove', (e) => {
-    const sp = entry._spinner;
-    if (!sp.dragging) return;
-    for (const t of e.changedTouches) {
-      if (t.identifier === pointerId) {
-        const dx = Math.abs(t.clientX - sp.dragStartX);
-        const dy = Math.abs(t.clientY - touchStartY);
-        // 수평 이동이 더 크면 스피너, 아니면 스크롤
-        if (!touchLocked && dx > 12) {
-          touchLocked = true;
-        }
-        if (!touchLocked && dy > 12) {
-          // 세로 스크롤 의도 → 스피너 취소
-          onUp();
-          return;
-        }
-        if (touchLocked) {
-          e.preventDefault();
-          onMove(t.clientX);
-        }
-        break;
-      }
-    }
-  }, { passive: false });
-
-  canvas.addEventListener('touchend', (e) => {
-    for (const t of e.changedTouches) {
-      if (t.identifier === pointerId) {
-        onUp();
-        touchLocked = false;
-        break;
-      }
-    }
-  });
-
-  canvas.addEventListener('touchcancel', () => { onUp(); touchLocked = false; });
-
-  canvas.style.cursor = 'grab';
-  canvas.style.touchAction = 'pan-y'; // 세로 스크롤 허용, 가로만 스피너
-}
-
-// ══════════════════════════════════════════════════════
-// BAPE 3축 자유 조작 — 드래그로 360° 자유 회전, 플릭 관성, 마그네틱 복귀
-// ══════════════════════════════════════════════════════
-function initBapeInteraction(entry, glbFile) {
-  entry._bapeCtrl = {
-    active: true,
-    dragging: false,
-    // 드래그 상태
-    dragStartX: 0, dragStartY: 0,
-    dragLastX: 0, dragLastY: 0,
-    dragLastTime: 0,
-    // 현재 유저 회전 오프셋 (자동 회전과 별도)
-    rotOffsetX: 0, rotOffsetY: 0,
-    // 플릭 관성 속도
-    velX: 0, velY: 0,
-    // 스프링 복귀
-    springX: new Spring({ value: 0, stiffness: 45, damping: 8, mass: 1.2, precision: 0.0005 }),
-    springY: new Spring({ value: 0, stiffness: 45, damping: 8, mass: 1.2, precision: 0.0005 }),
-    // 줌 효과 (핀치/스크롤)
-    zoomSpring: new Spring({ value: 1.0, stiffness: 160, damping: 18, mass: 0.8, precision: 0.001 }),
-    zoomTarget: 1.0,
-    // 탭 효과 — 탭하면 탱~ 튀는 bounce
-    tapBounce: new Spring({ value: 0, stiffness: 300, damping: 12, mass: 0.6, precision: 0.001 }),
-    // 상태
-    released: false,
-    flickActive: false,
-    returnToAuto: false,
-    idleTimer: 0,
-    // 마지막 드래그의 velocity 추적 (5프레임 이동평균)
-    velHistory: [],
-  };
-
-  const canvas = entry.canvas;
-  if (!canvas) return;
-
-  let pointerId = null;
-
-  const onDown = (clientX, clientY, id) => {
-    const bc = entry._bapeCtrl;
-    bc.dragging = true;
-    bc.released = false;
-    bc.flickActive = false;
-    bc.returnToAuto = false;
-    bc.idleTimer = 0;
-    bc.dragStartX = clientX;
-    bc.dragStartY = clientY;
-    bc.dragLastX = clientX;
-    bc.dragLastY = clientY;
-    bc.dragLastTime = performance.now();
-    bc.velX = 0;
-    bc.velY = 0;
-    bc.velHistory = [];
-    // 스프링 값을 현재 오프셋으로 설정 (이어잡기)
-    bc.springX.set(bc.rotOffsetX);
-    bc.springY.set(bc.rotOffsetY);
-    pointerId = id;
-    canvas.style.cursor = 'grabbing';
-  };
-
-  const onMove = (clientX, clientY) => {
-    const bc = entry._bapeCtrl;
-    if (!bc.dragging) return;
-    const now = performance.now();
-    const dtMs = Math.max(1, now - bc.dragLastTime);
-    const dx = clientX - bc.dragLastX;
-    const dy = clientY - bc.dragLastY;
-    // 감도 — Y축(상하)을 X축(좌우) 회전으로 매핑
-    const sensX = 0.008; // 좌우 드래그 → Y축 회전
-    const sensY = 0.006; // 상하 드래그 → X축 회전
-    bc.rotOffsetY += dx * sensX;
-    bc.rotOffsetX += dy * sensY;
-    // X축 회전 제한 (위아래 ±60도)
-    bc.rotOffsetX = Math.max(-1.05, Math.min(1.05, bc.rotOffsetX));
-    // velocity 기록 (플릭 감지용)
-    const vx = dx / dtMs * 16; // per-frame으로 정규화
-    const vy = dy / dtMs * 16;
-    bc.velHistory.push({ vx, vy, t: now });
-    // 최근 80ms만 유지
-    bc.velHistory = bc.velHistory.filter(v => now - v.t < 80);
-    bc.dragLastX = clientX;
-    bc.dragLastY = clientY;
-    bc.dragLastTime = now;
-  };
-
-  const onUp = () => {
-    const bc = entry._bapeCtrl;
-    if (!bc.dragging) return;
-    bc.dragging = false;
-    bc.released = true;
-    // 플릭 velocity 계산 (최근 기록 평균)
-    if (bc.velHistory.length > 0) {
-      let svx = 0, svy = 0;
-      bc.velHistory.forEach(v => { svx += v.vx; svy += v.vy; });
-      bc.velX = svx / bc.velHistory.length * 0.008;
-      bc.velY = svy / bc.velHistory.length * 0.006;
-    }
-    const speed = Math.sqrt(bc.velX * bc.velX + bc.velY * bc.velY);
-    if (speed > 0.005) {
-      bc.flickActive = true;
-    } else {
-      // 느린 놓기 → 바로 복귀 시작
-      bc.returnToAuto = true;
-      bc.springX.set(bc.rotOffsetX);
-      bc.springX.v = 0;
-      bc.springY.set(bc.rotOffsetY);
-      bc.springY.v = 0;
-    }
-    canvas.style.cursor = 'grab';
-    pointerId = null;
-  };
-
-  const onTap = () => {
-    // 탭 → 탱~ 튀는 bounce 효과
-    const bc = entry._bapeCtrl;
-    bc.tapBounce.set(0);
-    bc.tapBounce.impulse(8.0);
-  };
-
-  // 마우스 이벤트
-  let mouseDownTime = 0;
-  canvas.addEventListener('mousedown', (e) => {
-    e.preventDefault();
-    e.stopPropagation();
-    mouseDownTime = performance.now();
-    onDown(e.clientX, e.clientY, -1);
-
-    const mouseMoveHandler = (ev) => onMove(ev.clientX, ev.clientY);
-    const mouseUpHandler = (ev) => {
-      const dt = performance.now() - mouseDownTime;
-      const dist = Math.sqrt((ev.clientX - entry._bapeCtrl.dragStartX)**2 + (ev.clientY - entry._bapeCtrl.dragStartY)**2);
-      onUp();
-      // 짧은 클릭 + 이동 없으면 → 탭 bounce
-      if (dt < 200 && dist < 8) onTap();
-      window.removeEventListener('mousemove', mouseMoveHandler);
-      window.removeEventListener('mouseup', mouseUpHandler);
+  const analyzedChairSurface = analyzeChairSeatSurface();
+  if (analyzedChairSurface) {
+    STATE.room.chairSeatY = analyzedChairSurface.y;
+    STATE.room.chairSurfaceBounds = analyzedChairSurface.bounds;
+    STATE.room.chairSurfaceYTolerance = analyzedChairSurface.tolerance;
+  } else {
+    STATE.room.chairSeatY = Math.max(box.min.y + fallbackSize.y * 0.2, STATE.room.deskTopY - Math.max(0.54, fallbackSize.y * 0.24));
+    STATE.room.chairSurfaceBounds = {
+      minX: fallbackCenterX - 0.42,
+      maxX: fallbackCenterX + 0.42,
+      minZ: STATE.room.deskSurfaceBounds.maxZ + 0.18,
+      maxZ: STATE.room.deskSurfaceBounds.maxZ + 0.68,
     };
-    window.addEventListener('mousemove', mouseMoveHandler);
-    window.addEventListener('mouseup', mouseUpHandler);
-  });
+    STATE.room.chairSurfaceYTolerance = Math.max(0.06, fallbackSize.y * 0.06);
+  }
 
-  // 마우스 줌 (스크롤)
-  canvas.addEventListener('wheel', (e) => {
-    e.preventDefault();
-    e.stopPropagation();
-    const bc = entry._bapeCtrl;
-    const zoomDelta = e.deltaY * 0.001;
-    bc.zoomTarget = Math.max(0.65, Math.min(1.45, bc.zoomTarget + zoomDelta));
-  }, { passive: false });
-
-  // 터치 이벤트
-  let touchStartTime = 0;
-  let touchStartY2 = 0;
-  let touchLocked2 = false;
-
-  canvas.addEventListener('touchstart', (e) => {
-    if (e.touches.length === 1) {
-      const t = e.touches[0];
-      touchStartY2 = t.clientY;
-      touchStartTime = performance.now();
-      touchLocked2 = false;
-      onDown(t.clientX, t.clientY, t.identifier);
-    }
-    // 2-finger pinch zoom
-    if (e.touches.length === 2) {
-      e.preventDefault();
-      const bc = entry._bapeCtrl;
-      bc._pinchDist = Math.sqrt(
-        (e.touches[0].clientX - e.touches[1].clientX)**2 +
-        (e.touches[0].clientY - e.touches[1].clientY)**2
-      );
-    }
-  }, { passive: false });
-
-  canvas.addEventListener('touchmove', (e) => {
-    const bc = entry._bapeCtrl;
-    // Pinch zoom
-    if (e.touches.length === 2 && bc._pinchDist) {
-      e.preventDefault();
-      const newDist = Math.sqrt(
-        (e.touches[0].clientX - e.touches[1].clientX)**2 +
-        (e.touches[0].clientY - e.touches[1].clientY)**2
-      );
-      const scale = newDist / bc._pinchDist;
-      bc.zoomTarget = Math.max(0.65, Math.min(1.45, bc.zoomTarget * (1 + (scale - 1) * 0.3)));
-      bc._pinchDist = newDist;
-      return;
-    }
-    if (!bc.dragging || e.touches.length !== 1) return;
-    const t = e.changedTouches[0];
-    if (t.identifier !== pointerId) return;
-    const dx = Math.abs(t.clientX - bc.dragStartX);
-    const dy = Math.abs(t.clientY - touchStartY2);
-    if (!touchLocked2 && (dx > 10 || dy > 10)) {
-      touchLocked2 = true;
-      if (dy > dx * 1.5) {
-        // 세로 방향이 더 크면 스크롤 허용
-        onUp(); touchLocked2 = false;
-        return;
-      }
-    }
-    if (touchLocked2) {
-      e.preventDefault();
-      onMove(t.clientX, t.clientY);
-    }
-  }, { passive: false });
-
-  canvas.addEventListener('touchend', (e) => {
-    const bc = entry._bapeCtrl;
-    bc._pinchDist = null;
-    if (bc.dragging) {
-      for (const t of e.changedTouches) {
-        if (t.identifier === pointerId) {
-          const dt = performance.now() - touchStartTime;
-          const dist = Math.sqrt((t.clientX - bc.dragStartX)**2 + (t.clientY - touchStartY2)**2);
-          onUp();
-          if (dt < 200 && dist < 12) onTap();
-          break;
-        }
-      }
-    }
-    touchLocked2 = false;
-  });
-
-  canvas.addEventListener('touchcancel', () => {
-    entry._bapeCtrl._pinchDist = null;
-    onUp();
-    touchLocked2 = false;
-  });
-
-  canvas.style.cursor = 'grab';
-  canvas.style.touchAction = 'pan-y';
+  buildStaticDecor();
 }
 
-const chronSections=document.querySelectorAll(".chron-section");
-const glbRenderers=Object.create(null);
-const glbLivePromises=new Map();
-const glbTemplateCache=new Map();
-const wantedGLBIndices=new Set();
-let activeGLBIdx=-1;
-let lastActiveGLBIdx=-1;
-const IS_MOBILE=/Android|iPhone|iPad|iPod|Mobile/i.test(navigator.userAgent);
-const DPR=Math.min(window.devicePixelRatio||1, IS_MOBILE ? 1.15 : 1.4);
-const MAX_CHRON_CONTEXTS=IS_MOBILE ? 1 : 3;
-const PRELOAD_CONCURRENCY=IS_MOBILE ? 1 : 2;
-
-const GLB_SCALE_OVERRIDE={
-  "midi.glb":3.2,"2020.glb":3.1,"2020_ferrari_f8_tributo.glb":3.1,
-  "jack_daniels_whiskey_no.7_bottle.glb":2.7,"hoodie.glb":4.4,
-  "cuban_link_chain.glb":2.7,"can.glb":2.1,"kiki.glb":3.6,"stu.glb":4.45,"20201.glb":3.8,
-  "whiskey.glb":2.2,
-};
-const GLB_Y_OFFSET={"hoodie.glb":-1.05, "whiskey.glb":-0.75, "stu.glb":-0.45};
-const GLB_BOTTOM_PIVOT=new Set(["wine_bottle_cos.glb","jack_daniels_whiskey_no.7_bottle.glb","whiskey.glb"]);
-
-const GLB_LIGHTING={
-  "jack_daniels_whiskey_no.7_bottle.glb": {zeroBase:true, exposure:1.1, warmColor:0x8A4B22, warmI:14.0, warmDist:14},
-  "whiskey.glb": {whiskeyCustm:true, exposure:1.8, ambI:0.35, warmColor:0xC47A30, warmI:9.0, warmDist:14},
-  "vintage_metal_ashtray.glb": {ashtray:true, exposure:2.2, ambI:1.10, dirI:1.80, dir2I:0.80},
-  "hoodie.glb": {hoodie:true, exposure:2.2, ambI:1.20, dirI:1.80, dir2I:0.90},
-  "midi.glb": {keyboard:true, exposure:1.55, ambI:0.72, dirI:1.10, dir2I:0.55},
-  "cuban_link_chain.glb": {cuban:true, ambI:3.2, dirI:5.0, dir2I:2.5, exposure:3.4},
-  "diamond_bape_buckle.glb": {ambI:2.2, dirI:3.0, dir2I:1.5, exposure:2.2},
-  "2020.glb": {dark:true, ambI:0.18, dirI:0.35, dir2I:0.12, exposure:0.65},
-  "2020_ferrari_f8_tributo.glb": {dark:true, ambI:0.18, dirI:0.35, dir2I:0.12, exposure:0.65},
-};
-
-const GLB_SPECIAL_REVERSE=new Set(["hoodie.glb","2020_ferrari_f8_tributo.glb"]);
-
-const GLB_PERS={
-  "vintage_metal_ashtray.glb": {wobble:0.016,wFreq:1.2,band:"sub",  bRot:0.006, subBass:true},
-  "hoodie.glb":                {wobble:0.0014,wFreq:0.62,band:"bass", bRot:0.009, hoodieMode:true},
-  "kiki.glb":                  {wobble:0.012,wFreq:3.0,band:"mid", bRot:0.0022, airHigh:true},
-  "cuban_link_chain.glb":      {wobble:0.007,wFreq:1.4,band:"bass", bRot:0.0005, oneWay:true},
-  "whiskey.glb":               {wobble:0.006,wFreq:1.5,band:"sub",  bRot:0.0014, whiskyMode:true},
-  "diamond_bape_buckle.glb":   {wobble:0.018,wFreq:4.2,band:"high", bRot:0.0015, airHigh:true, bapeMode:true},
-  "stu.glb":                   {wobble:0.0022,wFreq:0.52,band:"sub",  bRot:0.00045, stuMode:true},
-  "20201.glb":                 {wobble:0.0008,wFreq:0.45,band:"bass", bRot:0.00365, bounceMode:true, oneWay:true},
-  "boot.glb":                  {wobble:0.000,wFreq:0.0,band:"sub",  bRot:0.0022, bootMode:true},
-  "jack_daniels_whiskey_no.7_bottle.glb":{wobble:0.006,wFreq:1.3,band:"sub", bRot:0.0012},
-  "2020.glb":                  {wobble:0.010,wFreq:1.6,band:"bass", bRot:0.0018, multiband:true},
-};
-const DEF_PERS={wobble:0.010,wFreq:2.0,band:"bass",bRot:0.0022};
-
-// ── 스피너 대상 모델 (손으로 돌리기 가능)
-const SPINNER_MODELS = new Set(["vintage_metal_ashtray.glb", "20201.glb"]);
-
-// ── BAPE 3축 자유 조작 대상
-const BAPE_INTERACT_MODELS = new Set(["diamond_bape_buckle.glb"]);
-
-let sharedLoadingManager=null;
-let sharedGLTFLoader=null;
-let sharedDRACOLoader=null;
-let sharedKTX2Loader=null;
-
-function getVisibleSectionRatio(sec){
-  if(!sec) return 0;
-  const rect=sec.getBoundingClientRect();
-  const vh=window.innerHeight||1;
-  if(rect.bottom<=0||rect.top>=vh) return 0;
-  const visible=Math.min(rect.bottom,vh)-Math.max(rect.top,0);
-  return Math.max(0, visible / Math.max(1, Math.min(rect.height, vh)));
+function clearStaticDecor() {
+  STATE.staticDecor.forEach((object) => STATE.scene.remove(object));
+  STATE.staticDecor = [];
 }
 
-function getTextureSlots(material){
+
+function buildStaticDecor() {
+  clearStaticDecor();
+}
+
+function createAssetInstance(key) {
+  const template = STATE.templates[key];
+  const root = template.animations.length ? cloneSkeleton(template.root) : template.root.clone(true);
+  root.userData.assetKey = key;
+  applyShadowSettings(root);
+
+  let mixer = null;
+  let action = null;
+
+  if (template.animations.length) {
+    mixer = new THREE.AnimationMixer(root);
+    action = mixer.clipAction(template.animations[0]);
+    action.setLoop(THREE.LoopOnce, 1);
+    action.clampWhenFinished = true;
+  }
+
+  return { root, mixer, action };
+}
+
+
+function getDeskSurfaceBounds() {
+  return STATE.room.deskSurfaceBounds || {
+    minX: -1.55,
+    maxX: 1.55,
+    minZ: -5.8,
+    maxZ: -4.55,
+  };
+}
+
+function getChairSurfaceBounds() {
+  return STATE.room.chairSurfaceBounds || {
+    minX: -0.48,
+    maxX: 0.48,
+    minZ: -3.98,
+    maxZ: -3.36,
+  };
+}
+
+function slotOnChair(u, v, rotY = 0, zOffset = 0, xOffset = 0) {
+  const bounds = getChairSurfaceBounds();
+  return {
+    x: THREE.MathUtils.lerp(bounds.minX, bounds.maxX, u) + xOffset,
+    z: THREE.MathUtils.lerp(bounds.minZ, bounds.maxZ, v) + zOffset,
+    rotY,
+  };
+}
+
+function getChairOverflowSlots() {
   return [
-    "map","alphaMap","aoMap","bumpMap","normalMap","roughnessMap","metalnessMap","emissiveMap",
-    "clearcoatMap","clearcoatNormalMap","clearcoatRoughnessMap","iridescenceMap","iridescenceThicknessMap",
-    "specularColorMap","specularIntensityMap","sheenColorMap","sheenRoughnessMap","thicknessMap","transmissionMap"
+    slotOnChair(0.28, 0.38, -0.08),
+    slotOnChair(0.72, 0.34, 0.08),
+    slotOnChair(0.5, 0.62, 0.02),
   ];
 }
 
-function optimizeTexture(texture){
-  if(!texture||texture.userData?._optimized) return;
-  texture.anisotropy=Math.min(texture.anisotropy||1, 2);
-  const img=texture.image;
-  const tooLarge=img&&img.width&&img.height&&(img.width>2048||img.height>2048);
-  if(tooLarge){
-    texture.generateMipmaps=false;
-    texture.minFilter=THREE.LinearFilter;
-  }
-  texture.needsUpdate=true;
-  texture.userData = texture.userData || {};
-  texture.userData._optimized=true;
+function slotOnDesk(u, v, rotY = 0, zOffset = 0, xOffset = 0) {
+  const bounds = getDeskSurfaceBounds();
+  return {
+    x: THREE.MathUtils.lerp(bounds.minX, bounds.maxX, u) + DESK_TOP_ITEM_WORLD_COMP.x + xOffset,
+    z: THREE.MathUtils.lerp(bounds.minZ, bounds.maxZ, v) + DESK_TOP_ITEM_WORLD_COMP.z + zOffset,
+    rotY,
+  };
 }
 
-function optimizeMaterial(material){
-  if(!material||material.userData?._optimized) return;
-  getTextureSlots(material).forEach((slot)=>{
-    if(material[slot]) optimizeTexture(material[slot]);
-  });
-  if(material.transparent && material.opacity >= 0.999 && !material.alphaMap){
-    material.transparent=false;
-  }
-  if(material.alphaTest>0){
-    material.depthWrite=true;
-  }
-  material.userData = material.userData || {};
-  material.userData._optimized=true;
-  material.needsUpdate=true;
+function getDeskNoteSlots() {
+  return [
+    slotOnDesk(0.03, 0.42, -0.18, -0.40),
+    slotOnDesk(0.11, 0.52, 0.12, -0.40),
+    slotOnDesk(0.2, 0.36, -0.1, -0.42),
+    slotOnDesk(0.29, 0.48, 0.16, -0.40),
+  ];
 }
 
-function initAssetLoaders(){
-  if(sharedGLTFLoader) return;
-  sharedLoadingManager=new THREE.LoadingManager();
-  sharedDRACOLoader=new DRACOLoader(sharedLoadingManager);
-  sharedDRACOLoader.setDecoderPath("https://cdn.jsdelivr.net/npm/three@0.163.0/examples/jsm/libs/draco/gltf/");
+function getDeskScribbleSlots() {
+  return [
+    slotOnDesk(0.02, 0.68, -0.26, -0.34, -0.04),
+    slotOnDesk(0.08, 0.58, -0.18, -0.36, -0.02),
+  ];
+}
 
-  sharedKTX2Loader=new KTX2Loader(sharedLoadingManager);
-  sharedKTX2Loader.setTranscoderPath("https://cdn.jsdelivr.net/npm/three@0.163.0/examples/jsm/libs/basis/");
+function getRecordFloorSlots() {
+  return RECORD_FLOOR_SLOTS;
+}
 
-  let probeRenderer=null;
-  try{
-    const probeCanvas=document.createElement("canvas");
-    probeRenderer=new THREE.WebGLRenderer({ canvas:probeCanvas, antialias:false, alpha:false, powerPreference:"low-power" });
-    sharedKTX2Loader.detectSupport(probeRenderer);
-  }catch(_){}
+function getDeskTumblerSlots() {
+  const rightShift = 0.12;
+  return [
+    slotOnDesk(0.44, 0.22, -0.06, -0.28, -0.16 + rightShift),
+    slotOnDesk(0.57, 0.26, 0.02, -0.25, -0.06 + rightShift),
+    slotOnDesk(0.74, 0.23, -0.04, -0.27, 0.08 + rightShift),
+    slotOnDesk(0.50, 0.40, 0.06, -0.18, -0.12 + rightShift),
+    slotOnDesk(0.70, 0.42, -0.03, -0.17, 0.10 + rightShift),
+  ];
+}
 
-  sharedGLTFLoader=new GLTFLoader(sharedLoadingManager);
-  sharedGLTFLoader.setDRACOLoader(sharedDRACOLoader);
-  if(probeRenderer) sharedGLTFLoader.setKTX2Loader(sharedKTX2Loader);
+function getDeskOverflowPaperSlots() {
+  return [
+    slotOnDesk(0.34, 0.22, -0.12, -0.46),
+    slotOnDesk(0.46, 0.32, 0.08, -0.42),
+    slotOnDesk(0.56, 0.22, -0.08, -0.46),
+    slotOnDesk(0.38, 0.54, 0.14, -0.36),
+    slotOnDesk(0.54, 0.56, -0.16, -0.34),
+    slotOnDesk(0.66, 0.44, 0.1, -0.38),
+  ];
+}
 
-  if(probeRenderer){
-    try{ probeRenderer.dispose(); }catch(_){}
-    try{ probeRenderer.forceContextLoss(); }catch(_){}
+function getDeskEmotionSlots() {
+  return [
+    slotOnDesk(0.09, 0.28, -0.14, -0.42, -0.18),
+  ];
+}
+
+function isAllowedEmotionDeskLayout(entry) {
+  if (!entry || entry.placement !== 'desk') return true;
+  const [slot] = getDeskEmotionSlots();
+  if (!slot) return false;
+  return Math.abs((entry.x ?? 0) - slot.x) <= 0.45 && Math.abs((entry.z ?? 0) - slot.z) <= 0.45;
+}
+
+function getDeskEmotionRewardSlots() {
+  return DESK_EMOTION_REWARD_SLOTS.map((slot) => slotOnDesk(slot.u, slot.v, slot.rotY, slot.zOffset, slot.xOffset));
+}
+
+function isFloorPlacementSlotList(slotList) {
+  return slotList === CLUTTER_SLOTS
+    || slotList === RECORD_FLOOR_SLOTS
+    || slotList === RECORD_SECONDARY_SPREAD_SLOTS
+    || slotList === CLUTTER_SECONDARY_SPREAD_SLOTS
+    || slotList === CLOTHES_SLOTS
+    || slotList === EMOTION_REWARD_SLOTS;
+}
+
+function finalizePickedSlot(slotList, slot) {
+  if (!slot) return slot;
+  return isFloorPlacementSlotList(slotList) ? stabilizeFloorSlotCandidate({ ...slot }) : slot;
+}
+
+const FLOOR_FRONT_PRIORITY_WINDOW_RATIO = 0.42;
+const FLOOR_FRONT_PRIORITY_MIN_WINDOW = 4;
+
+function buildFrontBiasedSlotOrder(slotList, occupiedCount = 0, seedOffset = 0) {
+  if (!isFloorPlacementSlotList(slotList)) {
+    return Array.isArray(slotList) ? slotList : [];
   }
+
+  return slotList
+    .map((slot) => ({ slot }))
+    .sort((a, b) => {
+      const depthDiff = b.slot.z - a.slot.z;
+      if (depthDiff !== 0) return depthDiff;
+
+      const centerDiff = Math.abs(a.slot.x) - Math.abs(b.slot.x);
+      if (centerDiff !== 0) return centerDiff;
+
+      return a.slot.x - b.slot.x;
+    })
+    .map((entry) => entry.slot);
 }
 
-function fixFerrari(model){
-  model.traverse(c=>{
-    if(!c.isMesh) return;
-    const mats=Array.isArray(c.material)?c.material:[c.material];
-    mats.forEach(m=>{
-      if(!m) return;
-      m.side=THREE.DoubleSide;
-      m.transparent=false;
-      m.opacity=1.0;
-      m.alphaTest=0;
-      m.depthWrite=true;
-      m.depthTest=true;
-      m.needsUpdate=true;
-    });
-  });
+function buildFrontBiasedSearchIndices(total, occupiedCount = 0, seedOffset = 0) {
+  if (!total) return [];
+  return Array.from({ length: total }, (_, index) => index);
 }
 
-function optimizeTemplateGltf(gltf, glbFile){
-  const hasAnimations=!!(gltf.animations&&gltf.animations.length);
-  const visitedMaterials=new Set();
+function pickDeskOrChairPlacement(options) {
+  const {
+    assetKey = '',
+    canUseDesk = true,
+    canUseChair = true,
+    deskSlots = [],
+    chairSlots = [],
+    occupied,
+    deskMinDistance = 0.72,
+    chairMinDistance = 0.66,
+    seedOffset = 0,
+  } = options;
 
-  if(glbFile.includes("ferrari")||glbFile==="2020.glb") fixFerrari(gltf.scene);
+  const allowDesk = canUseDesk && isPlacementAllowedForAsset(assetKey, 'desk');
+  const allowChair = canUseChair && isPlacementAllowedForAsset(assetKey, 'chair');
 
-  gltf.scene.traverse((obj)=>{
-    if(obj.isMesh){
-      obj.castShadow=false;
-      obj.receiveShadow=false;
-      obj.frustumCulled=true;
-      if(obj.material){
-        const mats=Array.isArray(obj.material)?obj.material:[obj.material];
-        mats.forEach((mat)=>{
-          if(mat && !visitedMaterials.has(mat)){
-            visitedMaterials.add(mat);
-            optimizeMaterial(mat);
-          }
+  if (allowDesk && hasAvailableSlot(deskSlots, occupied.deskInteractive, deskMinDistance)) {
+    return {
+      slot: pickSlot(deskSlots, occupied.deskInteractive, deskMinDistance, seedOffset),
+      area: 'deskInteractive',
+      placement: 'desk',
+    };
+  }
+
+  if (allowChair && hasAvailableSlot(chairSlots, occupied.chairInteractive, chairMinDistance)) {
+    return {
+      slot: pickSlot(chairSlots, occupied.chairInteractive, chairMinDistance, seedOffset + 0.37),
+      area: 'chairInteractive',
+      placement: 'chair',
+    };
+  }
+
+  return null;
+}
+
+function applyObjectToPlacementSurface(object, slot, placement, key) {
+  if (placement === 'chair') {
+    placeObjectOnChairSurface(object, slot, key);
+    return;
+  }
+
+  placeObjectOnDeskSurface(object, slot, key);
+}
+
+function buildSurfaceDropIntro(enabled, placement, settledY, startedAt, duration = SURFACE_DROP_MS, height = SURFACE_DROP_HEIGHT) {
+  if (!enabled) return null;
+  if (placement !== 'desk' && placement !== 'chair') return null;
+
+  return {
+    startedAt,
+    duration,
+    fromY: settledY + height,
+    toY: settledY,
+  };
+}
+
+function pickSlotFromPreferredSlots(preferredSlots, slotList, occupied, minDistance, seedOffset = 0) {
+  if (Array.isArray(preferredSlots) && preferredSlots.length) {
+    const orderedPreferred = buildFrontBiasedSlotOrder(preferredSlots, occupied.length, seedOffset);
+    const totalPreferred = orderedPreferred.length;
+    const searchIndices = isFloorPlacementSlotList(preferredSlots)
+      ? buildFrontBiasedSearchIndices(totalPreferred, occupied.length, seedOffset)
+      : Array.from({ length: totalPreferred }, (_, index) => {
+          const preferredStart = totalPreferred
+            ? Math.abs(Math.floor((occupied.length * 1.73 + seedOffset * 17.0) * 1000)) % totalPreferred
+            : 0;
+          return (preferredStart + index) % totalPreferred;
         });
+
+    for (let orderIndex = 0; orderIndex < searchIndices.length; orderIndex += 1) {
+      const slot = orderedPreferred[searchIndices[orderIndex]];
+      const ok = occupied.every((point) => distance2D(point.x, point.z, slot.x, slot.z) >= minDistance);
+      if (ok) {
+        const finalSlot = finalizePickedSlot(preferredSlots, slot);
+        occupied.push({ x: finalSlot.x, z: finalSlot.z });
+        return finalSlot;
       }
     }
-    if(!hasAnimations && obj !== gltf.scene && !obj.isBone && !obj.isSkinnedMesh){
-      obj.matrixAutoUpdate=false;
-      obj.updateMatrix();
-    }
-  });
-
-  gltf.scene.updateMatrixWorld(true);
-  return gltf;
-}
-
-function preloadGLBTemplate(idx){
-  const sec=chronSections[idx];
-  if(!sec) return Promise.resolve(null);
-  const glbPath=sec.dataset.glb;
-  if(!glbPath) return Promise.resolve(null);
-  if(glbTemplateCache.has(glbPath)){
-    return glbTemplateCache.get(glbPath).promise;
   }
 
-  initAssetLoaders();
-
-  const glbFile=glbPath.split("/").pop();
-  const cacheEntry={
-    path:glbPath,
-    glbFile,
-    lastUsed:performance.now(),
-    promise:null,
-    gltf:null,
-  };
-
-  cacheEntry.promise=new Promise((resolve,reject)=>{
-    sharedGLTFLoader.load(glbPath,(gltf)=>{
-      cacheEntry.gltf=optimizeTemplateGltf(gltf, glbFile);
-      cacheEntry.lastUsed=performance.now();
-      resolve(cacheEntry.gltf);
-    },undefined,(err)=>{
-      glbTemplateCache.delete(glbPath);
-      console.warn("GLB preload 실패:",glbPath,err);
-      reject(err);
-    });
-  });
-
-  glbTemplateCache.set(glbPath,cacheEntry);
-  return cacheEntry.promise;
+  return pickSlot(slotList, occupied, minDistance, seedOffset);
 }
 
-function cloneLiveMaterial(material){
-  if(!material) return material;
-  const cloned=material.clone();
-  cloned.needsUpdate=true;
-  return cloned;
+function hasAvailableSlot(slotList, occupied, minDistance) {
+  if (!Array.isArray(slotList) || !slotList.length) return false;
+  return slotList.some((slot) => occupied.every((point) => distance2D(point.x, point.z, slot.x, slot.z) >= minDistance));
 }
 
-function buildLiveModelFromTemplate(gltf, glbFile){
-  const model=cloneSkeleton(gltf.scene);
-
-  model.traverse((obj)=>{
-    if(!obj.isMesh) return;
-    if(obj.material){
-      obj.material=Array.isArray(obj.material)
-        ? obj.material.map(cloneLiveMaterial)
-        : cloneLiveMaterial(obj.material);
-    }
-    obj.castShadow=false;
-    obj.receiveShadow=false;
-    obj.frustumCulled=true;
-  });
-
-  let box=new THREE.Box3().setFromObject(model);
-  const size=box.getSize(new THREE.Vector3());
-  const maxDim=Math.max(size.x,size.y,size.z)||1;
-  const scaleOverride=GLB_SCALE_OVERRIDE[glbFile];
-  const targetSize=scaleOverride||2.8;
-  const sc=targetSize/maxDim;
-  model.scale.setScalar(sc);
-
-  box=new THREE.Box3().setFromObject(model);
-  const center=box.getCenter(new THREE.Vector3());
-  const bottom=box.min.y;
-
-  if(GLB_BOTTOM_PIVOT.has(glbFile)){
-    const yOff=GLB_Y_OFFSET[glbFile]||0;
-    model.position.set(-center.x, -bottom+yOff, -center.z);
-  } else {
-    const yOff=GLB_Y_OFFSET[glbFile]||0;
-    model.position.set(-center.x, -center.y+yOff, -center.z);
-  }
-
-  if(GLB_SPECIAL_REVERSE.has(glbFile)){
-    model.rotation.y=Math.PI;
-  }
-
-  model.updateMatrixWorld(true);
-  return { model, baseScale:sc };
+function getFloorCrowdCount(occupied) {
+  return (occupied?.floorInteractive?.length || 0)
+    + (occupied?.clutter?.length || 0)
+    + (occupied?.clothes?.length || 0);
 }
 
-function disposeObject3D(root,{ disposeGeometry=false, disposeMaterials=true, disposeTextures=false }={}){
-  if(!root) return;
-
-  const visitedMaterials=new Set();
-  const visitedTextures=new Set();
-  const visitedGeometries=new Set();
-
-  root.traverse((obj)=>{
-    if(obj.isMesh){
-      if(disposeGeometry && obj.geometry && !visitedGeometries.has(obj.geometry)){
-        visitedGeometries.add(obj.geometry);
-        obj.geometry.dispose();
-      }
-
-      if(disposeMaterials && obj.material){
-        const mats=Array.isArray(obj.material)?obj.material:[obj.material];
-        mats.forEach((mat)=>{
-          if(!mat || visitedMaterials.has(mat)) return;
-          visitedMaterials.add(mat);
-
-          if(disposeTextures){
-            getTextureSlots(mat).forEach((slot)=>{
-              const tex=mat[slot];
-              if(tex && !visitedTextures.has(tex)){
-                visitedTextures.add(tex);
-                tex.dispose();
-              }
-            });
-          }
-
-          mat.dispose();
-        });
-      }
-    }
-  });
+function shouldUseDeskPaperOverflow(occupied, deskOverflowSlots, minDistance = 0.66) {
+  return getFloorCrowdCount(occupied) >= 12
+    && hasAvailableSlot(deskOverflowSlots, occupied.deskInteractive, minDistance);
 }
 
-function replaceCanvasWithFreshClone(canvas){
-  if(!canvas||!canvas.parentNode) return canvas;
-  const fresh=canvas.cloneNode(false);
-  if(canvas.className) fresh.className=canvas.className;
-  if(canvas.id) fresh.id=canvas.id;
-  canvas.parentNode.replaceChild(fresh, canvas);
-  return fresh;
-}
+function getEmotionAnchor(anchorList, index, tone) {
+  const base = anchorList[index % anchorList.length];
+  const ring = Math.floor(index / anchorList.length);
+  if (!ring) return { ...base };
 
-function buildInstancedCopies(templateMesh, transforms=[]){
-  if(!templateMesh||!templateMesh.isMesh||transforms.length===0) return null;
-  const sourceMaterial=Array.isArray(templateMesh.material)?templateMesh.material[0]:templateMesh.material;
-  const instanced=new THREE.InstancedMesh(templateMesh.geometry, sourceMaterial, transforms.length);
-  const tempMatrix=new THREE.Matrix4();
-  transforms.forEach((transform, idx)=>{
-    tempMatrix.compose(transform.position, transform.quaternion, transform.scale);
-    instanced.setMatrixAt(idx, tempMatrix);
-  });
-  instanced.instanceMatrix.needsUpdate=true;
-  instanced.frustumCulled=true;
-  return instanced;
-}
+  const angle = (index * 1.61803398875) % (Math.PI * 2);
+  const spreadX = tone === 'good' ? 1.02 : 0.86;
+  const spreadZ = tone === 'good' ? 0.82 : 0.7;
+  const spreadY = tone === 'good' ? 0.16 : 0.12;
 
-function attachContextWatchers(canvas,onLost,onRestored){
-  const lost=(e)=>{
-    e.preventDefault();
-    onLost?.(e);
-  };
-  const restored=()=>{
-    onRestored?.();
-  };
-  canvas.addEventListener("webglcontextlost",lost,false);
-  canvas.addEventListener("webglcontextrestored",restored,false);
-  return ()=>{
-    canvas.removeEventListener("webglcontextlost",lost,false);
-    canvas.removeEventListener("webglcontextrestored",restored,false);
+  return {
+    x: base.x + Math.cos(angle) * spreadX * ring,
+    y: base.y + (((ring % 2) === 0 ? 1 : -1) * spreadY * Math.min(ring, 2)),
+    z: base.z + Math.sin(angle) * spreadZ * ring,
   };
 }
 
-function createChronRenderer(sec, canvas, glbFile){
-  const W=window.innerWidth, H=window.innerHeight;
-  const renderer=new THREE.WebGLRenderer({
-    canvas,
-    alpha:true,
-    antialias:!IS_MOBILE,
-    powerPreference:"high-performance",
-    preserveDrawingBuffer:false,
-    stencil:false
-  });
-  renderer.setPixelRatio(DPR);
-  renderer.setSize(W,H,false);
-  renderer.shadowMap.enabled=false;
-  renderer.setClearColor(0x000000,0);
-  renderer.outputColorSpace=THREE.SRGBColorSpace;
-  renderer.toneMapping=THREE.ACESFilmicToneMapping;
-  renderer.toneMappingExposure=1.4;
 
-  const scene=new THREE.Scene();
-  const camera=new THREE.PerspectiveCamera(45,W/H,0.01,1000);
-  camera.position.set(0,0.8,4.0);
-  camera.lookAt(0,0,0);
-
-  const ambLight = new THREE.AmbientLight(0xffffff,0.9);
-  scene.add(ambLight);
-  const dir=new THREE.DirectionalLight(0xffffff,1.4);
-  dir.position.set(3,5,4);
-  dir.castShadow=false;
-  scene.add(dir);
-  const dir2=new THREE.DirectionalLight(0xffffff,0.5);
-  dir2.position.set(-3,-1,-2);
-  scene.add(dir2);
-
-  const lconf=GLB_LIGHTING[glbFile];
-  if(lconf){
-    if(lconf.dark){
-      ambLight.intensity=0.18; dir.intensity=0.35; dir2.intensity=0.12;
-      renderer.toneMappingExposure=0.65;
-      const topL=new THREE.PointLight(0xffffff,0.5,8); topL.position.set(0,3,2); scene.add(topL);
-      const frontL=new THREE.PointLight(0xffffff,0.3,6); frontL.position.set(0,0,3); scene.add(frontL);
-    } else if(lconf.zeroBase){
-      ambLight.intensity=0; dir.intensity=0; dir2.intensity=0;
-      renderer.toneMappingExposure=lconf.exposure;
-      const wc=lconf.warmColor,wi=lconf.warmI,wd=lconf.warmDist;
-      const wFront=new THREE.PointLight(wc,wi,wd); wFront.position.set(0,0.2,2.0); scene.add(wFront);
-      const wSide=new THREE.PointLight(wc,wi*0.65,wd); wSide.position.set(1.8,0.8,1.5); scene.add(wSide);
-      const wSide2=new THREE.PointLight(wc,wi*0.65,wd); wSide2.position.set(-1.8,0.8,1.5); scene.add(wSide2);
-      const wBack=new THREE.PointLight(wc,wi*0.3,wd*0.6); wBack.position.set(0,0.5,-1.5); scene.add(wBack);
-      scene.add(new THREE.AmbientLight(wc, 0.18));
-    } else if(lconf.whiskeyCustm){
-      ambLight.intensity=lconf.ambI||0.35; dir.intensity=0.5; dir2.intensity=0.2;
-      renderer.toneMappingExposure=lconf.exposure||1.8;
-      const wc=lconf.warmColor,wi=lconf.warmI,wd=lconf.warmDist;
-      const wFront=new THREE.PointLight(wc,wi,wd); wFront.position.set(0,0.3,2.2); scene.add(wFront);
-      const wSide=new THREE.PointLight(wc,wi*0.55,wd); wSide.position.set(1.5,1.0,1.5); scene.add(wSide);
-      const wSide2=new THREE.PointLight(wc,wi*0.55,wd); wSide2.position.set(-1.5,1.0,1.5); scene.add(wSide2);
-      const wTop=new THREE.PointLight(0xE8C090,wi*0.4,wd*0.8); wTop.position.set(0,3.0,1.0); scene.add(wTop);
-      scene.add(new THREE.AmbientLight(0xC88040, 0.25));
-    } else if(lconf.ashtray){
-      ambLight.intensity=lconf.ambI||1.10; dir.intensity=lconf.dirI||1.80; dir2.intensity=lconf.dir2I||0.80;
-      renderer.toneMappingExposure=lconf.exposure||2.2;
-      const fillL=new THREE.DirectionalLight(0xE8E0D8,0.90); fillL.position.set(0,2,-3); scene.add(fillL);
-      const topL=new THREE.DirectionalLight(0xffffff,1.20); topL.position.set(0,4,1); scene.add(topL);
-      const rimL=new THREE.DirectionalLight(0xC8D8FF,0.60); rimL.position.set(-3,1,0); scene.add(rimL);
-    } else if(lconf.hoodie){
-      ambLight.intensity=lconf.ambI||1.20; dir.intensity=lconf.dirI||1.80; dir2.intensity=lconf.dir2I||0.90;
-      renderer.toneMappingExposure=lconf.exposure||2.2;
-      const frontL=new THREE.DirectionalLight(0xffffff,1.20); frontL.position.set(0,0,4); scene.add(frontL);
-      const topL=new THREE.DirectionalLight(0xffffff,0.90); topL.position.set(0,5,1); scene.add(topL);
-      const fillL=new THREE.DirectionalLight(0xD0E0FF,0.50); fillL.position.set(3,2,2); scene.add(fillL);
-    } else if(lconf.keyboard){
-      ambLight.intensity=lconf.ambI||0.72; dir.intensity=lconf.dirI||1.10; dir2.intensity=lconf.dir2I||0.55;
-      renderer.toneMappingExposure=lconf.exposure||1.55;
-      const topL=new THREE.DirectionalLight(0xffffff,0.70); topL.position.set(0,4,1.2); scene.add(topL);
-      const sideL=new THREE.DirectionalLight(0xE8F0FF,0.45); sideL.position.set(-2,1.2,2.2); scene.add(sideL);
-      const rimL=new THREE.DirectionalLight(0xFFEEDD,0.30); rimL.position.set(2,0.5,1.5); scene.add(rimL);
-    } else if(lconf.cuban){
-      ambLight.intensity=lconf.ambI||3.2; dir.intensity=lconf.dirI||5.0; dir2.intensity=lconf.dir2I||2.5;
-      renderer.toneMappingExposure=lconf.exposure||3.4;
-      const spot1=new THREE.DirectionalLight(0xFFFFFF,4.0); spot1.position.set(2,3,3); scene.add(spot1);
-      const spot2=new THREE.DirectionalLight(0xFFF8E8,3.5); spot2.position.set(-2,2,3); scene.add(spot2);
-      const spot3=new THREE.DirectionalLight(0xFFFFFF,2.5); spot3.position.set(0,5,1); scene.add(spot3);
-      const rimL=new THREE.DirectionalLight(0xE8F0FF,2.0); rimL.position.set(0,-2,2); scene.add(rimL);
-    } else {
-      ambLight.intensity=lconf.ambI||0.9; dir.intensity=lconf.dirI||1.4; dir2.intensity=lconf.dir2I||0.5;
-      renderer.toneMappingExposure=lconf.exposure||1.4;
-      const brightFill=new THREE.DirectionalLight(0xffffff,1.8); brightFill.position.set(0,0,3); scene.add(brightFill);
-      const brightTop=new THREE.DirectionalLight(0xffffff,1.2); brightTop.position.set(0,5,1); scene.add(brightTop);
-    }
-  }
-
-  const era=sec.dataset.era||"mid";
-  const eraC={early:0xcc3322,mid:0x7755ff,late:0x2277ff};
-  let ptColor=eraC[era], ptIntensity=2.0;
-  if(lconf){
-    if(lconf.dark){ ptIntensity=0.4; }
-    else if(lconf.zeroBase){ ptColor=lconf.warmColor||0x8A4520; ptIntensity=1.2; }
-    else if(lconf.whiskeyCustm){ ptColor=lconf.warmColor||0xC47A30; ptIntensity=1.0; }
-    else if(lconf.ashtray){ ptIntensity=0.8; }
-    else if(lconf.hoodie){ ptIntensity=0.8; }
-    else if(lconf.keyboard){ ptIntensity=0.28; }
-  }
-
-  const ptLight=new THREE.PointLight(ptColor, ptIntensity, 12);
-  ptLight.position.set(-2,2,3);
-  scene.add(ptLight);
-
-  return { renderer, scene, camera, ambLight, dir, dir2, ptLight };
+function getRecordLayoutKey(memo) {
+  return `record:${memo.id}`;
 }
 
-function disposeLiveGLB(idx, { replaceCanvas=true }={}){
-  const entry=glbRenderers[idx];
-  if(!entry) return;
-
-  entry.disposed=true;
-
-  if(entry.mixer){
-    try{ entry.mixer.stopAllAction(); }catch(_){}
-    try{ entry.mixer.uncacheRoot(entry.model); }catch(_){}
-  }
-
-  if(entry.model){
-    entry.scene.remove(entry.model);
-    disposeObject3D(entry.model,{ disposeMaterials:true, disposeTextures:false, disposeGeometry:false });
-  }
-
-  try{ entry.scene.clear(); }catch(_){}
-  if(entry.cleanupContextWatchers) entry.cleanupContextWatchers();
-
-  if(entry.renderer){
-    try{ entry.renderer.renderLists.dispose(); }catch(_){}
-    try{ entry.renderer.dispose(); }catch(_){}
-    try{ entry.renderer.forceContextLoss(); }catch(_){}
-  }
-
-  if(replaceCanvas){
-    replaceCanvasWithFreshClone(entry.canvas);
-  }
-
-  delete glbRenderers[idx];
+function getClutterFreshLayoutKey(memo) {
+  return `clutter-fresh:${memo.id}`;
 }
 
-async function createLiveGLBEntry(idx){
-  const sec=chronSections[idx];
-  if(!sec) return null;
+function getClutterOldAnchorMemo(memos) {
+  const list = (Array.isArray(memos) ? memos : [memos]).filter(Boolean);
+  if (!list.length) return null;
 
-  const glbPath=sec.dataset.glb;
-  const glbFile=glbPath.split("/").pop();
-  const template=await preloadGLBTemplate(idx);
-  if(!template || !wantedGLBIndices.has(idx)) return null;
+  return list
+    .slice()
+    .sort((a, b) => {
+      const timeDiff = new Date(a.createdAt).getTime() - new Date(b.createdAt).getTime();
+      if (timeDiff !== 0) return timeDiff;
+      return String(a.id).localeCompare(String(b.id));
+    })[0];
+}
 
-  const canvas=sec.querySelector(".glb-canvas");
-  if(!canvas) return null;
+function getClutterOldLayoutKey(memos) {
+  const anchor = getClutterOldAnchorMemo(memos);
+  return anchor ? 'clutter-old:shared' : null;
+}
 
-  canvas.style.position="absolute";
-  canvas.style.top="0";
-  canvas.style.left="0";
-  canvas.style.width="100%";
-  canvas.style.height="100%";
+function getClutterOldSingleLayoutKey(memo) {
+  return getClutterOldLayoutKey(memo ? [memo] : []);
+}
 
-  const entry=createChronRenderer(sec, canvas, glbFile);
-  entry.clock=new THREE.Clock();
-  entry.mixer=null;
-  entry.loaded=false;
-  entry.model=null;
-  entry.baseScale=1;
-  entry.glbFile=glbFile;
-  entry.pers=GLB_PERS[glbFile]||DEF_PERS;
-  entry.wPhase=Math.random()*Math.PI*2;
-  entry._baseModelY=null;
-  entry.canvas=canvas;
-  entry.section=sec;
-  entry.disposed=false;
-  entry.lastUsed=performance.now();
+function getClutterPileLayoutKey(memos) {
+  return getClutterOldLayoutKey(memos);
+}
 
-  entry.cleanupContextWatchers=attachContextWatchers(canvas,()=>{
-    entry.contextLost=true;
-  },()=>{
-    if(wantedGLBIndices.has(idx)){
-      disposeLiveGLB(idx,{ replaceCanvas:true });
-      ensureGLB(idx);
-    }
-  });
+function getRoutineLayoutKey(memo) {
+  return `routine-v2-desk-avoid:${memo.id}`;
+}
 
-  const built=buildLiveModelFromTemplate(template, glbFile);
-  entry.model=built.model;
-  entry.baseScale=built.baseScale;
-  entry._baseModelY=built.model.position.y;
+function isInRoutineDeskAvoidZone(slot, padX = 0.95, padZ = 0.9) {
+  const deskBounds = STATE?.room?.deskBounds;
+  if (!slot || !deskBounds) return false;
+  if (!Number.isFinite(slot.x) || !Number.isFinite(slot.z)) return false;
 
-  if(template.animations&&template.animations.length){
-    entry.mixer=new THREE.AnimationMixer(entry.model);
-    template.animations.forEach((clip)=>{
-      entry.mixer.clipAction(clip).play();
-    });
+  return slot.x >= (deskBounds.min.x - padX)
+    && slot.x <= (deskBounds.max.x + padX)
+    && slot.z >= (deskBounds.min.z - padZ)
+    && slot.z <= (deskBounds.max.z + padZ);
+}
+
+function getRoutineFloorSlots() {
+  const filtered = CLOTHES_SLOTS.filter((slot) => !isInRoutineDeskAvoidZone(slot));
+  return filtered.length ? filtered : CLOTHES_SLOTS;
+}
+
+function getSnackLayoutKey(memo) {
+  return `snack-v2:${memo.id}`;
+}
+
+function getEmotionLayoutKey(memo) {
+  return `emotion-v3-left-desk-1:${memo.id}`;
+}
+
+function getEmotionRewardLayoutKey(memo) {
+  return `emotion-reward-v4:${memo.id}`;
+}
+
+function shouldNormalizeFloorPlacementEntry(entry) {
+  if (!entry) return false;
+  return entry.area === 'floorInteractive'
+    || entry.area === 'clutter'
+    || entry.area === 'clothes'
+    || entry.area === 'recordFloor';
+}
+
+function isPlacementAllowedForAsset(assetKey, placement) {
+  if (placement === 'chair') return false;
+  if (placement === 'desk' && assetKey === 'scribble') return false;
+  return true;
+}
+
+function getLayoutCacheEntry(key) {
+  if (!key) return null;
+  const entry = STATE.layoutCache[key] || null;
+  if (!entry) return null;
+
+  if (!isPlacementAllowedForAsset(entry.assetKey, entry.placement)) {
+    delete STATE.layoutCache[key];
+    return null;
   }
 
-  entry.scene.add(entry.model);
-  entry.loaded=true;
-
-  // 스피너 대상 모델이면 드래그 이벤트 바인딩
-  if (SPINNER_MODELS.has(glbFile)) {
-    initSpinner(entry, glbFile);
+  if (!entry.transformLocked && shouldNormalizeFloorPlacementEntry(entry)) {
+    normalizeFloorPlacementSlot(entry);
+    entry.transformLocked = true;
   }
 
-  // BAPE 3축 자유 조작 인터랙션
-  if (BAPE_INTERACT_MODELS.has(glbFile)) {
-    initBapeInteraction(entry, glbFile);
-  }
-
-  glbRenderers[idx]=entry;
   return entry;
 }
 
-function getDesiredGLBIndices(idx){
-  if(idx<0) return [];
-  if(IS_MOBILE) return [idx].filter((v)=>v>=0&&v<chronSections.length);
-  return [idx-1,idx,idx+1].filter((v)=>v>=0&&v<chronSections.length);
+function setLayoutCacheEntry(key, value) {
+  if (!key) return null;
+  STATE.layoutCache[key] = {
+    ...(STATE.layoutCache[key] || {}),
+    ...value,
+    transformLocked: true,
+    slotMigrationVersion: value.slotMigrationVersion || LAYOUT_CACHE_SLOT_MIGRATION_VERSION,
+  };
+  return STATE.layoutCache[key];
 }
 
-function pruneLiveGLBContexts(){
-  const liveIndices=Object.keys(glbRenderers).map((v)=>Number(v));
-  if(liveIndices.length<=MAX_CHRON_CONTEXTS) return;
+function applyCachedTransform(object, cachedLayout) {
+  if (!object || !cachedLayout) return;
+  object.position.x = cachedLayout.x;
+  object.position.z = cachedLayout.z;
+  object.rotation.x = Number.isFinite(cachedLayout.rotX) ? cachedLayout.rotX : (object.rotation.x || 0);
+  object.rotation.y = Number.isFinite(cachedLayout.rotY) ? cachedLayout.rotY : 0;
+  object.rotation.z = Number.isFinite(cachedLayout.rotZ) ? cachedLayout.rotZ : 0;
+}
 
-  liveIndices
-    .sort((a,b)=>{
-      const ad=wantedGLBIndices.has(a)?0:1;
-      const bd=wantedGLBIndices.has(b)?0:1;
-      if(ad!==bd) return ad-bd;
-      return Math.abs(a-activeGLBIdx)-Math.abs(b-activeGLBIdx);
-    });
+function syncLayoutCacheFromObject(key, object, extra = {}) {
+  if (!key || !object) return null;
+  const entry = {
+    x: object.position.x,
+    z: object.position.z,
+    rotX: Number.isFinite(object.rotation.x) ? object.rotation.x : 0,
+    rotY: Number.isFinite(object.rotation.y) ? object.rotation.y : 0,
+    rotZ: Number.isFinite(object.rotation.z) ? object.rotation.z : 0,
+    ...extra,
+  };
+  return setLayoutCacheEntry(key, entry);
+}
 
-  while(liveIndices.length>MAX_CHRON_CONTEXTS){
-    const victim=liveIndices.pop();
-    if(victim==null) break;
-    if(wantedGLBIndices.has(victim)) break;
-    disposeLiveGLB(victim);
+function bindObjectLayoutCache(object, key, extra = {}) {
+  if (!object || !key) return;
+  object.userData.layoutCacheKey = key;
+  object.userData.layoutCacheExtra = {
+    ...(object.userData.layoutCacheExtra || {}),
+    ...extra,
+  };
+}
+
+function snapshotLiveVisualTransformsToLayoutCache() {
+  STATE.visuals.forEach((visual) => {
+    const object = visual?.object;
+    const layoutKey = object?.userData?.layoutCacheKey;
+    if (!object || !layoutKey) return;
+    syncLayoutCacheFromObject(layoutKey, object, object.userData.layoutCacheExtra || {});
+  });
+}
+
+function pruneLayoutCache(activeKeys) {
+  Object.keys(STATE.layoutCache).forEach((key) => {
+    if (!activeKeys.has(key)) {
+      delete STATE.layoutCache[key];
+    }
+  });
+}
+
+function reserveOccupiedPoint(list, x, z) {
+  if (!list || !Number.isFinite(x) || !Number.isFinite(z)) return;
+  list.push({ x, z });
+}
+
+function reservePlacementCache(key, occupied) {
+  const cache = getLayoutCacheEntry(key);
+  if (!cache) return;
+
+  if (cache.area === 'deskInteractive') {
+    reserveOccupiedPoint(occupied.deskInteractive, cache.x, cache.z);
+    return;
+  }
+
+  if (cache.area === 'chairInteractive') {
+    reserveOccupiedPoint(occupied.chairInteractive, cache.x, cache.z);
+    return;
+  }
+
+  if (cache.area === 'floorInteractive') {
+    reserveOccupiedPoint(occupied.floorInteractive, cache.x, cache.z);
+    return;
+  }
+
+  if (cache.area === 'clutter') {
+    reserveOccupiedPoint(occupied.clutter, cache.x, cache.z);
+    return;
+  }
+
+  if (cache.area === 'clothes') {
+    reserveOccupiedPoint(occupied.clothes, cache.x, cache.z);
   }
 }
 
-async function ensureGLB(idx){
-  if(idx<0||idx>=chronSections.length) return null;
-  if(glbRenderers[idx]?.loaded) return glbRenderers[idx];
-  if(glbLivePromises.has(idx)) return glbLivePromises.get(idx);
-
-  const promise=createLiveGLBEntry(idx)
-    .catch((err)=>{
-      console.warn("GLB live create 실패:", idx, err);
-      return null;
-    })
-    .finally(()=>{
-      glbLivePromises.delete(idx);
-      pruneLiveGLBContexts();
-    });
-
-  glbLivePromises.set(idx,promise);
-  return promise;
+function reservePlacementCaches(keys, occupied) {
+  keys.forEach((key) => reservePlacementCache(key, occupied));
 }
 
-function updateActiveGLB(vIdx){
-  const idx=vIdx-1;
-  if(activeGLBIdx===idx && wantedGLBIndices.size) return;
+function buildActiveLayoutKeys({ records, clutterFresh, clutterOld, routines, snacks, emotions = [] }) {
+  const keys = new Set();
 
-  lastActiveGLBIdx=activeGLBIdx;
-  activeGLBIdx=idx;
-
-  wantedGLBIndices.clear();
-  getDesiredGLBIndices(idx).forEach((value)=>wantedGLBIndices.add(value));
-
-  wantedGLBIndices.forEach((value)=>{
-    preloadGLBTemplate(value).catch(()=>{});
-    ensureGLB(value);
+  records.forEach((memo) => {
+    keys.add(getRecordLayoutKey(memo));
   });
 
-  Object.keys(glbRenderers).forEach((key)=>{
-    const numericKey=Number(key);
-    if(!wantedGLBIndices.has(numericKey)) disposeLiveGLB(numericKey);
+  clutterFresh.forEach((memo) => {
+    keys.add(getClutterFreshLayoutKey(memo));
   });
 
-  pruneLiveGLBContexts();
-}
-
-function renderChronEntry(entry){
-  if(!entry||!entry.loaded||!entry.model||entry.disposed||entry.contextLost) return;
-  const visibility=getVisibleSectionRatio(entry.section);
-  if(visibility<=0.01) return;
-
-  const {renderer,scene,camera,clock,mixer,model,ptLight,pers,glbFile} = entry;
-  const delta=Math.min(clock.getDelta(),0.05);
-  entry.lastUsed=performance.now();
-  if(mixer) mixer.update(delta);
-
-  entry.wPhase+=0.016;
-  const baseScale=entry.baseScale;
-  const bv=S[pers.band]||0;
-  const speakerPulse=S.beat+LQ.bassShock*0.5;
-
-  // ── 스피너 속도 제어 ──
-  let spinMul = 1.0;   // 1 = 정상 자동 회전, 0 = 정지
-  let spinInc = 0;     // 스피너에서 오는 per-frame 회전량
-  if (entry._spinner && entry._spinner.enabled) {
-    const sp = entry._spinner;
-    if (sp.dragging) {
-      // 드래그 중: 자동 회전 정지, 스피너 속도로 대체
-      spinMul = 0;
-      spinInc = sp.spinVel;
-    } else if (sp.released) {
-      if (sp.mode === 'spring') {
-        // ── spring (담배떨이): 속도가 탱~ 하고 0으로 복귀 ──
-        sp.spinVel = sp.spinVelSpring.update(0, delta);
-        spinInc = sp.spinVel;
-        if (sp.spinVelSpring.settled) {
-          sp.released = false;
-          sp.spinVel = 0;
-          spinMul = 1.0;
-        } else {
-          // 스프링 속도가 줄어들수록 자동 회전 복구
-          const fade = Math.min(1.0, Math.abs(sp.spinVel) * 40);
-          spinMul = 1.0 - fade;
-        }
-      } else {
-        // ── friction (20201): 마찰로 천천히 감속 ──
-        sp.spinVel *= 0.96;
-        spinInc = sp.spinVel;
-        if (Math.abs(sp.spinVel) < 0.00005) {
-          sp.released = false;
-          sp.spinVel = 0;
-          spinMul = 1.0;
-        } else {
-          // 속도가 줄어들수록 자동 회전 복구
-          const fade = Math.min(1.0, Math.abs(sp.spinVel) * 120);
-          spinMul = 1.0 - fade;
-        }
-      }
-    }
+  if (clutterOld.length) {
+    const clutterOldKey = getClutterOldLayoutKey(clutterOld);
+    if (clutterOldKey) keys.add(clutterOldKey);
   }
 
-  if(!pers.isStatic){
-    if(pers.hoodieMode){
-      const bassFlow = S.bass * 0.52 + LQ.midDensity * 0.12;
-      const hoodPulse = S.beat * 0.18 + LQ.bassShock * 0.08;
-      const subPush = LQ.subPressure * 0.16;
-      model.rotation.y += pers.bRot * (1.0 + bassFlow * 1.8 + hoodPulse * 0.5);
-      model.rotation.x = Math.sin(entry.wPhase * pers.wFreq) * pers.wobble * (0.30 + bassFlow * 0.45);
-      if(entry._baseModelY==null) entry._baseModelY = model.position.y;
-      model.position.y = entry._baseModelY + subPush * 0.028;
-      const ns = baseScale * (1 + bassFlow * 0.006 + hoodPulse * 0.012);
-      model.scale.setScalar(model.scale.x + (ns - model.scale.x) * 0.16);
-    } else if(pers.bootMode){
-      model.rotation.x = 0;
-      model.rotation.z = 0;
-      model.rotation.y += pers.bRot * (1.0 + S.bass * 0.8);
-      model.scale.setScalar(baseScale);
-    } else if(pers.bounceMode){
-      model.rotation.y += pers.bRot * (1.2 + (S.bass + LQ.midDensity) * 1.6 + speakerPulse * 0.6) * spinMul + spinInc;
-      model.rotation.x = 0;
-      model.rotation.z = 0;
-      if(entry._baseModelY==null) entry._baseModelY = model.position.y;
-      const bounce = Math.sin(entry.wPhase * 1.4) * 0.012 + LQ.subPressure * 0.008;
-      model.position.y = entry._baseModelY + bounce;
-      model.scale.setScalar(baseScale * (1 + speakerPulse * 0.025));
-
-      if(!entry._baseCamPos){
-        entry._baseCamPos = camera.position.clone();
-        entry._camJSeed = {
-          a: Math.random() * 1000,
-          b: Math.random() * 1000,
-          c: Math.random() * 1000,
-          d: Math.random() * 1000,
-          e: Math.random() * 1000,
-          f: Math.random() * 1000,
-        };
-        entry._shakeDecay = 0;
-      }
-      // ── 20201 micro-jitter: tight, cinematic camera shake ──
-      // Two-layer noise: fast + ultra-fast, gated by bass threshold
-      const rawBass = Math.max(0, S.bass - 0.18);
-      const bassGate = Math.min(1, rawBass / 0.42);
-      // Onset burst: momentary spike decays quickly
-      const beatBurst = S.beat > 0.5 ? S.beat * 0.7 : 0;
-      const shakeTarget = bassGate * 0.65 + beatBurst;
-      entry._shakeDecay += (shakeTarget - entry._shakeDecay) * 0.38;
-      entry._shakeDecay *= 0.92;  // fast natural decay
-
-      const shakeAmt = entry._shakeDecay;
-      if(shakeAmt > 0.003){
-        const ph = entry.wPhase;
-        const s = entry._camJSeed;
-        // Layer 1: medium-freq (rumble feel)
-        const n1 = Math.sin(ph * 72.3 + s.a) * 0.55 + Math.sin(ph * 118.7 + s.d) * 0.45;
-        const n2 = Math.cos(ph * 67.9 + s.b) * 0.50 + Math.cos(ph * 103.4 + s.e) * 0.50;
-        const n3 = Math.sin(ph * 51.2 + s.c) * 0.60 + Math.sin(ph * 89.6 + s.f) * 0.40;
-        // Layer 2: ultra-fast (crispness)
-        const h1 = Math.sin(ph * 213.5 + s.c) * 0.3;
-        const h2 = Math.cos(ph * 197.8 + s.a) * 0.3;
-        const jX = (n1 + h1) * shakeAmt * 0.0048;
-        const jY = (n2 + h2) * shakeAmt * 0.0022;  // vertical more subtle
-        const jZ = n3 * shakeAmt * 0.0018;
-        camera.position.set(
-          entry._baseCamPos.x + jX,
-          entry._baseCamPos.y + jY,
-          entry._baseCamPos.z + jZ
-        );
-      } else {
-        camera.position.copy(entry._baseCamPos);
-      }
-      camera.lookAt(0,0,0);
-    } else {
-      if(glbFile==="diamond_bape_buckle.glb" || pers.bapeMode){
-        if(entry._baseModelY==null) entry._baseModelY = model.position.y;
-
-        // ── BAPE 3축 인터랙션 제어 ──
-        const bc = entry._bapeCtrl;
-        let userRotX = 0, userRotY = 0, userZoom = 1.0, tapBounceVal = 0;
-
-        if (bc && bc.active) {
-          // 플릭 관성 처리
-          if (bc.flickActive && !bc.dragging) {
-            bc.rotOffsetY += bc.velX;
-            bc.rotOffsetX += bc.velY;
-            bc.rotOffsetX = Math.max(-1.05, Math.min(1.05, bc.rotOffsetX));
-            // 마찰 감속
-            bc.velX *= 0.94;
-            bc.velY *= 0.94;
-            const speed = Math.sqrt(bc.velX * bc.velX + bc.velY * bc.velY);
-            if (speed < 0.0003) {
-              bc.flickActive = false;
-              bc.returnToAuto = true;
-              bc.springX.set(bc.rotOffsetX);
-              bc.springX.v = 0;
-              bc.springY.set(bc.rotOffsetY);
-              bc.springY.v = 0;
-            }
-          }
-
-          // 마그네틱 복귀 (손 놓으면 탱~ 하고 원래 자세로)
-          if (bc.returnToAuto && !bc.dragging && !bc.flickActive) {
-            bc.rotOffsetX = bc.springX.update(0, delta);
-            bc.rotOffsetY = bc.springY.update(0, delta);
-            if (bc.springX.settled && bc.springY.settled) {
-              bc.returnToAuto = false;
-              bc.rotOffsetX = 0;
-              bc.rotOffsetY = 0;
-            }
-          }
-
-          // 줌 스프링
-          const zoom = bc.zoomSpring.update(bc.zoomTarget, delta);
-          userZoom = zoom;
-          // 줌이 원래대로 복귀하지 않았으면 천천히 1.0으로
-          if (!bc.dragging && !bc.flickActive) {
-            bc.zoomTarget += (1.0 - bc.zoomTarget) * 0.008;
-          }
-
-          // 탭 바운스
-          tapBounceVal = bc.tapBounce.update(0, delta);
-
-          userRotX = bc.rotOffsetX;
-          userRotY = bc.rotOffsetY;
-        }
-
-        // ── Bape Spring: 음악 반응 (유저 조작과 합성) ──
-        if(!entry._springScale) entry._springScale = new Spring({
-          value: model.scale.x,
-          stiffness: 220,
-          damping: 14,
-          mass: 0.85,
-          precision: 0.00005,
-        });
-        if(!entry._springYPos) entry._springYPos = new Spring({
-          value: model.position.y,
-          stiffness: 190,
-          damping: 13,
-          mass: 0.9,
-          precision: 0.00005,
-        });
-        if(!entry._springRotZ) entry._springRotZ = new Spring({
-          value: 0,
-          stiffness: 260,
-          damping: 16,
-          mass: 0.7,
-          precision: 0.0001,
-        });
-
-        const diamondPulse = Math.min(1, S.high * 0.72 + speakerPulse * 0.32 + LQ.highShimmer * 0.14);
-        const scaleTarget = baseScale * (1 + diamondPulse * 0.028 + Math.abs(tapBounceVal) * 0.04) * userZoom;
-        const yTarget = entry._baseModelY + diamondPulse * 0.034 + tapBounceVal * 0.015;
-
-        // Impulse kick on beat
-        if(!entry._bapePrevBeat) entry._bapePrevBeat = 0;
-        const beatRise = S.beat - entry._bapePrevBeat;
-        if(beatRise > 0.35){
-          const kick = beatRise * 0.42 + S.bass * 0.18;
-          entry._springScale.impulse(kick * 0.12);
-          entry._springYPos.impulse(kick * 0.22);
-          entry._springRotZ.impulse(kick * 0.55);
-        }
-        entry._bapePrevBeat = S.beat;
-
-        const newScale = entry._springScale.update(scaleTarget, delta);
-        const newY = entry._springYPos.update(yTarget, delta);
-        const rotZSpring = entry._springRotZ.update(0, delta);
-
-        model.scale.setScalar(newScale);
-        model.position.y = newY;
-
-        const bandVal = S.high;
-        const sign=GLB_SPECIAL_REVERSE.has(glbFile)?-1:1;
-        // 자동 회전 — 유저 조작 중이면 약해짐
-        const autoRotAmount = (bc && (bc.dragging || bc.flickActive || bc.returnToAuto)) ? 0.15 : 1.0;
-        // 자동 회전 누적 (기존 += 방식 유지하되 속도 조절)
-        if (!entry._autoRotY) entry._autoRotY = model.rotation.y;
-        entry._autoRotY += pers.bRot * (0.55 + bandVal * 1.35 + speakerPulse * 0.18) * sign * autoRotAmount;
-        model.rotation.y = entry._autoRotY + userRotY;
-        model.rotation.x = userRotX + Math.sin(entry.wPhase * pers.wFreq) * pers.wobble * (0.42 + bandVal * 1.1) * autoRotAmount;
-        model.rotation.z = Math.cos(entry.wPhase * pers.wFreq * 0.68) * pers.wobble * 0.30 * autoRotAmount + rotZSpring * 0.012;
-      } else if(glbFile==="kiki.glb"){
-        if(entry._baseModelY==null) entry._baseModelY = model.position.y;
-        if(entry._kikiVocalSmooth==null) entry._kikiVocalSmooth = 0;
-
-        const vocalStrength = Math.min(1, Math.max(0, (T.mid - 0.10) / 0.45));
-        entry._kikiVocalSmooth += (vocalStrength - entry._kikiVocalSmooth) * 0.55;
-        const kick = entry._kikiVocalSmooth;
-
-        const baseY = entry._baseModelY;
-        const targetScale = baseScale * (1 + kick * 0.065);
-        model.scale.setScalar(model.scale.x + (targetScale - model.scale.x) * 0.55);
-        model.position.y = baseY + kick * 0.032;
-
-        const sign=GLB_SPECIAL_REVERSE.has(glbFile)?-1:1;
-        model.rotation.y += pers.bRot * (0.45 + kick * 3.0 + speakerPulse * 0.03) * sign;
-        model.rotation.x = Math.sin(entry.wPhase * pers.wFreq * 1.05) * pers.wobble * (0.30 + kick * 1.8);
-        model.rotation.z = Math.cos(entry.wPhase * pers.wFreq * 0.78) * pers.wobble * 0.28;
-      } else {
-        const bandVal=bv;
-        const sign=GLB_SPECIAL_REVERSE.has(glbFile)?-1:1;
-
-        if(pers.oneWay){
-          model.rotation.y+=pers.bRot*(0.8+bandVal*2.0+speakerPulse*0.6)*spinMul + spinInc;
-        } else {
-          model.rotation.y+=pers.bRot*(0.6+bandVal*1.8+speakerPulse*0.5)*sign*spinMul + spinInc;
-        }
-
-        model.rotation.x=Math.sin(entry.wPhase*pers.wFreq)*pers.wobble*(0.5+bandVal*1.0);
-        model.rotation.z=Math.cos(entry.wPhase*pers.wFreq*0.68)*pers.wobble*0.45;
-        const ns=baseScale*(1+LQ.midDensity*0.014+S.bass*0.016);
-        const ss=baseScale*(1+speakerPulse*0.12);
-        const ts=speakerPulse>0.03?ss:ns;
-        const cs=model.scale.x;
-        model.scale.setScalar(cs+(ts-cs)*(speakerPulse>0.03?0.54:0.30));
-      }
-    }
-  }
-
-  ptLight.color.setRGB(curPal.r/255,curPal.g/255,curPal.b/255);
-  const eB=S.energy*S.energy;
-  const lightTemp=LQ.subPressure*0.3-LQ.highShimmer*0.1;
-  const rBoost=Math.max(0,lightTemp)*60;
-  const bBoost=Math.max(0,-lightTemp+LQ.airGlow*0.3)*40;
-  ptLight.color.r=Math.min(1,(curPal.r+rBoost)/255);
-  ptLight.color.b=Math.min(1,(curPal.b+bBoost)/255);
-  ptLight.intensity=0.4+S.bass*0.9+eB*2.8+speakerPulse*4.2+LQ.highShimmer*1.0;
-
-  renderer.render(scene,camera);
-}
-
-function renderActiveGLB(){
-  const indices=Object.keys(glbRenderers).map((value)=>Number(value));
-  if(indices.length===0) return;
-  indices.sort((a,b)=>Math.abs(a-activeGLBIdx)-Math.abs(b-activeGLBIdx));
-  indices.forEach((idx)=>{
-    const entry=glbRenderers[idx];
-    if(entry) renderChronEntry(entry);
-  });
-}
-
-function primeGLBPreloadQueue(){
-  const queue=[...Array(chronSections.length)].map((_,idx)=>idx);
-  let cursor=0;
-  const worker=async()=>{
-    while(cursor<queue.length){
-      const current=queue[cursor++];
-      try{ await preloadGLBTemplate(current); }catch(_){}
-      await new Promise((resolve)=>setTimeout(resolve, 140));
-    }
-  };
-  for(let i=0;i<PRELOAD_CONCURRENCY;i++) worker();
-}
-
-function center_y(model){
-  try {
-    const box=new THREE.Box3().setFromObject(model);
-    return box.getCenter(new THREE.Vector3()).y;
-  } catch(_){ return 0; }
-}
-
-// ── 오디오 이벤트
-function bindTrackButtons(){
-  const trackBtns = document.querySelectorAll(".track-btn");
-  trackBtns.forEach(btn => {
-    btn.addEventListener("click", () => {
-      const src = btn.dataset.src;
-      if (!src || mode === MODE_MIC) return;
-      mode = MODE_FILE;
-      ensureCtx();
-      try { audioEl.pause(); } catch(_) {}
-      audioEl.crossOrigin = "anonymous";
-      audioEl.src = src;
-      if (!fileCreated) {
-        fileSrc = audioCtx.createMediaElementSource(audioEl);
-        fileCreated = true; fileSrc.connect(analyser); analyser.connect(audioCtx.destination);
-        srcNode = fileSrc;
-      }
-      isPlaying = true;
-      audioCtx.resume().then(() => { audioEl.play().catch(err => console.error("트랙 재생 실패:", err)); });
-      trackBtns.forEach(b => b.classList.remove("active"));
-      btn.classList.add("active");
-    });
-  });
-  audioEl.addEventListener("ended", () => {
-    isPlaying = false;
-    document.querySelectorAll(".track-btn").forEach(b => b.classList.remove("active"));
-  });
-}
-
-function bindAudioEvents(){
-  const fi=document.getElementById("audio-file");
-  const play=document.getElementById("play-btn");
-  const paus=document.getElementById("pause-btn");
-  const mic=document.getElementById("mic-btn");
-  const badge=document.getElementById("mic-badge");
-
-  audioEl.addEventListener("play", ()=>{ isPlaying=true; });
-  audioEl.addEventListener("pause",()=>{ isPlaying=false; });
-
-  fi.addEventListener("change",async(e)=>{
-    const f=e.target.files[0]; if(!f) return;
-    if(mode===MODE_MIC) deactivateMic(mic,badge);
-    mode=MODE_FILE; ensureCtx();
-    if(!fileCreated){
-      fileSrc=audioCtx.createMediaElementSource(audioEl); fileCreated=true;
-      fileSrc.connect(analyser); analyser.connect(audioCtx.destination); srcNode=fileSrc;
-    }
-    try{ audioEl.pause(); }catch(_){}
-    audioEl.crossOrigin = "anonymous";
-    audioEl.src=URL.createObjectURL(f);
-    isPlaying=true;
-    document.querySelectorAll(".track-btn").forEach(b=>b.classList.remove("active"));
-    audioCtx.resume().then(()=>{ audioEl.play().catch(err=>console.error("재생 실패:", err)); });
+  routines.forEach((memo) => {
+    keys.add(getRoutineLayoutKey(memo));
   });
 
-  play.addEventListener("click",()=>{
-    if(mode===MODE_MIC||!audioEl.src) return;
-    ensureCtx();
-    if(!fileCreated){
-      fileSrc=audioCtx.createMediaElementSource(audioEl); fileCreated=true;
-      fileSrc.connect(analyser); analyser.connect(audioCtx.destination);
-    }
-    if(srcNode!==fileSrc){
-      if(srcNode){try{srcNode.disconnect();}catch(_){}}
-      try{fileSrc.connect(analyser);}catch(_){}
-      srcNode=fileSrc;
-    }
-    isPlaying=true; audioEl.play().catch(console.error);
+  snacks.forEach((memo) => {
+    if (memo.fromEmotion) keys.add(getEmotionRewardLayoutKey(memo));
+    else keys.add(getSnackLayoutKey(memo));
   });
 
-  paus.addEventListener("click",()=>{
-    if(mode===MODE_FILE){ audioEl.pause(); isPlaying=false; }
+  emotions.forEach((memo) => {
+    keys.add(getEmotionLayoutKey(memo));
   });
 
-  mic.addEventListener("click",async()=>{
-    if(mode===MODE_MIC){
-      deactivateMic(mic,badge); mode=MODE_FILE;
-      if(analyser) analyser.smoothingTimeConstant = 0.55;
-    } else {
-      try{
-        audioEl.pause(); isPlaying=false; dropSrc(); ensureCtx();
-        if(micStream){micStream.getTracks().forEach(t=>t.stop());micStream=null;}
-        micStream=await navigator.mediaDevices.getUserMedia({audio:true,video:false});
-        srcNode=audioCtx.createMediaStreamSource(micStream);
-        srcNode.connect(analyser);
-        // 마이크 모드: 더 빠른 반응을 위해 smoothing 낮춤
-        analyser.smoothingTimeConstant = 0.30;
-        mode=MODE_MIC; mic.classList.add("active"); badge.style.display="flex";
-      }catch(err){alert("마이크 권한을 허용해 주세요.");}
-    }
-  });
-
-  window.addEventListener("mousemove",(e)=>{S.mx=e.clientX;S.my=e.clientY;});
-  window.addEventListener("touchmove",(e)=>{if(e.touches[0]){S.mx=e.touches[0].clientX;S.my=e.touches[0].clientY;}},{passive:true});
-
-  window.addEventListener("resize",()=>{
-    resizeGL(); resizeOverlay();
-    Object.values(glbRenderers).forEach(entry=>{
-      if(entry&&entry.renderer){
-        entry.renderer.setSize(window.innerWidth,window.innerHeight);
-        entry.camera.aspect=window.innerWidth/window.innerHeight;
-        entry.camera.updateProjectionMatrix();
-      }
-    });
-    if (poolInited && poolRenderer && poolCamera) {
-      const W = window.innerWidth, H = window.innerHeight;
-      poolRenderer.setSize(W, H);
-      if (poolComposer) poolComposer.setSize(W, H);
-      poolCamera.aspect = W / H;
-      poolCamera.updateProjectionMatrix();
-      if (poolDropPass && poolDropPass.uniforms.uResolution) {
-        poolDropPass.uniforms.uResolution.value.set(W, H);
-      }
-      setupPoolRainCanvas();
-    }
-    LS.hOff=LS.hIdx*window.innerWidth; LS.vOff=LS.vIdx*window.innerHeight;
-    LS.cHoff=LS.hOff; LS.cVoff=LS.vOff;
-    mc.style.transform=`translate(${-LS.cHoff}px,${-LS.cVoff}px)`;
-  });
+  return keys;
 }
 
-function deactivateMic(mic,badge){
-  if(micStream){micStream.getTracks().forEach(t=>t.stop());micStream=null;}
-  dropSrc(); mic.classList.remove("active"); badge.style.display="none";
-}
+function rebuildVisuals(animateMemoId = null) {
+  snapshotLiveVisualTransformsToLayoutCache();
+  disposeVisuals();
 
-// ── Scene 렌더러 (panel-scene)
-let sceneCv=null, sCtx=null, sceneActive=false;
+  const activeMemos = STATE.memos.filter((memo) => !memo.clearedAt);
+  const now = Date.now();
 
-const RAIN_COUNT=120;
-const rainDrops=Array.from({length:RAIN_COUNT},()=>({
-  x:Math.random(), y:Math.random(),
-  len:0.012+Math.random()*0.028, spd:0.004+Math.random()*0.008,
-  angle:-Math.PI*0.5+(-0.18+Math.random()*0.36),
-  opacity:0.08+Math.random()*0.22,
-  band:["sub","bass","mid","high","air"][Math.floor(Math.random()*5)],
-  thick:Math.random()<0.15?1.8:0.7,
-}));
+  const clutterFresh = [];
+  const clutterOld = [];
+  const records = [];
+  const routines = [];
+  const snacks = [];
+  const emotions = [];
 
-function drawScene(){
-  if(!sCtx||!sceneActive) return;
-  const W=sceneCv.width, H=sceneCv.height;
-  sCtx.clearRect(0,0,W,H);
-  const pf = 0.12 + _sMoodEnergy * 0.45;
-  const baseHue = _sHueSlow;
-  const baseSat = Math.round(_sSatFast * 0.85);
+  activeMemos
+    .slice()
+    .sort((a, b) => new Date(a.createdAt) - new Date(b.createdAt))
+    .forEach((memo) => {
+      const ageDays = getAgeDays(memo.createdAt, now);
 
-  rainDrops.forEach(d=>{
-    const bv=S[d.band]||0;
-    d.y += d.spd * (1 + bv * 2.0 + _sMoodEnergy * 0.8) * 0.016;
-    if(d.y>1.08){ d.y=-0.05; d.x=Math.random(); }
-    const al = d.opacity * (0.25 + bv * 0.4) * pf;
-    if(al<0.003) return;
-    const x=d.x*W, y=d.y*H;
-    const len=d.len*H*(0.45+bv*0.5);
-    const dx=Math.sin(d.angle)*len*0.2, dy=Math.cos(d.angle)*len;
-    const dropHue = baseHue + (d.x - 0.5) * 18;
-    const dropLum = Math.min(72, 38 + _sMoodEnergy * 18 + bv * 14);
-    sCtx.beginPath();
-    sCtx.strokeStyle=`hsla(${dropHue.toFixed(0)},${baseSat}%,${dropLum.toFixed(0)}%,${al.toFixed(3)})`;
-    sCtx.lineWidth=d.thick*(0.45+bv*0.35);
-    sCtx.moveTo(x,y); sCtx.lineTo(x+dx,y+dy); sCtx.stroke();
-  });
-}
-
-function startSceneRenderer(){
-  if(sceneActive) return;
-  sceneCv=document.getElementById("scene-canvas");
-  if(!sceneCv) return;
-  sceneCv.width=window.innerWidth; sceneCv.height=window.innerHeight;
-  sCtx=sceneCv.getContext("2d");
-  sceneActive=true;
-  drawScene();
-}
-
-// ══════════════════════════════════════════════════════
-// POOL 렌더러 — ESM Water, 밝은 하늘 + 떠있는 풀박스
-// ══════════════════════════════════════════════════════
-let poolRenderer=null, poolScene=null, poolCamera=null, poolComposer=null;
-let poolClock=null, poolInited=false, poolActive=false;
-let waterMesh=null;
-let piaModel=null, piaLoaded=false;
-let rainCv=null, rainCtx2=null;
-let poolTime=0;
-let poolOrbitControls=null;
-let poolFloor=null;
-let poolUnderGlow=null;
-let poolDropPass=null;
-let poolCausticsCanvas=null, poolCausticsCtx=null, poolCausticsTex=null;
-let poolWaterNormals=null;
-
-const poolMouseRipples=[];
-let poolMouseX=0.5, poolMouseY=0.5;
-let poolMousePrevX=0.5, poolMousePrevY=0.5;
-let poolMouseSpeed=0;
-let poolRainActive=false;
-let poolRainTimer=0, poolRainDuration=0, poolRainCooldown=0;
-
-// ── Pool Sky Dawn Transition (곡 끝 무렵 청아한 하늘)
-let _poolDawnFactor = 0;          // 0 = 밤하늘, 1 = 맑은 낮하늘
-let _poolDawnSmooth = 0;          // 부드러운 추적용
-
-const POOL_SCENE_SCALE=1.22;
-const POOL_WATER_LEVEL=1.05*POOL_SCENE_SCALE;
-const POOL_DIMENSIONS = {
-  width: 22.0*POOL_SCENE_SCALE,
-  length: 26.0*POOL_SCENE_SCALE,
-  depth: 7.8*POOL_SCENE_SCALE,
-};
-let poolGlassWalls = [];
-let poolWallPanels = [];
-let poolWallCaustics = [];
-let poolWaterVolume = null;
-const POOL_RAIN_COUNT=280;
-const poolRainDrops=Array.from({length:POOL_RAIN_COUNT},()=>{
-  const size=Math.random();  // 0=tiny drizzle, 1=heavy drop
-  return {
-    x:Math.random(), y:Math.random()*1.2-0.15,
-    spd:0.002+size*0.008+Math.random()*0.003,
-    len:0.008+size*0.038+Math.random()*0.012,
-    angle:Math.PI*(0.02+Math.random()*0.04)*(Math.random()<0.5?1:-1),
-    windPhase:Math.random()*Math.PI*2,
-    opacity:0.04+size*0.18+Math.random()*0.06,
-    band:["sub","bass","mid","high","air"][Math.floor(Math.random()*5)],
-    thick:0.4+size*1.2+Math.random()*0.3,
-    size,
-  };
-});
-const poolRipples=[];
-
-// Pool Orbit Controls — 360° full sphere, two-finger trackpad / two-touch only, tighter damping
-
-function createPoolOrbitControls(camera, domElement) {
-  const ctrl = {
-    camera, domElement,
-    target: new THREE.Vector3(0, 0, 0),
-    spherical: new THREE.Spherical(),
-    sphericalDelta: new THREE.Spherical(),
-    scale: 1,
-    minPolarAngle: 0.01, maxPolarAngle: Math.PI - 0.01,
-    minDistance: 7.5*POOL_SCENE_SCALE, maxDistance: 34*POOL_SCENE_SCALE,
-    rotateSpeed: 0.19, zoomSpeed: 0.75,
-    dampingFactor: 0.93,
-    enableDamping: true,
-    _twoFingerActive: false, _lastTouchMidX: 0, _lastTouchMidY: 0, _lastPinchDist: 0,
-  };
-
-  domElement.style.touchAction = 'none';
-
-  const offset = new THREE.Vector3();
-  offset.copy(camera.position).sub(ctrl.target);
-  ctrl.spherical.setFromVector3(offset);
-
-  function getTouchMid(t) { return {x:(t[0].clientX+t[1].clientX)*0.5,y:(t[0].clientY+t[1].clientY)*0.5}; }
-  function getTouchDist(t) { const dx=t[0].clientX-t[1].clientX,dy=t[0].clientY-t[1].clientY; return Math.sqrt(dx*dx+dy*dy); }
-
-  ctrl._handlers = {
-    wheel(e) {
-      e.preventDefault();
-      e.stopPropagation();
-
-      if(e.ctrlKey){
-        const factor = 1 + Math.abs(e.deltaY) * ctrl.zoomSpeed * 0.005;
-        if(e.deltaY>0) ctrl.scale = Math.min(ctrl.scale * factor, 1.08);
-        else ctrl.scale = Math.max(ctrl.scale / factor, 0.92);
+      if (memo.category === 'clutter') {
+        if (ageDays >= CLUTTER_MERGE_DAYS) clutterOld.push(memo);
+        else clutterFresh.push(memo);
         return;
       }
 
-      const dTheta =  (2*Math.PI*e.deltaX/domElement.clientWidth)  * ctrl.rotateSpeed * 1.5;
-      const dPhi   =  (2*Math.PI*e.deltaY/domElement.clientHeight) * ctrl.rotateSpeed * 1.5;
-      ctrl.sphericalDelta.theta += dTheta;
-      ctrl.sphericalDelta.phi   += dPhi;
-    },
-    touchstart(e) {
-      e.stopPropagation();
-      if(e.touches.length===2){
-        e.preventDefault();
-        ctrl._twoFingerActive=true;
-        const mid=getTouchMid(e.touches);
-        ctrl._lastTouchMidX=mid.x; ctrl._lastTouchMidY=mid.y;
-        ctrl._lastPinchDist=getTouchDist(e.touches);
+      if (memo.category === 'record') {
+        records.push(memo);
+        return;
+      }
+
+      if (memo.category === 'routine') {
+        routines.push(memo);
+        return;
+      }
+
+      if (memo.category === 'snack') {
+        snacks.push(memo);
+        return;
+      }
+
+      if (memo.category === 'emotion') {
+        emotions.push(memo);
+      }
+    });
+
+  const occupied = {
+    desk: [],
+    chair: [],
+    clutter: [],
+    clothes: [],
+    snack: [],
+    recordFloor: [],
+    deskInteractive: [],
+    chairInteractive: [],
+    floorInteractive: [],
+  };
+
+  const deskNoteSlots = getDeskNoteSlots();
+  const deskScribbleSlots = getDeskScribbleSlots();
+  const deskTumblerSlots = getDeskTumblerSlots();
+  const deskEmotionRewardSlots = getDeskEmotionRewardSlots();
+  const deskOverflowPaperSlots = getDeskOverflowPaperSlots();
+  const chairOverflowSlots = getChairOverflowSlots();
+  const recordFloorSlots = getRecordFloorSlots();
+  const activeLayoutKeys = buildActiveLayoutKeys({ records, clutterFresh, clutterOld, routines, snacks, emotions });
+
+  pruneLayoutCache(activeLayoutKeys);
+  reservePlacementCaches(activeLayoutKeys, occupied);
+
+  let deskNoteCount = records.reduce((count, memo) => {
+    const cache = getLayoutCacheEntry(getRecordLayoutKey(memo));
+    return count + (cache?.placement === 'desk' && cache?.assetKey !== 'scribble' ? 1 : 0);
+  }, 0);
+
+  let deskScribbleCount = records.reduce((count, memo) => {
+    const cache = getLayoutCacheEntry(getRecordLayoutKey(memo));
+    return count + (cache?.placement === 'desk' && cache?.assetKey === 'scribble' ? 1 : 0);
+  }, 0);
+
+  let deskEmotionRewardCount = snacks.reduce((count, memo) => {
+    if (!memo.fromEmotion) return count;
+    const cache = getLayoutCacheEntry(getEmotionRewardLayoutKey(memo));
+    return count + (cache?.placement === 'desk' ? 1 : 0);
+  }, 0);
+
+  snacks.forEach((memo) => {
+    if (!memo || memo.fromEmotion) return;
+    const layoutKey = getSnackLayoutKey(memo);
+    const cache = getLayoutCacheEntry(layoutKey);
+    if (cache?.placement === 'chair') {
+      delete STATE.layoutCache[layoutKey];
+    }
+  });
+
+  const maxDeskTumblerSlots = Math.min(MAX_DESK_TUMBLER_COUNT, deskTumblerSlots.length);
+  const usedDeskTumblerSlotIndices = new Set();
+
+  records.forEach((memo, index) => {
+    const layoutKey = getRecordLayoutKey(memo);
+    const cachedLayout = getLayoutCacheEntry(layoutKey);
+    const useScribble = cachedLayout ? cachedLayout.assetKey === 'scribble' : (getMemoStableHash(memo, 'record-variant') % 3 === 2);
+    const key = useScribble ? 'scribble' : 'note';
+    const instance = createAssetInstance(key);
+    const shouldPlayDropIntro = memo.id === animateMemoId && !cachedLayout;
+
+    if (cachedLayout) {
+      applyCachedTransform(instance.root, cachedLayout);
+
+      if (cachedLayout.placement === 'desk' || cachedLayout.placement === 'chair') {
+        applyObjectToPlacementSurface(instance.root, cachedLayout, cachedLayout.placement, key);
       } else {
-        ctrl._twoFingerActive=false;
+        restObjectOnY(instance.root, 0.02);
+        if (key === 'scribble') liftDeskObject(instance.root, 'scribble');
       }
-    },
-    touchmove(e) {
-      e.stopPropagation();
-      if(e.touches.length!==2||!ctrl._twoFingerActive)return;
-      e.preventDefault();
-      const mid=getTouchMid(e.touches);
-      const dx=mid.x-ctrl._lastTouchMidX, dy=mid.y-ctrl._lastTouchMidY;
-      ctrl._lastTouchMidX=mid.x; ctrl._lastTouchMidY=mid.y;
+    } else if (useScribble) {
+      const surfacePlacement = pickDeskOrChairPlacement({
+        assetKey: 'scribble',
+        canUseDesk: deskScribbleCount < Math.min(1, deskScribbleSlots.length),
+        deskSlots: deskScribbleSlots,
+        chairSlots: chairOverflowSlots,
+        occupied,
+        deskMinDistance: 0.68,
+        chairMinDistance: 0.58,
+        seedOffset: getMemoStableSeedOffset(memo, 'seed-17', 9),
+      });
 
-      const dTheta=(2*Math.PI*(-dx)/domElement.clientWidth)*ctrl.rotateSpeed*1.5;
-      const dPhi  =(2*Math.PI*(-dy)/domElement.clientHeight)*ctrl.rotateSpeed*1.5;
-      ctrl.sphericalDelta.theta += dTheta;
-      ctrl.sphericalDelta.phi   += dPhi;
+      if (surfacePlacement) {
+        const { slot, placement, area } = surfacePlacement;
+        if (placement === 'desk') {
+          deskScribbleCount += 1;
+          occupied.desk.push({ x: slot.x, z: slot.z });
+        } else {
+          occupied.chair.push({ x: slot.x, z: slot.z });
+        }
 
-      const dist=getTouchDist(e.touches);
-      if(ctrl._lastPinchDist>0){
-        const pinchScale = 1 + (ctrl._lastPinchDist - dist) * 0.003;
-        ctrl.scale *= Math.max(0.94, Math.min(1.06, pinchScale));
+        instance.root.position.set(slot.x, 0, slot.z);
+        instance.root.rotation.y = slot.rotY || 0;
+        instance.root.rotation.z = slot.rotZ || 0;
+        applyObjectToPlacementSurface(instance.root, slot, placement, 'scribble');
+        syncLayoutCacheFromObject(layoutKey, instance.root, { area, placement, assetKey: 'scribble' });
+      } else {
+        const floorSlot = pickSlotFromPreferredSlots(RECORD_SECONDARY_SPREAD_SLOTS, recordFloorSlots, occupied.floorInteractive, 1.28, getMemoStableSeedOffset(memo, 'seed-21', 11));
+        occupied.recordFloor.push({ x: floorSlot.x, z: floorSlot.z });
+        instance.root.position.set(floorSlot.x, 0, floorSlot.z);
+        instance.root.rotation.y = floorSlot.rotY || 0;
+        instance.root.rotation.z = floorSlot.rotZ || 0;
+        restObjectOnY(instance.root, 0.02);
+        liftDeskObject(instance.root, 'scribble');
+        syncLayoutCacheFromObject(layoutKey, instance.root, { area: 'floorInteractive', placement: 'floor', assetKey: 'scribble' });
       }
-      ctrl._lastPinchDist=dist;
-    },
-    touchend(e) {
-      e.stopPropagation();
-      if(e.touches.length<2){
-        ctrl._twoFingerActive=false;
-        ctrl._lastPinchDist=0;
-      }
-    }
-  };
-
-  domElement.addEventListener('wheel',      ctrl._handlers.wheel, {passive:false});
-  domElement.addEventListener('touchstart', ctrl._handlers.touchstart, {passive:false});
-  domElement.addEventListener('touchmove',  ctrl._handlers.touchmove,  {passive:false});
-  domElement.addEventListener('touchend',   ctrl._handlers.touchend,   {passive:false});
-  domElement.addEventListener('touchcancel',ctrl._handlers.touchend,   {passive:false});
-
-  ctrl.update = function() {
-    const offset2 = new THREE.Vector3();
-    const quat    = new THREE.Quaternion().setFromUnitVectors(camera.up, new THREE.Vector3(0,1,0));
-    const quatInv = quat.clone().invert();
-    offset2.copy(camera.position).sub(ctrl.target);
-    offset2.applyQuaternion(quat);
-    ctrl.spherical.setFromVector3(offset2);
-    ctrl.spherical.theta += ctrl.sphericalDelta.theta;
-    ctrl.spherical.phi   += ctrl.sphericalDelta.phi;
-    ctrl.spherical.phi    = Math.max(ctrl.minPolarAngle, Math.min(ctrl.maxPolarAngle, ctrl.spherical.phi));
-    ctrl.spherical.radius *= ctrl.scale;
-    ctrl.spherical.radius = Math.max(ctrl.minDistance, Math.min(ctrl.maxDistance, ctrl.spherical.radius));
-    ctrl.spherical.makeSafe();
-    offset2.setFromSpherical(ctrl.spherical);
-    offset2.applyQuaternion(quatInv);
-    camera.position.copy(ctrl.target).add(offset2);
-    camera.lookAt(ctrl.target);
-
-    if(ctrl.enableDamping){
-      ctrl.sphericalDelta.theta *= (1-ctrl.dampingFactor);
-      ctrl.sphericalDelta.phi   *= (1-ctrl.dampingFactor);
-      if(Math.abs(ctrl.sphericalDelta.theta)<0.00001) ctrl.sphericalDelta.theta = 0;
-      if(Math.abs(ctrl.sphericalDelta.phi)<0.00001) ctrl.sphericalDelta.phi = 0;
-      ctrl.scale = 1+(ctrl.scale-1)*(1-0.70*1.2);
-      if(Math.abs(ctrl.scale-1)<0.00001) ctrl.scale = 1;
     } else {
-      ctrl.sphericalDelta.set(0,0,0);
-      ctrl.scale=1;
-    }
-  };
+      const surfacePlacement = pickDeskOrChairPlacement({
+        assetKey: 'note',
+        canUseDesk: deskNoteCount < Math.min(MAX_DESK_NOTE_COUNT, deskNoteSlots.length),
+        deskSlots: deskNoteSlots,
+        chairSlots: chairOverflowSlots,
+        occupied,
+        deskMinDistance: 0.76,
+        chairMinDistance: 0.64,
+        seedOffset: getMemoStableSeedOffset(memo, 'seed-19', 10),
+      });
 
-  ctrl.dispose = function(){
-    domElement.removeEventListener('wheel', ctrl._handlers.wheel, {passive:false});
-    domElement.removeEventListener('touchstart', ctrl._handlers.touchstart, {passive:false});
-    domElement.removeEventListener('touchmove', ctrl._handlers.touchmove, {passive:false});
-    domElement.removeEventListener('touchend', ctrl._handlers.touchend, {passive:false});
-    domElement.removeEventListener('touchcancel', ctrl._handlers.touchend, {passive:false});
-  };
-
-  return ctrl;
-}
-
-
-// Pool Drop Shader — 유리/물막 왜곡, 절제된 chromatic aberration
-// 평소엔 약하고, high/air/beat 올라갈 때만 강해짐
-const POOL_DROP_SHADER = {
-  uniforms: {
-    tDiffuse:    { value: null },
-    uTime:       { value: 0 },
-    uBeat:       { value: 0 },
-    uShimmer:    { value: 0 },
-    uSub:        { value: 0 },
-    uMid:        { value: 0 },
-    uAir:        { value: 0 },
-    uMouseX:     { value: 0.5 },
-    uMouseY:     { value: 0.5 },
-    uMouseSpeed: { value: 0 },
-    uResolution: { value: new THREE.Vector2(window.innerWidth, window.innerHeight) }
-  },
-  vertexShader: `varying vec2 vUv; void main(){ vUv=uv; gl_Position=projectionMatrix*modelViewMatrix*vec4(position,1.0); }`,
-  fragmentShader: `
-    precision highp float;
-    uniform sampler2D tDiffuse;
-    uniform float uTime,uBeat,uShimmer,uSub,uMid,uAir,uMouseX,uMouseY,uMouseSpeed;
-    uniform vec2 uResolution;
-    varying vec2 vUv;
-    float hash(vec2 p){ return fract(sin(dot(p,vec2(127.1,311.7)))*43758.5453123); }
-    float noise(vec2 p){
-      vec2 i=floor(p),f=fract(p);f=f*f*(3.0-2.0*f);
-      return mix(mix(hash(i),hash(i+vec2(1,0)),f.x),mix(hash(i+vec2(0,1)),hash(i+vec2(1,1)),f.x),f.y);
-    }
-    float fbm(vec2 p){
-      float v=0.0,a=0.5;
-      for(int i=0;i<3;i++){v+=a*noise(p);p*=2.0;a*=0.5;}
-      return v;
-    }
-    void main(){
-      vec2 uv=vUv;
-      float ar=uResolution.x/uResolution.y;
-
-      // 수면 강도 — high/air/beat 에 의존
-      float wStrength = uShimmer*0.75 + uAir*0.50 + uBeat*0.40;
-      // 기본 물막은 아주 약하게 — 항상 있지만 거의 안 보임
-      float baseStrength = 0.010;
-
-      // 큰 흐름 왜곡 — fbm 기반 (점성 액체 느낌)
-      float n1=fbm(uv*3.5+vec2(uTime*0.06, uTime*0.04));
-      float n2=fbm(uv*5.5-vec2(uTime*0.05, uTime*0.03)+vec2(n1*0.4));
-      // 잔물결 고주파
-      float n3=noise(uv*14.0+vec2(uTime*0.22,-uTime*0.18));
-      float n4=noise(uv*22.0+vec2(-uTime*0.28,uTime*0.14));
-
-      // 물막 마스크 — 화면 위쪽(하늘쪽)엔 약하게, 가운데 이하에 집중
-      float filmMask=smoothstep(0.05,0.65,uv.y)*(1.0-smoothstep(0.55,1.0,uv.y)*0.5);
-
-      // 기본 드리프트 (항상 존재, 아주 미세)
-      vec2 baseDrift=vec2(
-        (n1-0.5)*baseStrength + sin(uv.y*8.0+uTime*0.4)*baseStrength*0.5,
-        (n2-0.5)*baseStrength + cos(uv.x*7.0+uTime*0.35)*baseStrength*0.4
-      );
-      // 음악 반응 드리프트 (high/air/beat 올라갈 때)
-      vec2 musicDrift=vec2(
-        (n2-0.5)*(wStrength*0.016) + (n4-0.5)*(wStrength*0.007),
-        (n1-0.5)*(wStrength*0.014) + (n3-0.5)*(wStrength*0.006)
-      );
-      // sub 압력 — 수면 bulge
-      vec2 subBulge=vec2(0.0);
-      {
-        vec2 c=vec2(0.5,0.58);
-        vec2 d=uv-c;
-        float dist=max(length(d),0.0001);
-        float wave=sin(dist*38.0-uTime*8.0)*exp(-dist*4.5)*uSub*0.014;
-        subBulge=(d/dist)*wave*filmMask;
-      }
-      // beat 순간 ripple
-      vec2 beatRipple=vec2(0.0);
-      {
-        vec2 c=vec2(0.5,0.55);
-        vec2 d=uv-c;
-        float dist=max(length(d),0.0001);
-        float wave=sin(dist*55.0-uTime*14.0)*exp(-dist*5.5)*uBeat*0.012;
-        beatRipple=(d/dist)*wave*filmMask;
-      }
-      // 마우스 흔들림 — 주변부 물결
-      vec2 mouseRipple=vec2(0.0);
-      {
-        vec2 mUV=vec2(uMouseX,1.0-uMouseY);
-        vec2 d=uv-mUV;
-        float dist=max(length(d*vec2(ar,1.0)),0.0001);
-        float spd=uMouseSpeed;
-        // 가까이 있을 때 부드러운 lens 왜곡
-        float lens=exp(-dist*dist*22.0)*spd*0.014*filmMask;
-        // 퍼져나가는 물결
-        float ripple=sin(dist*60.0-uTime*11.0)*exp(-dist*7.0)*spd*0.012*filmMask;
-        mouseRipple=(d/(dist+0.001))*(lens+ripple);
-      }
-
-      vec2 totalDrift=baseDrift+musicDrift+subBulge+beatRipple+mouseRipple;
-
-      // 절제된 chromatic aberration — 물막 굴절 분산
-      // 강도는 음악 반응과 마우스에만 의존, 평소엔 0에 가깝게
-      float caStrength = (wStrength*0.0072 + uMouseSpeed*0.005 + uSub*0.004)*filmMask;
-      // 너무 강하면 글리치처럼 보이므로 max 제한
-      caStrength=min(caStrength, 0.008);
-
-      vec2 caDir=normalize(totalDrift+vec2(0.0001));
-      float r=texture2D(tDiffuse, clamp(uv+totalDrift+caDir*caStrength*1.0,0.001,0.999)).r;
-      float g=texture2D(tDiffuse, clamp(uv+totalDrift,                        0.001,0.999)).g;
-      float b=texture2D(tDiffuse, clamp(uv+totalDrift-caDir*caStrength*0.8,   0.001,0.999)).b;
-
-      vec4 col=vec4(r,g,b,1.0);
-
-      // 물 표면 shimmer — 하이라이트 줄기 (고급스럽게 절제)
-      float streakU=sin(uv.x*ar*90.0+uTime*2.2)*(0.5+0.5*sin(uv.y*6.0+uTime*0.8));
-      float streak=max(0.0,streakU)*0.012*(wStrength*0.9+uMid*0.3)*filmMask;
-      col.rgb+=streak*vec3(0.92,0.97,1.0);
-
-      // 수면 반사 sparkle — 물방울 반짝임 (beat/air 때)
-      float sparkMask=smoothstep(0.68,0.90,n3*(0.55+n4*0.7))*filmMask;
-      float sparkle=sparkMask*(uBeat*0.06+uAir*0.035+uShimmer*0.025);
-      col.rgb+=sparkle*vec3(0.88,0.96,1.0);
-
-      // 물막 색조 — 아주 약한 청록 tint (평소엔 거의 없음)
-      float tintStrength=(wStrength*0.032+baseStrength*0.5)*filmMask;
-      col.rgb=mix(col.rgb, col.rgb*vec3(0.94,0.98,1.04), tintStrength);
-
-      // 밝기 살짝 올리기 — 물 너머 보는 느낌
-      col.rgb*=1.0+filmMask*wStrength*0.025;
-
-      gl_FragColor=col;
-    }
-  `
-};
-
-function makeProceduralWaterNormals(size){
-  size=size||1024;
-  const canvas=document.createElement("canvas");
-  canvas.width=size; canvas.height=size;
-  const ctx=canvas.getContext("2d");
-  const img=ctx.createImageData(size,size);
-
-  for(let y=0;y<size;y++){
-    for(let x=0;x<size;x++){
-      const i=(y*size+x)*4;
-      const xn=x/size, yn=y/size;
-      // 레이어 1: 큰 너울 — 느리고 넓음
-      const l1x = Math.sin(xn*4.2 + yn*1.8) * 0.38 + Math.cos(xn*2.6 - yn*3.1) * 0.24;
-      const l1y = Math.cos(yn*4.5 - xn*1.6) * 0.38 + Math.sin(yn*2.8 + xn*2.9) * 0.24;
-      // 레이어 2: 중간 잔결
-      const l2x = Math.sin(xn*11.0 - yn*7.5) * 0.18 + Math.sin((xn+yn)*9.2) * 0.12;
-      const l2y = Math.cos(yn*10.5 + xn*8.0) * 0.18 + Math.cos((xn-yn)*8.7) * 0.12;
-      // 레이어 3: 미세 표면 질감
-      const l3x = Math.sin(xn*28.0 + yn*22.0) * 0.06;
-      const l3y = Math.cos(yn*26.0 - xn*24.0) * 0.06;
-      const lx = l1x + l2x + l3x;
-      const ly = l1y + l2y + l3y;
-      img.data[i]   = 128 + lx * 52;
-      img.data[i+1] = 128 + ly * 52;
-      img.data[i+2] = 255;
-      img.data[i+3] = 255;
-    }
-  }
-
-  ctx.putImageData(img,0,0);
-  const tex=new THREE.CanvasTexture(canvas);
-  tex.wrapS=tex.wrapT=THREE.RepeatWrapping;
-  tex.repeat.set(2.0, 2.0);
-  return tex;
-}
-
-// ── Pool Sky (밝은 하늘색)
-function buildPoolSky(){
-  const skyGeo=new THREE.SphereGeometry(150,32,16);
-  const skyMat=new THREE.ShaderMaterial({
-    side: THREE.BackSide,
-    uniforms:{
-      uTopColor:     { value: new THREE.Color(0x010306) },
-      uMidColor:     { value: new THREE.Color(0x03080f) },
-      uHorizonColor: { value: new THREE.Color(0x060e18) },
-      uSunColor:     { value: new THREE.Color(0x1a3a6a) },
-      uSunDir:       { value: new THREE.Vector3(0.4,0.8,0.3).normalize() },
-      uTime:         { value: 0 },
-    },
-    vertexShader:`
-      varying vec3 vWorldPos;
-      void main(){
-        vWorldPos=(modelMatrix*vec4(position,1.0)).xyz;
-        gl_Position=projectionMatrix*modelViewMatrix*vec4(position,1.0);
-      }
-    `,
-    fragmentShader:`
-      uniform vec3 uTopColor,uMidColor,uHorizonColor,uSunColor,uSunDir;
-      uniform float uTime;
-      varying vec3 vWorldPos;
-      float hash(vec2 p){return fract(sin(dot(p,vec2(127.1,311.7)))*43758.5);}
-      void main(){
-        vec3 dir=normalize(vWorldPos);
-        float h=clamp(dir.y,0.0,1.0);
-        vec3 col=mix(uHorizonColor,mix(uMidColor,uTopColor,h*h),h);
-        float sunDot=max(0.0,dot(dir,normalize(uSunDir)));
-        float sun=pow(sunDot,380.0)*2.5;
-        float halo=pow(sunDot,12.0)*0.32;
-        col+=uSunColor*(sun+halo);
-        float cloudH=smoothstep(0.06,0.30,h);
-        float nx=dir.x/(dir.y+0.001), nz=dir.z/(dir.y+0.001);
-        float cloud=0.0;
-        for(int i=0;i<4;i++){
-          float sc=pow(2.0,float(i));
-          cloud+=hash(vec2(nx*sc+uTime*0.003,nz*sc+uTime*0.002))/sc;
+      if (surfacePlacement) {
+        const { slot, placement, area } = surfacePlacement;
+        if (placement === 'desk') {
+          deskNoteCount += 1;
+          occupied.desk.push({ x: slot.x, z: slot.z });
+        } else {
+          occupied.chair.push({ x: slot.x, z: slot.z });
         }
-        cloud=smoothstep(0.58,0.88,cloud)*cloudH*0.55;
-        col=mix(col,vec3(0.97,0.99,1.0),cloud);
-        gl_FragColor=vec4(col,1.0);
+
+        instance.root.position.set(slot.x, 0, slot.z);
+        instance.root.rotation.y = slot.rotY || 0;
+        instance.root.rotation.z = slot.rotZ || 0;
+        applyObjectToPlacementSurface(instance.root, slot, placement, 'note');
+        syncLayoutCacheFromObject(layoutKey, instance.root, { area, placement, assetKey: 'note' });
+      } else {
+        const slot = pickSlot(recordFloorSlots, occupied.floorInteractive, 0.94, getMemoStableSeedOffset(memo, 'seed-19', 10));
+        occupied.recordFloor.push({ x: slot.x, z: slot.z });
+        instance.root.position.set(slot.x, 0, slot.z);
+        instance.root.rotation.y = slot.rotY || 0;
+        instance.root.rotation.z = slot.rotZ || 0;
+        restObjectOnY(instance.root, 0.02);
+        syncLayoutCacheFromObject(layoutKey, instance.root, { area: 'floorInteractive', placement: 'floor', assetKey: 'note' });
       }
-    `
+    }
+
+    const resolvedRecordLayout = getLayoutCacheEntry(layoutKey);
+    const recordPlacement = resolvedRecordLayout?.placement || 'floor';
+    const settledY = instance.root.position.y;
+
+    if (recordPlacement === 'floor' && !cachedLayout) {
+      ensureObjectStartsVisible(instance.root, FLOOR_RECORD_CLUTTER_VISIBLE_ZONE, FLOOR_VISIBILITY_NUDGES, FLOOR_RECORD_CLUTTER_CAMERA_VISIBILITY_BOUNDS);
+    }
+
+    const finalRecordExtra = {
+      area: resolvedRecordLayout?.area || (recordPlacement === 'chair' ? 'chairInteractive' : recordPlacement === 'desk' ? 'deskInteractive' : 'floorInteractive'),
+      placement: recordPlacement,
+      assetKey: key,
+    };
+    syncLayoutCacheFromObject(layoutKey, instance.root, finalRecordExtra);
+    bindObjectLayoutCache(instance.root, layoutKey, finalRecordExtra);
+    tagMemoHoverTarget(instance.root, [memo.id]);
+    STATE.scene.add(instance.root);
+    const hoverProxy = createMemoHoverProxy(instance.root);
+
+    if (instance.mixer) {
+      STATE.mixers.push(instance.mixer);
+    }
+
+    if (instance.action && memo.id === animateMemoId) {
+      instance.action.reset();
+      instance.action.play();
+    }
+
+    STATE.visuals.push({
+      kind: 'asset',
+      memoIds: [memo.id],
+      object: instance.root,
+      mixer: instance.mixer,
+      hoverProxy,
+      dropIntro: buildSurfaceDropIntro(shouldPlayDropIntro, recordPlacement, settledY, now),
+    });
   });
-  const sky=new THREE.Mesh(skyGeo,skyMat);
-  poolScene.add(sky);
-  poolScene._sky=sky;
-  poolScene._skyMat=skyMat;
+
+  clutterFresh.forEach((memo, index) => {
+    const layoutKey = getClutterFreshLayoutKey(memo);
+    const cachedLayout = getLayoutCacheEntry(layoutKey);
+    const key = cachedLayout?.assetKey || (getMemoStableHash(memo, 'clutter-variant') % 2 === 0 ? 'paperSingle' : 'paperSingle2');
+    const instance = createAssetInstance(key);
+    const shouldPlayDropIntro = memo.id === animateMemoId;
+
+    if (cachedLayout) {
+      applyCachedTransform(instance.root, cachedLayout);
+
+      if (cachedLayout.placement === 'desk' || cachedLayout.placement === 'chair') {
+        applyObjectToPlacementSurface(instance.root, cachedLayout, cachedLayout.placement, 'note');
+      } else {
+        restObjectOnY(instance.root, 0.02);
+      }
+    } else {
+      const useDeskOverflow = shouldUseDeskPaperOverflow(occupied, deskOverflowPaperSlots, 0.64);
+      const surfacePlacement = useDeskOverflow ? pickDeskOrChairPlacement({
+        assetKey: 'note',
+        canUseDesk: true,
+        deskSlots: deskOverflowPaperSlots,
+        chairSlots: chairOverflowSlots,
+        occupied,
+        deskMinDistance: 0.64,
+        chairMinDistance: 0.58,
+        seedOffset: getMemoStableSeedOffset(memo, 'seed-16', 8),
+      }) : null;
+      const slot = surfacePlacement
+        ? surfacePlacement.slot
+        : key === 'paperSingle2'
+          ? pickSlotFromPreferredSlots(CLUTTER_SECONDARY_SPREAD_SLOTS, CLUTTER_SLOTS, occupied.clutter, 0.98, getMemoStableSeedOffset(memo, 'seed-16', 8))
+          : pickSlot(CLUTTER_SLOTS, occupied.clutter, 0.56, getMemoStableSeedOffset(memo, 'seed-16', 8));
+
+      instance.root.position.set(slot.x, 0, slot.z);
+      instance.root.rotation.y = slot.rotY || 0;
+      instance.root.rotation.z = slot.rotZ || 0;
+
+      if (surfacePlacement) {
+        if (surfacePlacement.placement === 'desk') occupied.desk.push({ x: slot.x, z: slot.z });
+        else occupied.chair.push({ x: slot.x, z: slot.z });
+        applyObjectToPlacementSurface(instance.root, slot, surfacePlacement.placement, 'note');
+        syncLayoutCacheFromObject(layoutKey, instance.root, { area: surfacePlacement.area, placement: surfacePlacement.placement, assetKey: key });
+      } else {
+        restObjectOnY(instance.root, 0.02);
+        syncLayoutCacheFromObject(layoutKey, instance.root, { area: 'clutter', placement: 'floor', assetKey: key });
+      }
+    }
+
+    const resolvedClutterLayout = getLayoutCacheEntry(layoutKey);
+    const clutterPlacement = resolvedClutterLayout?.placement || 'floor';
+    const clutterOnSurface = clutterPlacement === 'desk' || clutterPlacement === 'chair';
+    const settledY = instance.root.position.y;
+    const dropHeight = (!cachedLayout && !clutterOnSurface) ? getClutterDropHeightForSlot(resolvedClutterLayout) : 0;
+
+    if (shouldPlayDropIntro && !cachedLayout && !clutterOnSurface) {
+      instance.root.position.y = settledY + dropHeight;
+    }
+
+    if (!clutterOnSurface && !cachedLayout) {
+      ensureObjectStartsVisible(instance.root, FLOOR_RECORD_CLUTTER_VISIBLE_ZONE, FLOOR_VISIBILITY_NUDGES, FLOOR_RECORD_CLUTTER_CAMERA_VISIBILITY_BOUNDS);
+    }
+
+    const finalClutterExtra = clutterOnSurface
+      ? { area: resolvedClutterLayout?.area || 'deskInteractive', placement: clutterPlacement, assetKey: key }
+      : { area: 'clutter', placement: 'floor', assetKey: key };
+    syncLayoutCacheFromObject(layoutKey, instance.root, finalClutterExtra);
+    bindObjectLayoutCache(instance.root, layoutKey, finalClutterExtra);
+    tagMemoHoverTarget(instance.root, [memo.id]);
+    STATE.scene.add(instance.root);
+    const hoverProxy = createMemoHoverProxy(instance.root);
+
+    STATE.visuals.push({
+      kind: 'asset',
+      memoIds: [memo.id],
+      object: instance.root,
+      mixer: null,
+      hoverProxy,
+      dropIntro: clutterOnSurface
+        ? buildSurfaceDropIntro(shouldPlayDropIntro && !cachedLayout, clutterPlacement, settledY, now)
+        : shouldPlayDropIntro && !cachedLayout
+          ? { startedAt: now, duration: CLUTTER_DROP_MS, fromY: settledY + dropHeight, toY: settledY }
+          : null,
+    });
+  });
+
+  if (clutterOld.length) {
+    if (clutterOld.length >= 2) {
+      const layoutKey = getClutterPileLayoutKey(clutterOld);
+      const cachedLayout = getLayoutCacheEntry(layoutKey);
+      const pile = createAssetInstance('paperPile');
+
+      if (cachedLayout) {
+        applyCachedTransform(pile.root, cachedLayout);
+
+        if (cachedLayout.placement === 'desk' || cachedLayout.placement === 'chair') applyObjectToPlacementSurface(pile.root, cachedLayout, cachedLayout.placement, 'note');
+        else restObjectOnY(pile.root, 0.02);
+      } else {
+        const useDeskOverflow = shouldUseDeskPaperOverflow(occupied, deskOverflowPaperSlots, 0.74);
+        const surfacePlacement = useDeskOverflow ? pickDeskOrChairPlacement({
+          assetKey: 'note',
+          canUseDesk: true,
+          deskSlots: deskOverflowPaperSlots,
+          chairSlots: chairOverflowSlots,
+          occupied,
+          deskMinDistance: 0.74,
+          chairMinDistance: 0.66,
+          seedOffset: 0.24,
+        }) : null;
+        const pileSlot = surfacePlacement ? surfacePlacement.slot : pickSlot(CLUTTER_SLOTS, occupied.clutter, 0.96, 0.24);
+        pile.root.position.set(pileSlot.x, 0, pileSlot.z);
+        pile.root.rotation.y = pileSlot.rotY || 0;
+        pile.root.rotation.z = pileSlot.rotZ || 0;
+
+        if (surfacePlacement) {
+          if (surfacePlacement.placement === 'desk') occupied.desk.push({ x: pileSlot.x, z: pileSlot.z });
+          else occupied.chair.push({ x: pileSlot.x, z: pileSlot.z });
+          applyObjectToPlacementSurface(pile.root, pileSlot, surfacePlacement.placement, 'note');
+          syncLayoutCacheFromObject(layoutKey, pile.root, { area: surfacePlacement.area, placement: surfacePlacement.placement, assetKey: 'paperPile' });
+        } else {
+          restObjectOnY(pile.root, 0.02);
+          syncLayoutCacheFromObject(layoutKey, pile.root, { area: 'clutter', placement: 'floor', assetKey: 'paperPile' });
+        }
+      }
+
+      const resolvedPileLayout = getLayoutCacheEntry(layoutKey);
+      const pilePlacement = resolvedPileLayout?.placement || 'floor';
+      const pileOnSurface = pilePlacement === 'desk' || pilePlacement === 'chair';
+
+      if (!pileOnSurface && !cachedLayout) ensureObjectStartsVisible(pile.root, FLOOR_RECORD_CLUTTER_VISIBLE_ZONE, FLOOR_VISIBILITY_NUDGES, FLOOR_RECORD_CLUTTER_CAMERA_VISIBILITY_BOUNDS);
+      const finalPileExtra = pileOnSurface
+        ? { area: resolvedPileLayout?.area || 'deskInteractive', placement: pilePlacement, assetKey: 'paperPile' }
+        : { area: 'clutter', placement: 'floor', assetKey: 'paperPile' };
+      syncLayoutCacheFromObject(layoutKey, pile.root, finalPileExtra);
+      bindObjectLayoutCache(pile.root, layoutKey, finalPileExtra);
+      tagMemoHoverTarget(pile.root, clutterOld.map((memo) => memo.id));
+      STATE.scene.add(pile.root);
+      const hoverProxy = createMemoHoverProxy(pile.root);
+
+      STATE.visuals.push({
+        kind: 'asset',
+        memoIds: clutterOld.map((memo) => memo.id),
+        object: pile.root,
+        mixer: null,
+        hoverProxy,
+      });
+    } else {
+      const memo = clutterOld[0];
+      const layoutKey = getClutterOldSingleLayoutKey(memo);
+      const cachedLayout = getLayoutCacheEntry(layoutKey);
+      const instance = createAssetInstance('paperSingle2');
+
+      if (cachedLayout) {
+        applyCachedTransform(instance.root, cachedLayout);
+
+        if (cachedLayout.placement === 'desk' || cachedLayout.placement === 'chair') applyObjectToPlacementSurface(instance.root, cachedLayout, cachedLayout.placement, 'note');
+        else restObjectOnY(instance.root, 0.02);
+      } else {
+        const useDeskOverflow = shouldUseDeskPaperOverflow(occupied, deskOverflowPaperSlots, 0.7);
+        const surfacePlacement = useDeskOverflow ? pickDeskOrChairPlacement({
+          assetKey: 'note',
+          canUseDesk: true,
+          deskSlots: deskOverflowPaperSlots,
+          chairSlots: chairOverflowSlots,
+          occupied,
+          deskMinDistance: 0.7,
+          chairMinDistance: 0.62,
+        }) : null;
+        const slot = surfacePlacement ? surfacePlacement.slot : pickSlotFromPreferredSlots(CLUTTER_SECONDARY_SPREAD_SLOTS, CLUTTER_SLOTS, occupied.clutter, 1.02);
+        instance.root.position.set(slot.x, 0, slot.z);
+        instance.root.rotation.y = slot.rotY || 0;
+        instance.root.rotation.z = slot.rotZ || 0.08;
+
+        if (surfacePlacement) {
+          if (surfacePlacement.placement === 'desk') occupied.desk.push({ x: slot.x, z: slot.z });
+          else occupied.chair.push({ x: slot.x, z: slot.z });
+          applyObjectToPlacementSurface(instance.root, slot, surfacePlacement.placement, 'note');
+          syncLayoutCacheFromObject(layoutKey, instance.root, { area: surfacePlacement.area, placement: surfacePlacement.placement, assetKey: 'paperSingle2' });
+        } else {
+          restObjectOnY(instance.root, 0.02);
+          syncLayoutCacheFromObject(layoutKey, instance.root, { area: 'clutter', placement: 'floor', assetKey: 'paperSingle2' });
+        }
+      }
+
+      const resolvedOldSingleLayout = getLayoutCacheEntry(layoutKey);
+      const oldSinglePlacement = resolvedOldSingleLayout?.placement || 'floor';
+      const oldSingleOnSurface = oldSinglePlacement === 'desk' || oldSinglePlacement === 'chair';
+
+      if (!oldSingleOnSurface && !cachedLayout) ensureObjectStartsVisible(instance.root, FLOOR_RECORD_CLUTTER_VISIBLE_ZONE, FLOOR_VISIBILITY_NUDGES, FLOOR_RECORD_CLUTTER_CAMERA_VISIBILITY_BOUNDS);
+      const finalOldSingleExtra = oldSingleOnSurface
+        ? { area: resolvedOldSingleLayout?.area || 'deskInteractive', placement: oldSinglePlacement, assetKey: 'paperSingle2' }
+        : { area: 'clutter', placement: 'floor', assetKey: 'paperSingle2' };
+      syncLayoutCacheFromObject(layoutKey, instance.root, finalOldSingleExtra);
+      bindObjectLayoutCache(instance.root, layoutKey, finalOldSingleExtra);
+      tagMemoHoverTarget(instance.root, [memo.id]);
+      STATE.scene.add(instance.root);
+      const hoverProxy = createMemoHoverProxy(instance.root);
+
+      STATE.visuals.push({
+        kind: 'asset',
+        memoIds: [memo.id],
+        object: instance.root,
+        mixer: null,
+        hoverProxy,
+      });
+    }
+  }
+
+  routines.forEach((memo, index) => {
+    const layoutKey = getRoutineLayoutKey(memo);
+    const cachedLayout = getLayoutCacheEntry(layoutKey);
+    const oldEnough = getAgeDays(memo.createdAt, now) >= ROUTINE_SCATTER_DAYS;
+    const key = oldEnough ? 'clothesScattered' : 'clothesFolded';
+    const instance = createAssetInstance(key);
+    const shouldPlayDropIntro = memo.id === animateMemoId;
+
+    if (cachedLayout) {
+      applyCachedTransform(instance.root, cachedLayout);
+      restObjectOnY(instance.root, 0.02);
+    } else {
+      const slot = pickSlot(getRoutineFloorSlots(), occupied.clothes, 1.05, getMemoStableSeedOffset(memo, 'seed-22', 12));
+      instance.root.position.set(slot.x, 0, slot.z);
+      instance.root.rotation.y = slot.rotY || 0;
+      restObjectOnY(instance.root, 0.02);
+      syncLayoutCacheFromObject(layoutKey, instance.root, {
+        area: 'clothes',
+      });
+    }
+
+    const settledY = instance.root.position.y;
+
+    if (shouldPlayDropIntro && !cachedLayout) {
+      instance.root.position.y = settledY + ROUTINE_DROP_HEIGHT;
+    }
+
+    if (!cachedLayout) ensureObjectStartsVisible(instance.root);
+    const finalRoutineExtra = {
+      area: 'clothes',
+      placement: 'floor',
+      assetKey: key,
+    };
+    syncLayoutCacheFromObject(layoutKey, instance.root, finalRoutineExtra);
+    bindObjectLayoutCache(instance.root, layoutKey, finalRoutineExtra);
+    tagMemoHoverTarget(instance.root, [memo.id]);
+    STATE.scene.add(instance.root);
+    const hoverProxy = createMemoHoverProxy(instance.root);
+
+    STATE.visuals.push({
+      kind: 'asset',
+      memoIds: [memo.id],
+      object: instance.root,
+      mixer: null,
+      hoverProxy,
+      dropIntro: shouldPlayDropIntro && !cachedLayout
+        ? {
+            startedAt: now,
+            duration: ROUTINE_DROP_MS,
+            fromY: settledY + ROUTINE_DROP_HEIGHT,
+            toY: settledY,
+          }
+        : null,
+    });
+  });
+
+  snacks.forEach((memo, index) => {
+    const isEmotionSnack = Boolean(memo.fromEmotion);
+
+    if (isEmotionSnack) {
+      const layoutKey = getEmotionRewardLayoutKey(memo);
+      const cachedLayout = getLayoutCacheEntry(layoutKey);
+      const rewardKey = getEmotionDecayAssetKey(memo, now);
+      const instance = createAssetInstance(rewardKey);
+      const shouldPlayDropIntro = !STATE.playedEmotionRewardDropMemoIds.has(memo.id) && !cachedLayout;
+
+      if (cachedLayout) {
+        instance.root.position.set(cachedLayout.x, 0, cachedLayout.z);
+        instance.root.rotation.y = cachedLayout.rotY || 0;
+        instance.root.rotation.z = cachedLayout.rotZ || 0;
+
+        if (cachedLayout.placement === 'desk' || cachedLayout.placement === 'chair') {
+          applyObjectToPlacementSurface(instance.root, cachedLayout, cachedLayout.placement, rewardKey);
+        } else {
+          restObjectOnY(instance.root, 0.02);
+        }
+      } else {
+        const surfacePlacement = pickDeskOrChairPlacement({
+          assetKey: rewardKey,
+          canUseDesk: deskEmotionRewardCount < Math.min(EMOTION_REWARD_DESK_LIMIT, deskEmotionRewardSlots.length),
+          deskSlots: deskEmotionRewardSlots,
+          chairSlots: chairOverflowSlots,
+          occupied,
+          deskMinDistance: 0.82,
+          chairMinDistance: 0.66,
+          seedOffset: getMemoStableSeedOffset(memo, 'seed-17', 9),
+        });
+
+        if (surfacePlacement) {
+          const { slot, placement, area } = surfacePlacement;
+          if (placement === 'desk') {
+            deskEmotionRewardCount += 1;
+            occupied.desk.push({ x: slot.x, z: slot.z });
+          } else {
+            occupied.chair.push({ x: slot.x, z: slot.z });
+          }
+          instance.root.position.set(slot.x, 0, slot.z);
+          instance.root.rotation.y = slot.rotY || 0;
+          instance.root.rotation.z = slot.rotZ || 0;
+          applyObjectToPlacementSurface(instance.root, slot, placement, rewardKey);
+          syncLayoutCacheFromObject(layoutKey, instance.root, { area, placement, assetKey: rewardKey });
+        } else {
+          const slot = pickSlot(EMOTION_REWARD_SLOTS, occupied.snack, 2.18, getMemoStableSeedOffset(memo, 'seed-19', 10));
+          reserveOccupiedPoint(occupied.floorInteractive, slot.x, slot.z);
+          instance.root.position.set(slot.x, 0, slot.z);
+          instance.root.rotation.y = slot.rotY || 0;
+          restObjectOnY(instance.root, 0.02);
+          syncLayoutCacheFromObject(layoutKey, instance.root, { area: 'floorInteractive', placement: 'floor', assetKey: rewardKey });
+        }
+      }
+
+      const resolvedRewardLayout = getLayoutCacheEntry(layoutKey);
+      const rewardPlacement = resolvedRewardLayout?.placement || 'floor';
+      const rewardOnSurface = rewardPlacement === 'desk' || rewardPlacement === 'chair';
+      const settledY = instance.root.position.y;
+
+      if (shouldPlayDropIntro) {
+        instance.root.position.y = settledY + EMOTION_REWARD_DROP_HEIGHT;
+        STATE.playedEmotionRewardDropMemoIds.add(memo.id);
+      }
+
+      if (!rewardOnSurface && !cachedLayout) {
+        ensureObjectStartsVisible(instance.root, FLOOR_RECORD_CLUTTER_VISIBLE_ZONE, FLOOR_VISIBILITY_NUDGES, FLOOR_RECORD_CLUTTER_CAMERA_VISIBILITY_BOUNDS);
+      }
+      const finalRewardExtra = {
+        area: resolvedRewardLayout?.area || (rewardPlacement === 'chair' ? 'chairInteractive' : rewardPlacement === 'desk' ? 'deskInteractive' : 'floorInteractive'),
+        placement: rewardPlacement,
+        assetKey: rewardKey,
+      };
+      syncLayoutCacheFromObject(layoutKey, instance.root, finalRewardExtra);
+      bindObjectLayoutCache(instance.root, layoutKey, finalRewardExtra);
+      tagMemoHoverTarget(instance.root, [memo.id]);
+      STATE.scene.add(instance.root);
+      const hoverProxy = createMemoHoverProxy(instance.root);
+
+      if (instance.mixer) {
+        STATE.mixers.push(instance.mixer);
+      }
+
+      STATE.visuals.push({
+        kind: 'asset',
+        memoIds: [memo.id],
+        object: instance.root,
+        mixer: instance.mixer,
+        hoverProxy,
+        dropIntro: shouldPlayDropIntro
+          ? {
+              startedAt: now,
+              duration: EMOTION_REWARD_DROP_MS,
+              fromY: settledY + EMOTION_REWARD_DROP_HEIGHT,
+              toY: settledY,
+            }
+          : null,
+      });
+      return;
+    }
+
+    const layoutKey = getSnackLayoutKey(memo);
+    const cachedLayout = getLayoutCacheEntry(layoutKey);
+    const hasValidCachedDeskSlotIndex = Number.isInteger(cachedLayout?.slotIndex)
+      && cachedLayout.slotIndex >= 0
+      && cachedLayout.slotIndex < maxDeskTumblerSlots
+      && !usedDeskTumblerSlotIndices.has(cachedLayout.slotIndex);
+    const usableCachedLayout = cachedLayout && cachedLayout.placement !== 'chair' ? cachedLayout : null;
+    const instance = createAssetInstance('tumbler');
+    const shouldPlayDropIntro = memo.id === animateMemoId && !(usableCachedLayout && usableCachedLayout.placement !== 'chair');
+
+    if (usableCachedLayout?.placement === 'desk' && hasValidCachedDeskSlotIndex) {
+      const slot = deskTumblerSlots[cachedLayout.slotIndex];
+      usedDeskTumblerSlotIndices.add(cachedLayout.slotIndex);
+      occupied.desk.push({ x: slot.x, z: slot.z });
+      applyObjectToPlacementSurface(instance.root, slot, 'desk', 'tumbler');
+      syncLayoutCacheFromObject(layoutKey, instance.root, {
+        area: 'deskInteractive',
+        placement: 'desk',
+        assetKey: 'tumbler',
+        slotIndex: cachedLayout.slotIndex,
+      });
+    } else {
+      const nextDeskSlotIndex = Array.from({ length: maxDeskTumblerSlots }, (_, slotIndex) => slotIndex)
+        .find((slotIndex) => !usedDeskTumblerSlotIndices.has(slotIndex));
+
+      if (Number.isInteger(nextDeskSlotIndex)) {
+        const slot = deskTumblerSlots[nextDeskSlotIndex];
+        usedDeskTumblerSlotIndices.add(nextDeskSlotIndex);
+        occupied.desk.push({ x: slot.x, z: slot.z });
+        applyObjectToPlacementSurface(instance.root, slot, 'desk', 'tumbler');
+        syncLayoutCacheFromObject(layoutKey, instance.root, {
+          area: 'deskInteractive',
+          placement: 'desk',
+          assetKey: 'tumbler',
+          slotIndex: nextDeskSlotIndex,
+        });
+      } else {
+        const rawSlot = pickSlotFromPreferredSlots(FLOOR_TUMBLER_PREFERRED_SLOTS, recordFloorSlots, occupied.floorInteractive, FLOOR_TUMBLER_MIN_DISTANCE, getMemoStableSeedOffset(memo, 'seed-23', 12));
+        const slot = getAdjustedFloorTumblerSlot(rawSlot);
+        instance.root.position.set(slot.x, 0, slot.z);
+        instance.root.rotation.y = slot.rotY || 0;
+        instance.root.rotation.z = slot.rotZ || 0;
+        restObjectOnY(instance.root, 0.02);
+        ensureObjectStartsVisible(instance.root, FLOOR_RECORD_CLUTTER_VISIBLE_ZONE, FLOOR_VISIBILITY_NUDGES, FLOOR_RECORD_CLUTTER_CAMERA_VISIBILITY_BOUNDS);
+        syncLayoutCacheFromObject(layoutKey, instance.root, {
+          area: 'floorInteractive',
+          placement: 'floor',
+          assetKey: 'tumbler',
+          slotIndex: null,
+        });
+      }
+    }
+
+    const resolvedSnackLayout = getLayoutCacheEntry(layoutKey);
+    const snackPlacement = resolvedSnackLayout?.placement || 'floor';
+    const settledY = instance.root.position.y;
+
+    if (snackPlacement === 'floor' && !usableCachedLayout) {
+      ensureObjectStartsVisible(instance.root, FLOOR_RECORD_CLUTTER_VISIBLE_ZONE, FLOOR_VISIBILITY_NUDGES, FLOOR_RECORD_CLUTTER_CAMERA_VISIBILITY_BOUNDS);
+    }
+
+    const finalSnackExtra = {
+      area: resolvedSnackLayout?.area || (snackPlacement === 'desk' ? 'deskInteractive' : 'floorInteractive'),
+      placement: snackPlacement,
+      assetKey: 'tumbler',
+      slotIndex: Number.isInteger(resolvedSnackLayout?.slotIndex) ? resolvedSnackLayout.slotIndex : null,
+    };
+    syncLayoutCacheFromObject(layoutKey, instance.root, finalSnackExtra);
+    bindObjectLayoutCache(instance.root, layoutKey, finalSnackExtra);
+    tagMemoHoverTarget(instance.root, [memo.id]);
+    STATE.scene.add(instance.root);
+    const hoverProxy = createMemoHoverProxy(instance.root);
+
+    STATE.visuals.push({
+      kind: 'asset',
+      memoIds: [memo.id],
+      object: instance.root,
+      mixer: null,
+      hoverProxy,
+      dropIntro: buildSurfaceDropIntro(shouldPlayDropIntro, snackPlacement, settledY, now),
+    });
+  });
+
+  emotions.forEach((memo) => {
+    createAndAttachEmotionVisual(memo, animateMemoId);
+  });
+
+  updateCounts();
+  STATE.lastVisualSignature = buildVisualSignature();
 }
 
-// ── Pool Shell — 물튜브 박스 (세로로 길고, 투명 유리 벽, 내부 타일만)
-function buildPoolShell(){
-  const PW = POOL_DIMENSIONS.width;
-  const PD = POOL_DIMENSIONS.length;
-  const PH = POOL_DIMENSIONS.depth;
-  const halfX = PW * 0.5;
-  const halfZ = PD * 0.5;
-  const floorY = -PH + POOL_WATER_LEVEL;
+function getEmotionRewardAssetKey(memo) {
+  const seed = `${memo.id}:${memo.createdAt}`;
+  let hash = 0;
 
-  poolGlassWalls = [];
-  poolWallPanels = [];
-  poolWallCaustics = [];
-  poolWaterVolume = null;
-
-  // ── 타일 바닥 — 더 깊고 맑은 풀 블루
-  const floorMat = new THREE.MeshStandardMaterial({
-    color: 0x2e7ea8,
-    roughness: 0.18,
-    metalness: 0.04,
-    emissive: 0x082838,
-    emissiveIntensity: 0.22,
-  });
-  const floor = new THREE.Mesh(new THREE.PlaneGeometry(PW, PD, 24, 40), floorMat);
-  floor.rotation.x = -Math.PI * 0.5;
-  floor.position.y = floorY;
-  floor.receiveShadow = true;
-  poolScene.add(floor);
-  poolFloor = floor;
-
-  // ── 코스틱 오버레이 (바닥 위)
-  const caustic = new THREE.Mesh(
-    new THREE.PlaneGeometry(PW - 0.2, PD - 0.2),
-    new THREE.MeshBasicMaterial({
-      map: poolCausticsTex,
-      color: 0xd8f4ff,
-      transparent: true,
-      opacity: 0.34,
-      blending: THREE.AdditiveBlending,
-      depthWrite: false
-    })
-  );
-  caustic.rotation.x = -Math.PI * 0.5;
-  caustic.position.y = floorY + 0.02;
-  poolScene.add(caustic);
-  poolScene._caustic = caustic;
-
-  // ── 바닥 타일 그리드 선 (1m 간격)
-  const gridMat = new THREE.MeshStandardMaterial({
-    color: 0x2d79a2,
-    roughness: 0.92,
-    emissive: 0x0d2433,
-    emissiveIntensity: 0.14,
-  });
-  for(let i = -Math.floor(halfZ); i <= Math.floor(halfZ); i++){
-    const hz = new THREE.Mesh(new THREE.BoxGeometry(PW + 0.2, 0.014, 0.022), gridMat);
-    hz.position.set(0, floorY + 0.01, i);
-    poolScene.add(hz);
-  }
-  for(let i = -Math.floor(halfX); i <= Math.floor(halfX); i++){
-    const vt = new THREE.Mesh(new THREE.BoxGeometry(0.022, 0.014, PD + 0.2), gridMat);
-    vt.position.set(i, floorY + 0.01, 0);
-    poolScene.add(vt);
+  for (let i = 0; i < seed.length; i += 1) {
+    hash = ((hash * 31) + seed.charCodeAt(i)) >>> 0;
   }
 
-  // ── 물 볼륨 자체를 넣어서 측면이 진한 남색 덩어리처럼 안 보이게 함
-  const volumeMat = new THREE.MeshPhysicalMaterial({
-    color: 0x6fcaf2,
+  return hash % 2 === 0 ? 'snack' : 'strawberry';
+}
+
+function getEmotionDecayAssetKey(memo, nowMs = Date.now()) {
+  const baseKey = getEmotionRewardAssetKey(memo);
+  const ageDays = getAgeDays(memo.createdAt, nowMs);
+
+  if (ageDays < EMOTION_DECAY_DAYS) {
+    return baseKey;
+  }
+
+  return baseKey === 'strawberry' ? 'jar' : 'burn';
+}
+
+
+function getMemoStableHash(memo, salt = '') {
+  const seed = `${memo?.id || ''}:${memo?.createdAt || ''}:${salt}`;
+  let hash = 0;
+
+  for (let i = 0; i < seed.length; i += 1) {
+    hash = ((hash * 31) + seed.charCodeAt(i)) >>> 0;
+  }
+
+  return hash >>> 0;
+}
+
+function getMemoStableSeedOffset(memo, salt = '', scale = 1) {
+  const normalized = (getMemoStableHash(memo, salt) % 100000) / 100000;
+  return normalized * scale;
+}
+
+function updateVisualMemoHoverBinding(visual) {
+  if (!visual || visual.kind !== 'asset' || !visual.object || !Array.isArray(visual.memoIds) || !visual.memoIds.length) return;
+  tagMemoHoverTarget(visual.object, visual.memoIds);
+}
+
+function getClutterDropHeightForSlot(slot) {
+  if (!slot) return CLUTTER_DROP_LOW_HEIGHT;
+
+  const zValues = CLUTTER_SLOTS.map((item) => item.z);
+  const minZ = Math.min(...zValues);
+  const maxZ = Math.max(...zValues);
+  const range = Math.max(maxZ - minZ, 0.0001);
+  const normalized = clamp((slot.z - minZ) / range, 0, 1);
+  const backWeight = 1 - normalized;
+
+  return THREE.MathUtils.lerp(CLUTTER_DROP_LOW_HEIGHT, CLUTTER_DROP_HIGH_HEIGHT, backWeight);
+}
+
+function updateAssetDropVisual(visual, now) {
+  if (!visual.dropIntro || !visual.object) return true;
+
+  const intro = visual.dropIntro;
+  const progress = clamp((now - intro.startedAt) / intro.duration, 0, 1);
+  const eased = 1 - Math.pow(1 - progress, 3);
+  const overshoot = Math.sin(progress * Math.PI) * 0.07 * (1 - progress);
+
+  visual.object.position.y = THREE.MathUtils.lerp(intro.fromY, intro.toY, eased) - overshoot;
+  visual.object.updateMatrixWorld(true);
+
+  if (progress >= 1) {
+    visual.object.position.y = intro.toY;
+    visual.object.updateMatrixWorld(true);
+    visual.dropIntro = null;
+  }
+
+  return true;
+}
+
+function pickSlot(slotList, occupied, minDistance, seedOffset = 0) {
+  const orderedSlots = buildFrontBiasedSlotOrder(slotList, occupied.length, seedOffset);
+  const total = orderedSlots.length;
+  const defaultStart = total
+    ? Math.abs(Math.floor((occupied.length * 1.91 + seedOffset * 23.0) * 1000)) % total
+    : 0;
+  const searchIndices = isFloorPlacementSlotList(slotList)
+    ? buildFrontBiasedSearchIndices(total, occupied.length, seedOffset)
+    : Array.from({ length: total }, (_, index) => (defaultStart + index) % total);
+
+  for (let orderIndex = 0; orderIndex < searchIndices.length; orderIndex += 1) {
+    const slot = orderedSlots[searchIndices[orderIndex]];
+    const ok = occupied.every((point) => distance2D(point.x, point.z, slot.x, slot.z) >= minDistance);
+    if (ok) {
+      const finalSlot = finalizePickedSlot(slotList, slot);
+      occupied.push({ x: finalSlot.x, z: finalSlot.z });
+      return finalSlot;
+    }
+  }
+
+  const base = orderedSlots[occupied.length % Math.max(orderedSlots.length, 1)];
+  const ring = Math.floor(occupied.length / Math.max(orderedSlots.length, 1)) + 1;
+  const angle = occupied.length * 1.618 + seedOffset;
+  const radius = (minDistance * 0.62) + ((occupied.length % 4) * minDistance * 0.22) + (ring * minDistance * 0.3);
+  const slot = finalizePickedSlot(slotList, {
+    ...base,
+    x: base.x + Math.cos(angle) * radius,
+    z: base.z + Math.sin(angle) * radius,
+  });
+  occupied.push({ x: slot.x, z: slot.z });
+  return slot;
+}
+
+function createEmotionParticleSystem(memo, tone, anchor) {
+  const count = tone === 'good' ? 84 : 70;
+  const positions = new Float32Array(count * 3);
+  const basePositions = new Float32Array(count * 3);
+  const velocity = new Float32Array(count * 3);
+  const seeds = new Float32Array(count);
+  const color = tone === 'good' ? 0xffcd86 : 0xcfe4ff;
+
+  for (let i = 0; i < count; i += 1) {
+    const stride = i * 3;
+    const radius = tone === 'good' ? (Math.random() * 0.65 + 0.2) : (Math.random() * 0.45 + 0.12);
+    const theta = Math.random() * Math.PI * 2;
+    const ySpread = tone === 'good' ? (Math.random() - 0.5) * 0.85 : (Math.random() - 0.5) * 0.55;
+
+    const px = anchor.x + Math.cos(theta) * radius;
+    const py = anchor.y + ySpread;
+    const pz = anchor.z + Math.sin(theta) * radius;
+
+    positions[stride] = px;
+    positions[stride + 1] = py;
+    positions[stride + 2] = pz;
+
+    basePositions[stride] = px;
+    basePositions[stride + 1] = py;
+    basePositions[stride + 2] = pz;
+
+    velocity[stride] = (Math.random() - 0.5) * (tone === 'good' ? 0.02 : 0.08);
+    velocity[stride + 1] = tone === 'good' ? Math.random() * 0.02 : Math.random() * 0.09 + 0.03;
+    velocity[stride + 2] = (Math.random() - 0.5) * (tone === 'good' ? 0.02 : 0.08);
+    seeds[i] = Math.random() * 10;
+  }
+
+  const geometry = new THREE.BufferGeometry();
+  geometry.setAttribute('position', new THREE.BufferAttribute(positions, 3));
+
+  const material = new THREE.PointsMaterial({
+    color,
+    size: tone === 'good' ? 0.13 : 0.1,
+    sizeAttenuation: true,
     transparent: true,
-    opacity: 0.18,
-    roughness: 0.06,
-    metalness: 0.0,
-    transmission: 0.90,
-    thickness: 2.4,
-    side: THREE.DoubleSide,
+    opacity: tone === 'good' ? 0.9 : 0.78,
     depthWrite: false,
-    clearcoat: 1.0,
-    clearcoatRoughness: 0.10,
-    emissive: 0x1a5c80,
-    emissiveIntensity: 0.16,
-  });
-  poolWaterVolume = new THREE.Mesh(
-    new THREE.BoxGeometry(PW - 0.08, PH - 0.02, PD - 0.08),
-    volumeMat
-  );
-  poolWaterVolume.position.set(0, floorY + PH * 0.5, 0);
-  poolScene.add(poolWaterVolume);
-
-  // ── 투명 유리 벽
-  const glassMat = new THREE.MeshPhysicalMaterial({
-    color: 0xdaf4ff,
-    transparent: true,
-    opacity: 0.22,
-    roughness: 0.02,
-    metalness: 0.0,
-    transmission: 0.96,
-    thickness: 1.25,
-    side: THREE.DoubleSide,
-    depthWrite: false,
-    clearcoat: 1.0,
-    clearcoatRoughness: 0.04,
-  });
-
-  [-halfZ, halfZ].forEach(z => {
-    const w = new THREE.Mesh(new THREE.PlaneGeometry(PW, PH), glassMat.clone());
-    w.position.set(0, floorY + PH * 0.5, z);
-    if(z < 0) w.rotation.y = Math.PI;
-    poolScene.add(w);
-    poolGlassWalls.push(w);
-  });
-  [-halfX, halfX].forEach(x => {
-    const w = new THREE.Mesh(new THREE.PlaneGeometry(PD, PH), glassMat.clone());
-    w.position.set(x, floorY + PH * 0.5, 0);
-    w.rotation.y = x > 0 ? -Math.PI * 0.5 : Math.PI * 0.5;
-    poolScene.add(w);
-    poolGlassWalls.push(w);
-  });
-
-  // ── 안쪽 벽 패널: 조명을 덜 타고 항상 같은 수색으로 보이게
-  const wallTileMat = new THREE.MeshPhysicalMaterial({
-    color: 0x88d6f3,
-    transparent: true,
-    opacity: 0.32,
-    roughness: 0.08,
-    metalness: 0.0,
-    transmission: 0.42,
-    thickness: 0.9,
-    side: THREE.DoubleSide,
-    depthWrite: false,
-    emissive: 0x2b83b2,
-    emissiveIntensity: 0.30,
-    clearcoat: 1.0,
-    clearcoatRoughness: 0.14,
-  });
-
-  [-halfZ + 0.01, halfZ - 0.01].forEach(z => {
-    const w = new THREE.Mesh(new THREE.PlaneGeometry(PW - 0.06, PH - 0.04), wallTileMat.clone());
-    w.position.set(0, floorY + PH * 0.5, z);
-    if(z < 0) w.rotation.y = Math.PI;
-    poolScene.add(w);
-    poolWallPanels.push(w);
-  });
-  [-halfX + 0.01, halfX - 0.01].forEach(x => {
-    const w = new THREE.Mesh(new THREE.PlaneGeometry(PD - 0.06, PH - 0.04), wallTileMat.clone());
-    w.position.set(x, floorY + PH * 0.5, 0);
-    w.rotation.y = x > 0 ? -Math.PI * 0.5 : Math.PI * 0.5;
-    poolScene.add(w);
-    poolWallPanels.push(w);
-  });
-
-  // ── 벽 코스틱 오버레이: 측면도 물결 질감이 보이게
-  const makeWallCausticMat = () => new THREE.MeshBasicMaterial({
-    map: poolCausticsTex,
-    color: 0xe7fbff,
-    transparent: true,
-    opacity: 0.10,
     blending: THREE.AdditiveBlending,
-    side: THREE.DoubleSide,
-    depthWrite: false,
   });
 
-  [-halfZ + 0.02, halfZ - 0.02].forEach(z => {
-    const w = new THREE.Mesh(new THREE.PlaneGeometry(PW - 0.14, PH - 0.10), makeWallCausticMat());
-    w.position.set(0, floorY + PH * 0.5, z);
-    if(z < 0) w.rotation.y = Math.PI;
-    poolScene.add(w);
-    poolWallCaustics.push(w);
-  });
-  [-halfX + 0.02, halfX - 0.02].forEach(x => {
-    const w = new THREE.Mesh(new THREE.PlaneGeometry(PD - 0.14, PH - 0.10), makeWallCausticMat());
-    w.position.set(x, floorY + PH * 0.5, 0);
-    w.rotation.y = x > 0 ? -Math.PI * 0.5 : Math.PI * 0.5;
-    poolScene.add(w);
-    poolWallCaustics.push(w);
-  });
-}
+  const points = new THREE.Points(geometry, material);
+  points.frustumCulled = false;
 
-// ── Water Surface — 완전 커스텀 ShaderMaterial (fluid disturbance)
-// 마우스 velocity, sub/bass pressure, beat 모두 반응
-let poolFluidTex = null;    // 유체 시뮬레이션 텍스처 (CPU)
-let poolFluidCanvas = null;
-let poolFluidCtx = null;
-const FLUID_SIZE = 256;     // 시뮬 해상도
-// height field double buffer
-let fluidH0 = new Float32Array(FLUID_SIZE*FLUID_SIZE); // current
-let fluidH1 = new Float32Array(FLUID_SIZE*FLUID_SIZE); // prev
-let fluidV  = new Float32Array(FLUID_SIZE*FLUID_SIZE); // velocity
-let fluidPrevMouseUX = 0.5, fluidPrevMouseUY = 0.5;
-let fluidMouseVX = 0, fluidMouseVY = 0;
-
-function initFluidSim(){
-  poolFluidCanvas = document.createElement("canvas");
-  poolFluidCanvas.width = FLUID_SIZE;
-  poolFluidCanvas.height = FLUID_SIZE;
-  poolFluidCtx = poolFluidCanvas.getContext("2d");
-  poolFluidTex = new THREE.CanvasTexture(poolFluidCanvas);
-  poolFluidTex.wrapS = THREE.RepeatWrapping;
-  poolFluidTex.wrapT = THREE.RepeatWrapping;
-}
-
-function stepFluidSim(delta){
-  if(!poolFluidCtx) return;
-  const N = FLUID_SIZE;
-  const dt = Math.min(delta, 0.035);
-  const isMic = (mode === MODE_MIC);
-  // wave propagation speed — 마이크: 훨씬 빠른 전파로 파동이 풀 전체로 순식간에 퍼짐
-  const c = isMic ? 0.52 : 0.30;
-  // 마이크 모드: 감쇠를 약간 낮춰서 진동이 더 오래 울리게
-  const baseDamp = isMic ? 0.991 : 0.994;
-  const damp = baseDamp - _poolOnsetStrength * (isMic ? 0.002 : 0.006);
-
-  // ── onset 임펄스 — 마이크: 풀 전체에 동시다발적 진동 ──
-  if (_poolOnsetStrength > 0.04) {
-    const str = _poolOnsetStrength;
-    const shouldPulse = isMic ? (S.beat > 0.15 || LQ.bassShock > 0.10 || S.energy > 0.2) : true;
-    if (shouldPulse) {
-      // 마이크: 8개 스팟으로 풀 전체가 동시에 울림
-      const spots = isMic ? [
-        { fx: 0.5,  fy: 0.5  },  // 중앙
-        { fx: 0.2,  fy: 0.2  },  // 좌상
-        { fx: 0.8,  fy: 0.2  },  // 우상
-        { fx: 0.2,  fy: 0.8  },  // 좌하
-        { fx: 0.8,  fy: 0.8  },  // 우하
-        { fx: 0.5,  fy: 0.15 },  // 상단 중앙
-        { fx: 0.5,  fy: 0.85 },  // 하단 중앙
-        { fx: 0.15, fy: 0.5  },  // 좌측 중앙
-      ] : [
-        { fx: 0.5,  fy: 0.5  },
-        { fx: 0.25, fy: 0.35 },
-        { fx: 0.75, fy: 0.65 },
-      ];
-      spots.forEach(sp => {
-        const cx = Math.floor(N * sp.fx);
-        const cy = Math.floor(N * sp.fy);
-        const r  = Math.floor(N * (0.06 + str * (isMic ? 0.18 : 0.10)));
-        const amp = str * (isMic ? 0.72 : 0.38);
-        for (let dy=-r; dy<=r; dy++) for (let dx=-r; dx<=r; dx++) {
-          const d = Math.sqrt(dx*dx+dy*dy);
-          if (d > r) continue;
-          const xi=cx+dx, yi=cy+dy;
-          if (xi<1||xi>=N-1||yi<1||yi>=N-1) continue;
-          fluidH0[yi*N+xi] += amp * (1 - d/r) * (1 - d/r);
-        }
-      });
-    }
-  }
-
-  // bass shock — 마이크: 벽까지 울리는 강력한 저음 타격
-  const shockThresh = isMic ? 0.05 : 0.18;
-  if (LQ.bassShock > shockThresh) {
-    // 마이크: 중앙 + 4면 가장자리에서 동시 충격
-    const shockSpots = isMic ? [
-      { fx: 0.5, fy: 0.5 },
-      { fx: 0.08, fy: 0.5 },   // 좌벽
-      { fx: 0.92, fy: 0.5 },   // 우벽
-      { fx: 0.5, fy: 0.08 },   // 상벽
-      { fx: 0.5, fy: 0.92 },   // 하벽
-    ] : [{ fx: 0.5, fy: 0.5 }];
-    shockSpots.forEach(sp => {
-      const cx = Math.floor(N * sp.fx), cy = Math.floor(N * sp.fy);
-      const r = Math.floor(N * (isMic ? 0.20 : 0.14));
-      const shockAmp = isMic ? 0.48 : 0.22;
-      for(let dy=-r;dy<=r;dy++) for(let dx=-r;dx<=r;dx++){
-        const d = Math.sqrt(dx*dx+dy*dy);
-        if(d>r) continue;
-        const xi=cx+dx, yi=cy+dy;
-        if(xi<0||xi>=N||yi<0||yi>=N) continue;
-        fluidH0[yi*N+xi] += LQ.bassShock * shockAmp * (1-d/r) * (1-d/r);
-      }
-    });
-  }
-
-  // 마이크 모드: beat에 맞춘 다중 파동 — 풀이 노래를 느끼는 flow
-  if (isMic && S.beat > 0.20) {
-    // beat마다 랜덤 위치 6곳에서 동시에 파동
-    const beatSpots = [
-      { fx: 0.5, fy: 0.5 },
-      { fx: 0.3, fy: 0.3 },
-      { fx: 0.7, fy: 0.3 },
-      { fx: 0.3, fy: 0.7 },
-      { fx: 0.7, fy: 0.7 },
-      { fx: 0.5, fy: 0.25 },
-    ];
-    beatSpots.forEach(sp => {
-      const cx = Math.floor(N * sp.fx), cy = Math.floor(N * sp.fy);
-      const r = Math.floor(N * (0.08 + S.beat * 0.08));
-      const beatAmp = S.beat * 0.45;
-      for(let dy=-r;dy<=r;dy++) for(let dx=-r;dx<=r;dx++){
-        const d = Math.sqrt(dx*dx+dy*dy);
-        if(d>r) continue;
-        const xi=cx+dx, yi=cy+dy;
-        if(xi<1||xi>=N-1||yi<1||yi>=N-1) continue;
-        fluidH0[yi*N+xi] += beatAmp * (1-d/r) * (1-d/r);
-      }
-    });
-  }
-
-  // 마이크 모드: mid/high에 반응하는 지속적 수면 흐름 (노래를 느끼는 풀)
-  if (isMic && S.energy > 0.08) {
-    const flowTime = poolTime || 0;
-    const flowStr = S.mid * 0.18 + S.high * 0.12 + S.air * 0.08;
-    for(let y=2;y<N-2;y+=4) for(let x=2;x<N-2;x+=4) {
-      const nx = x/N, ny = y/N;
-      const wave = Math.sin(nx * 12 + flowTime * 3.5) * Math.cos(ny * 10 - flowTime * 2.8);
-      fluidH0[y*N+x] += wave * flowStr * 0.06;
-    }
-  }
-
-  // 마우스 dragging — velocity 기반 disturbance
-  // 넓게 퍼지고, 속도에 비례
-  {
-    const mux = poolMouseX, muy = 1.0 - poolMouseY;
-    fluidMouseVX = fluidMouseVX * 0.62 + (mux - fluidPrevMouseUX) * 0.38;
-    fluidMouseVY = fluidMouseVY * 0.62 + (muy - fluidPrevMouseUY) * 0.38;
-    fluidPrevMouseUX = mux; fluidPrevMouseUY = muy;
-    const speed = Math.sqrt(fluidMouseVX*fluidMouseVX + fluidMouseVY*fluidMouseVY);
-    if(speed > 0.0002){
-      const cx = Math.floor(mux * N);
-      const cy = Math.floor(muy * N);
-      // 작은 움직임 → 작고 얕은 disturbance, 빠른 움직임 → 넓고 깊음
-      const r = Math.floor(N * (0.04 + speed * 1.8));
-      const amp = Math.min(speed * 45.0, 0.22);
-      const vx = fluidMouseVX * N, vy = fluidMouseVY * N;
-      for(let dy=-r;dy<=r;dy++) for(let dx=-r;dx<=r;dx++){
-        const d = Math.sqrt(dx*dx+dy*dy);
-        if(d>r) continue;
-        const xi=cx+dx, yi=cy+dy;
-        if(xi<1||xi>=N-1||yi<1||yi>=N-1) continue;
-        const falloff = (1 - d/r);
-        const falloff2 = falloff * falloff;
-        // 이동 방향으로 당기는 drag 효과
-        const proj = (dx*vx + dy*vy) / (Math.max(d,1)*Math.max(Math.sqrt(vx*vx+vy*vy),0.001));
-        fluidH0[yi*N+xi] += amp * falloff2 * (0.6 + proj * 0.4);
-        // velocity field에도 적용 — 관성
-        fluidV[yi*N+xi] += amp * falloff2 * 0.15;
-      }
-    }
-    // hover 반응 — 아주 예민하게, 작은 접촉에도 미세한 disturbance
-    else if(speed > 0.00004){
-      const cx = Math.floor(mux * N);
-      const cy = Math.floor(muy * N);
-      const r = Math.floor(N * 0.025);
-      const amp = speed * 8.0;
-      for(let dy=-r;dy<=r;dy++) for(let dx=-r;dx<=r;dx++){
-        const d = Math.sqrt(dx*dx+dy*dy);
-        if(d>r) continue;
-        const xi=cx+dx, yi=cy+dy;
-        if(xi<1||xi>=N-1||yi<1||yi>=N-1) continue;
-        fluidH0[yi*N+xi] += amp * (1-d/r);
-      }
-    }
-    // 정지 상태에서도 hover 위치 주변에 미세 liquid tension
-    else {
-      const cx = Math.floor(mux * N);
-      const cy = Math.floor(muy * N);
-      const r = 4;
-      for(let dy=-r;dy<=r;dy++) for(let dx=-r;dx<=r;dx++){
-        const d = Math.sqrt(dx*dx+dy*dy);
-        if(d>r) continue;
-        const xi=cx+dx, yi=cy+dy;
-        if(xi<1||xi>=N-1||yi<1||yi>=N-1) continue;
-        fluidH0[yi*N+xi] += 0.0003 * (1-d/r);
-      }
-    }
-  }
-
-  // wave equation step
-  const alpha = c * c;
-  const newH = fluidH1; // reuse as output (swap)
-  for(let y=1;y<N-1;y++){
-    for(let x=1;x<N-1;x++){
-      const idx = y*N+x;
-      const lap =
-        fluidH0[(y-1)*N+x] +
-        fluidH0[(y+1)*N+x] +
-        fluidH0[y*N+(x-1)] +
-        fluidH0[y*N+(x+1)] -
-        4.0 * fluidH0[idx];
-      newH[idx] = (2.0*fluidH0[idx] - newH[idx] + alpha*lap) * damp;
-    }
-  }
-  // edges — absorbing boundary (8픽셀 두께로 테두리 완전 고정)
-  const BORDER = 8;
-  for(let i=0;i<N;i++){
-    for(let b=0;b<BORDER;b++){
-      const fade = b / BORDER; // 0=완전고정, 1=자유
-      // 상단/하단 행
-      newH[b*N+i]       *= fade * fade;
-      newH[(N-1-b)*N+i] *= fade * fade;
-      // 좌측/우측 열
-      newH[i*N+b]       *= fade * fade;
-      newH[i*N+(N-1-b)] *= fade * fade;
-    }
-  }
-
-  // swap buffers
-  const tmp = fluidH1;
-  fluidH1 = fluidH0;
-  fluidH0 = newH;
-
-  // 텍스처로 렌더링 — R: height, GB: gradient(normal)
-  const imageData = poolFluidCtx.createImageData(N, N);
-  const data = imageData.data;
-  for(let y=1;y<N-1;y++){
-    for(let x=1;x<N-1;x++){
-      const idx = y*N+x;
-      const h = fluidH0[idx];
-      // gradient → normal
-      const gx = fluidH0[idx+1] - fluidH0[idx-1];
-      const gy = fluidH0[(y+1)*N+x] - fluidH0[(y-1)*N+x];
-      const ii = idx*4;
-      // R = height (128 = 0), GB = normal XY
-      data[ii]   = Math.max(0, Math.min(255, 128 + h * 160));
-      data[ii+1] = Math.max(0, Math.min(255, 128 + gx * 220));
-      data[ii+2] = Math.max(0, Math.min(255, 128 + gy * 220));
-      data[ii+3] = 255;
-    }
-  }
-  poolFluidCtx.putImageData(imageData, 0, 0);
-  if(poolFluidTex) poolFluidTex.needsUpdate = true;
-}
-
-function buildWaterSurface(){
-  const PW = POOL_DIMENSIONS.width, PD = POOL_DIMENSIONS.length;
-  initFluidSim();
-
-  // 유체 시뮬 + 커스텀 셰이더 기반 수면
-  const waterGeom = new THREE.PlaneGeometry(PW, PD, 128, 200);
-
-  const fallbackNormals = makeProceduralWaterNormals(1024);
-  poolWaterNormals = fallbackNormals;
-  new THREE.TextureLoader().load(
-    "assets/waternormals.jpg",
-    (tex)=>{
-      tex.wrapS=tex.wrapT=THREE.RepeatWrapping;
-      tex.repeat.set(2.0, 2.0);
-      poolWaterNormals = tex;
-      if(waterMesh && waterMesh.material && waterMesh.material.uniforms['tNormal']){
-        waterMesh.material.uniforms['tNormal'].value = tex;
-      }
-    },
-    undefined, ()=>{}
-  );
-
-  // 커스텀 water shader — 깊고 맑은 pool blue
-  const waterMat = new THREE.ShaderMaterial({
-    uniforms: {
-      tNormal:      { value: poolWaterNormals },
-      tFluid:       { value: poolFluidTex },
-      uTime:        { value: 0 },
-      uSunDir:      { value: new THREE.Vector3(0.42, 0.95, 0.28).normalize() },
-      uSunColor:    { value: new THREE.Color(0xfff8e8) },
-      uWaterDeep:   { value: new THREE.Color(0x0a3d5c) },
-      uWaterMid:    { value: new THREE.Color(0x1a88cc) },
-      uWaterShallow:{ value: new THREE.Color(0x5ec8f0) },
-      uCameraPos:   { value: new THREE.Vector3() },
-      uDistortion:  { value: 1.2 },
-      uFluidStrength:{ value: 0.0 },
-      uSub:         { value: 0 },
-      uMid:         { value: 0 },
-      uHigh:        { value: 0 },
-      uBeat:        { value: 0 },
-      uMouseSpeed:  { value: 0 },
-      uPaletteR:    { value: 0.5 },
-      uPaletteG:    { value: 0.7 },
-      uPaletteB:    { value: 1.0 },
-    },
-    vertexShader:`
-      uniform sampler2D tFluid;
-      uniform float uTime, uSub, uBeat, uFluidStrength;
-      varying vec3 vWorldPos;
-      varying vec2 vUv;
-      varying float vHeight;
-      varying vec3 vNormal;
-      void main(){
-        vUv=uv;
-        // fluid height displacement
-        vec4 fld=texture2D(tFluid,uv);
-        float h=(fld.r-0.5)*0.32*uFluidStrength;
-        // large swell from sub
-        float swell=sin(position.x*0.18+uTime*0.5)*0.030*uSub
-                  + cos(position.z*0.14+uTime*0.4)*0.022*uSub;
-        float beatBump=sin(length(position.xz)*0.6-uTime*5.5)*0.025*uBeat;
-
-        // ── 테두리 edge mask: UV 기준 가장자리에서 displacement를 0으로 고정 ──
-        // smoothstep으로 안쪽 8% 범위 안에서만 진동 허용
-        float edgeFadeX = smoothstep(0.0, 0.08, uv.x) * smoothstep(1.0, 0.92, uv.x);
-        float edgeFadeY = smoothstep(0.0, 0.08, uv.y) * smoothstep(1.0, 0.92, uv.y);
-        float edgeMask  = edgeFadeX * edgeFadeY;
-
-        float disp = (h + swell + beatBump) * edgeMask;
-        vec3 pos=position+vec3(0.0, disp, 0.0);
-        vHeight=disp;
-        vWorldPos=(modelMatrix*vec4(pos,1.0)).xyz;
-        // normal from fluid gradient — 마찬가지로 edge mask 적용
-        vec2 gxy=fld.gb*2.0-1.0;
-        vNormal=normalize(normalMatrix*vec3(-gxy.x*uFluidStrength*edgeMask*0.7,1.0,-gxy.y*uFluidStrength*edgeMask*0.7));
-        gl_Position=projectionMatrix*modelViewMatrix*vec4(pos,1.0);
-      }
-    `,
-    fragmentShader:`
-      precision highp float;
-      uniform sampler2D tNormal;
-      uniform float uTime,uSub,uMid,uHigh,uBeat,uMouseSpeed;
-      uniform float uPaletteR,uPaletteG,uPaletteB;
-      uniform vec3 uSunDir,uSunColor,uWaterDeep,uWaterMid,uWaterShallow;
-      uniform vec3 uCameraPos;
-      uniform float uDistortion;
-      varying vec3 vWorldPos,vNormal;
-      varying vec2 vUv;
-      varying float vHeight;
-
-      float hash(vec2 p){return fract(sin(dot(p,vec2(127.1,311.7)))*43758.5453);}
-      float noise(vec2 p){vec2 i=floor(p),f=fract(p);f=f*f*(3.-2.*f);
-        return mix(mix(hash(i),hash(i+vec2(1,0)),f.x),mix(hash(i+vec2(0,1)),hash(i+vec2(1,1)),f.x),f.y);}
-
-      void main(){
-        // 2-layer normal map — 큰 흐름 + 잔결
-        vec2 uv1=vUv*1.8+vec2(uTime*0.022, uTime*0.016);
-        vec2 uv2=vUv*4.5+vec2(-uTime*0.038,uTime*0.028);
-        vec3 n1=texture2D(tNormal,uv1).rgb*2.0-1.0;
-        vec3 n2=texture2D(tNormal,uv2).rgb*2.0-1.0;
-        vec3 nMap=normalize(mix(n1,n2,0.42)+vNormal*0.5);
-        // 물 색상 — 깊이감 표현
-        vec3 viewDir=normalize(uCameraPos-vWorldPos);
-        float fresnel=pow(1.0-max(dot(viewDir,nMap),0.0),3.5);
-        fresnel=mix(0.04,1.0,fresnel);
-        // 깊이에 따른 색상
-        float depth=clamp(-vHeight*3.0+0.5,0.0,1.0);
-        vec3 waterCol=mix(uWaterShallow,uWaterMid,depth);
-        waterCol=mix(waterCol,uWaterDeep,depth*depth);
-        // 팔레트 색상 미세 반영
-        vec3 palColor=vec3(uPaletteR,uPaletteG,uPaletteB);
-        waterCol=mix(waterCol,waterCol*palColor*1.15,0.08);
-        // 태양 반사 specular — 자연스러운 하이라이트
-        vec3 halfV=normalize(uSunDir+viewDir);
-        float spec=pow(max(dot(nMap,halfV),0.0),280.0);
-        float specB=pow(max(dot(nMap,halfV),0.0),40.0)*0.12;
-        // 음악 반응 shimmer
-        float shimmer=uHigh*0.65+uMouseSpeed*0.35;
-        spec=spec*(2.2+shimmer*1.6);
-        // 물 표면 산란 — SSS 느낌
-        float scatter=max(dot(nMap,uSunDir),0.0)*0.55;
-        scatter*=1.0+uMid*0.8;
-        // 잔물결 caustics 반짝임
-        float caus=noise(vUv*8.0+vec2(uTime*0.3))*noise(vUv*14.0-vec2(uTime*0.22));
-        caus=smoothstep(0.50,0.82,caus)*(0.09+shimmer*0.16+uBeat*0.12);
-        // 최종 색상 합성
-        vec3 reflectColor=mix(uSunColor*0.85,vec3(0.75,0.90,1.0),0.5);
-        vec3 col=waterCol*(0.48+scatter*0.75);
-        col=mix(col,reflectColor,fresnel*0.50);
-        col+=uSunColor*spec*(1.1+uHigh*0.5);
-        col+=uSunColor*specB;
-        col+=vec3(0.7,0.9,1.0)*caus;
-        float edgeGlow=vHeight*1.0+0.14*uBeat;
-        col+=vec3(0.6,0.9,1.0)*max(0.0,edgeGlow)*0.09;
-        col+=vec3(0.85,0.97,1.0)*uBeat*0.05;
-        col=pow(max(col,vec3(0.0)),vec3(0.90));
-        // 수면 투명도 — fresnel: 정면은 맑게 비치고, 얕은 각도에서 반사
-        // 기본 alpha 매우 낮게 → 바닥/pia가 잘 보임
-        float alpha=mix(0.28, 0.72, fresnel*fresnel);
-        // sub 압력 때 살짝 더 불투명 (물이 흔들리는 느낌)
-        alpha+=uSub*0.06+uBeat*0.04;
-        alpha=clamp(alpha,0.18,0.80);
-        gl_FragColor=vec4(col,alpha);
-      }
-    `,
-    transparent: true,
-    depthWrite: false,
-    side: THREE.DoubleSide,
-  });
-
-  waterMesh = new THREE.Mesh(waterGeom, waterMat);
-  waterMesh.rotation.x = -Math.PI * 0.5;
-  waterMesh.position.y = POOL_WATER_LEVEL;
-  poolScene.add(waterMesh);
-
-  // 수면 아래 글로우
-  poolUnderGlow = new THREE.Mesh(
-    new THREE.PlaneGeometry(PW + 0.2, PD + 0.2),
-    new THREE.MeshBasicMaterial({
-      color:0xaae8ff, transparent:true, opacity:0.045,
-      blending:THREE.AdditiveBlending, depthWrite:false
-    })
-  );
-  poolUnderGlow.rotation.x = -Math.PI * 0.5;
-  poolUnderGlow.position.y = POOL_WATER_LEVEL - 0.04;
-  poolScene.add(poolUnderGlow);
-}
-
-// ── pia.glb 로드
-function loadPiaModel(){
-  const loader=new GLTFLoader();
-  loader.load("assets/pia.glb",(gltf)=>{
-    piaModel=gltf.scene;
-    piaModel.traverse((c)=>{
-      if(!c.isMesh) return;
-      c.castShadow=true; c.receiveShadow=true;
-      const mats=Array.isArray(c.material)?c.material:[c.material];
-      mats.forEach((m)=>{
-        if(!m) return;
-        if("roughness" in m) m.roughness=Math.max(0.04,(m.roughness??0.5)*0.42);
-        if("metalness" in m) m.metalness=Math.min(0.72,(m.metalness??0.0)+0.10);
-        if("emissive" in m && "emissiveIntensity" in m){
-          if(!m._origEmissive) m._origEmissive=m.emissive.clone();
-          m.emissive=new THREE.Color(0x3399cc);
-          m.emissiveIntensity=0.04;
-        }
-        m.needsUpdate=true;
-      });
-    });
-
-    let box=new THREE.Box3().setFromObject(piaModel);
-    const size=box.getSize(new THREE.Vector3());
-    const maxDim=Math.max(size.x,size.y,size.z)||1;
-
-    const scale=(22.0*POOL_SCENE_SCALE)/maxDim;
-    piaModel.scale.setScalar(scale);
-
-    box=new THREE.Box3().setFromObject(piaModel);
-    const center=box.getCenter(new THREE.Vector3());
-
-    const floorY = -POOL_DIMENSIONS.depth + POOL_WATER_LEVEL;
-    piaModel.position.set(
-      -center.x + 0.8,
-      floorY - box.min.y + 0.02,
-      -center.z - 4.5          // 카메라 반대방향으로 밀어서 아래쪽 여백 확보
-    );
-    piaModel.rotation.y=Math.PI*0.18;
-    piaModel.rotation.x=Math.PI*0.02;
-    piaModel._baseY=piaModel.position.y;
-    piaModel._baseRotY=piaModel.rotation.y;
-
-    poolScene.add(piaModel);
-    piaLoaded=true;
-  },undefined,(err)=>console.warn("pia.glb 로드 실패:",err));
-}
-
-function initPoolComposer(){
-  poolComposer=new EffectComposer(poolRenderer);
-  const renderPass=new RenderPass(poolScene,poolCamera);
-  poolComposer.addPass(renderPass);
-  poolDropPass=new ShaderPass(POOL_DROP_SHADER);
-  poolComposer.addPass(poolDropPass);
-}
-
-function updateWaterSurface(delta){
-  if(!waterMesh||!waterMesh.material||!waterMesh.material.uniforms) return;
-  const u = waterMesh.material.uniforms;
-
-  // 유체 시뮬 업데이트
-  stepFluidSim(delta);
-
-  const t = poolTime;
-  if(u['uTime']) u['uTime'].value = t;
-  if(u['uCameraPos']) u['uCameraPos'].value.copy(poolCamera.position);
-  if(u['tFluid']) u['tFluid'].value = poolFluidTex;
-  if(u['tNormal']) u['tNormal'].value = poolWaterNormals;
-
-  // 유체 시뮬 반영 강도 — 음악 반응 (마이크 모드: 풀이 완전히 노래에 빠진 느낌)
-  const isMicW = (mode === MODE_MIC);
-  const fluidStrength = isMicW
-    ? (2.0 + LQ.subPressure * 7.0 + poolMouseSpeed * 3.0 + S.beat * 2.5 + S.mid * 1.5 + S.energy * 2.0)
-    : (1.05 + LQ.subPressure * 2.8 + poolMouseSpeed * 2.2 + S.beat * 0.72);
-  if(u['uFluidStrength']) u['uFluidStrength'].value += (fluidStrength - u['uFluidStrength'].value) * (isMicW ? 0.35 : 0.18);
-
-  if(u['uSub']) u['uSub'].value = isMicW ? Math.min(S.sub * 2.0, 1) : S.sub;
-  if(u['uMid']) u['uMid'].value = isMicW ? Math.min(S.mid * 1.8, 1) : S.mid;
-  if(u['uHigh']) u['uHigh'].value = isMicW ? Math.min(LQ.highShimmer * 1.6, 1) : LQ.highShimmer;
-  if(u['uBeat']) u['uBeat'].value = isMicW
-    ? Math.min(1, (S.beat + LQ.bassShock * 0.8) * 1.5)
-    : Math.min(1, S.beat + LQ.bassShock * 0.5);
-  if(u['uMouseSpeed']) u['uMouseSpeed'].value = poolMouseSpeed;
-
-  // 팔레트 색상 반영 — 미세하게
-  if(u['uPaletteR']) u['uPaletteR'].value = curPal.r / 255;
-  if(u['uPaletteG']) u['uPaletteG'].value = curPal.g / 255;
-  if(u['uPaletteB']) u['uPaletteB'].value = curPal.b / 255;
-
-  // 물 색상 — 더 맑고 깊은 pool blue
-  const poolBlueDeep    = new THREE.Color(0x062840);
-  const poolBlueMid     = new THREE.Color(0x1472b8);
-  const poolBlueShallow = new THREE.Color(0x4ec8ee);
-  // 팔레트에서 미세 영향
-  const pr = curPal.r/255, pg = curPal.g/255, pb = curPal.b/255;
-  if(u['uWaterDeep'])    u['uWaterDeep'].value.setRGB(
-    0.024 + pr * 0.04, 0.156 + pg * 0.06, 0.252 + pb * 0.08);
-  if(u['uWaterMid'])     u['uWaterMid'].value.setRGB(
-    0.08 + pr * 0.06,  0.44 + pg * 0.10,  0.72 + pb * 0.12);
-  if(u['uWaterShallow']) u['uWaterShallow'].value.setRGB(
-    0.20 + pr * 0.08,  0.72 + pg * 0.10,  0.92 + pb * 0.06);
-
-  // undrer glow
-  if(poolUnderGlow){
-    poolUnderGlow.material.opacity = 0.050 + LQ.midDensity*0.065 + LQ.highShimmer*0.042 + poolMouseSpeed*0.025 + S.beat*0.02;
-    const sc = 1 + S.beat * 0.018 + LQ.subPressure * 0.024;
-    poolUnderGlow.scale.set(sc,sc,sc);
-  }
-
-  if(poolWaterVolume && poolWaterVolume.material){
-    const m = poolWaterVolume.material;
-    m.color.setRGB(
-      Math.min(1, 0.22 + pr * 0.14),
-      Math.min(1, 0.68 + pg * 0.12),
-      Math.min(1, 0.90 + pb * 0.08)
-    );
-    m.emissive.setRGB(
-      0.06 + pr * 0.06,
-      0.22 + pg * 0.10,
-      0.32 + pb * 0.10
-    );
-    m.opacity = 0.18 + LQ.midDensity * 0.06 + LQ.highShimmer * 0.03;
-  }
-
-  poolGlassWalls.forEach((wall, wi)=>{
-    const m = wall.material;
-    if(!m) return;
-    m.color.setRGB(0.86 + pr * 0.06, 0.94 + pg * 0.05, 0.99);
-    const isMicWall = (mode === MODE_MIC);
-    // 마이크: 벽도 beat에 맞춰 밝아지고 진동
-    const wallBeatPulse = isMicWall ? (S.beat * 0.12 + LQ.bassShock * 0.10) : 0;
-    m.opacity = 0.18 + LQ.highShimmer * 0.07 + S.air * 0.04 + S.beat * 0.02 + wallBeatPulse;
-    // 마이크: 벽 위치 미세 진동 (안쪽으로 찔끔 움직이는 느낌)
-    if(isMicWall && wall._basePos) {
-      const vibAmt = S.beat * 0.06 + LQ.bassShock * 0.08 + S.sub * 0.03;
-      const vibPhase = (poolTime || 0) * 18 + wi * 1.57;
-      const vibX = Math.sin(vibPhase) * vibAmt * wall._vibDir.x;
-      const vibZ = Math.sin(vibPhase * 1.3) * vibAmt * wall._vibDir.z;
-      wall.position.x = wall._basePos.x + vibX;
-      wall.position.z = wall._basePos.z + vibZ;
-    } else if(isMicWall && !wall._basePos) {
-      wall._basePos = wall.position.clone();
-      // 벽 방향에 따른 진동 방향 (법선 방향)
-      const nx = Math.abs(wall.position.x) > Math.abs(wall.position.z) ? Math.sign(wall.position.x) : 0;
-      const nz = Math.abs(wall.position.z) > Math.abs(wall.position.x) ? Math.sign(wall.position.z) : 0;
-      wall._vibDir = { x: nx || 0.5, z: nz || 0.5 };
-    }
-  });
-
-  poolWallPanels.forEach((wall, wi)=>{
-    const m = wall.material;
-    if(!m) return;
-    const isMicPanel = (mode === MODE_MIC);
-    m.color.setRGB(
-      Math.min(1, 0.28 + pr * 0.18),
-      Math.min(1, 0.70 + pg * 0.16),
-      Math.min(1, 0.90 + pb * 0.10)
-    );
-    m.emissive.setRGB(0.05 + pr*0.06, 0.22 + pg*0.10, 0.30 + pb*0.08);
-    // 마이크: 벽 패널도 beat/bass에 맞춰 빛이 커짐
-    const panelBeatGlow = isMicPanel ? (S.beat * 0.16 + LQ.bassShock * 0.14 + S.sub * 0.08) : 0;
-    m.opacity = 0.24 + LQ.midDensity * 0.10 + LQ.highShimmer * 0.08 + S.beat * 0.03 + panelBeatGlow;
-    m.emissiveIntensity = 0.28 + LQ.highShimmer * 0.26 + S.air * 0.14 + S.beat * 0.06
-      + (isMicPanel ? (S.beat * 0.35 + LQ.bassShock * 0.28 + S.mid * 0.15) : 0);
-    // 마이크: 벽 패널 위치 진동
-    if(isMicPanel && wall._basePos) {
-      const vibAmt = S.beat * 0.05 + LQ.bassShock * 0.06 + S.bass * 0.025;
-      const vibPhase = (poolTime || 0) * 22 + wi * 2.09;
-      wall.position.x = wall._basePos.x + Math.sin(vibPhase) * vibAmt * (wall._vibDir?.x || 0);
-      wall.position.z = wall._basePos.z + Math.cos(vibPhase * 0.8) * vibAmt * (wall._vibDir?.z || 0);
-    } else if(isMicPanel && !wall._basePos) {
-      wall._basePos = wall.position.clone();
-      const nx = Math.abs(wall.position.x) > Math.abs(wall.position.z) ? Math.sign(wall.position.x) : 0;
-      const nz = Math.abs(wall.position.z) > Math.abs(wall.position.x) ? Math.sign(wall.position.z) : 0;
-      wall._vibDir = { x: nx || 0.5, z: nz || 0.5 };
-    }
-  });
-
-  poolWallCaustics.forEach((wall, wi)=>{
-    const m = wall.material;
-    if(!m) return;
-    const isMicC = (mode === MODE_MIC);
-    const caustBeat = isMicC ? (S.beat * 0.18 + LQ.bassShock * 0.14 + S.mid * 0.08) : 0;
-    m.opacity = 0.08 + LQ.highShimmer * 0.16 + S.air * 0.07 + poolMouseSpeed * 0.05 + S.beat * 0.04 + caustBeat;
-    // 마이크: caustics 패턴 진동 — scale pulse
-    if(isMicC) {
-      const pulseScale = 1 + S.beat * 0.04 + LQ.bassShock * 0.03;
-      wall.scale.set(pulseScale, pulseScale, 1);
-    }
-  });
-
-  // ── Dawn water: 물색이 맑고 투명하게 ──
-  if(_poolDawnSmooth > 0.001) {
-    const d = _poolDawnSmooth;
-    // 물 deep/mid/shallow → 더 밝고 맑은 터쿼이즈
-    if(u['uWaterDeep']) {
-      u['uWaterDeep'].value.r += d * 0.06;
-      u['uWaterDeep'].value.g += d * 0.14;
-      u['uWaterDeep'].value.b += d * 0.10;
-    }
-    if(u['uWaterMid']) {
-      u['uWaterMid'].value.r += d * 0.08;
-      u['uWaterMid'].value.g += d * 0.12;
-      u['uWaterMid'].value.b += d * 0.06;
-    }
-    if(u['uWaterShallow']) {
-      u['uWaterShallow'].value.r += d * 0.10;
-      u['uWaterShallow'].value.g += d * 0.06;
-      u['uWaterShallow'].value.b += d * 0.03;
-    }
-    // water volume → 더 투명하게
-    if(poolWaterVolume && poolWaterVolume.material) {
-      poolWaterVolume.material.opacity *= (1 - d * 0.35);
-    }
-    // 유리벽 → 더 맑게
-    poolGlassWalls.forEach((wall) => {
-      if(wall.material) wall.material.opacity *= (1 - d * 0.25);
-    });
-  }
-}
-
-function buildProceduralCaustics(){
-  poolCausticsCanvas=document.createElement("canvas");
-  poolCausticsCanvas.width=512; poolCausticsCanvas.height=512;
-  poolCausticsCtx=poolCausticsCanvas.getContext("2d");
-  poolCausticsTex=new THREE.CanvasTexture(poolCausticsCanvas);
-  poolCausticsTex.wrapS=THREE.RepeatWrapping;
-  poolCausticsTex.wrapT=THREE.RepeatWrapping;
-  poolCausticsTex.repeat.set(2.0,2.0);
-}
-
-function updateProceduralCaustics(time){
-  if(!poolCausticsCtx||!poolCausticsTex) return;
-  const ctx2=poolCausticsCtx;
-  const W=poolCausticsCanvas.width, H=poolCausticsCanvas.height;
-  ctx2.clearRect(0,0,W,H);
-  // 배경 — 매우 짙은 딥 블루
-  ctx2.fillStyle="#020d14"; ctx2.fillRect(0,0,W,H);
-  ctx2.globalCompositeOperation="lighter";
-
-  // caustics 강도 — mid가 올라가면 세지고, air도 반응
-  // 평소엔 절제, 과하면 안 됨
-  const base = 0.08;
-  const musicBoost = LQ.midDensity * 0.30 + S.air * 0.16 + LQ.highShimmer * 0.15;
-  const sparkle = base + musicBoost;
-  const pulse = 1 + S.beat * 0.24 + LQ.bassShock * 0.18;
-
-  // 큰 물빛 패턴 — Voronoi-like caustic 모양
-  for(let i=0;i<18;i++){
-    const ang=i/18*Math.PI*2;
-    const r=0.30+Math.sin(time*0.18+i*0.77)*0.14;
-    const px=W*(0.5+r*Math.cos(ang+time*(0.04+i*0.003)));
-    const py=H*(0.5+r*Math.sin(ang*1.1+time*(0.035+i*0.004)));
-    const rad=(18+(i%4)*12+Math.sin(time*0.9+i*0.6)*6)*pulse;
-    const g=ctx2.createRadialGradient(px,py,0,px,py,rad);
-    // 더 차갑고 투명한 pool blue
-    const alpha1=(0.038+sparkle*0.072);
-    const alpha2=(0.018+sparkle*0.042);
-    g.addColorStop(0,`rgba(180,238,255,${alpha1.toFixed(3)})`);
-    g.addColorStop(0.5,`rgba(100,200,255,${alpha2.toFixed(3)})`);
-    g.addColorStop(1,"rgba(60,160,220,0)");
-    ctx2.fillStyle=g;
-    ctx2.beginPath(); ctx2.arc(px,py,rad,0,Math.PI*2); ctx2.fill();
-  }
-
-  // 잔물결 라인 — 절제된 스트라이프
-  const lineCount=24;
-  for(let i=0;i<lineCount;i++){
-    const y=(i/lineCount)*H;
-    const amp=4.5+LQ.subPressure*10+S.beat*8;
-    const alpha=(0.008+sparkle*0.024);
-    if(alpha<0.003) continue;
-    ctx2.strokeStyle=`rgba(160,230,255,${alpha.toFixed(3)})`;
-    ctx2.lineWidth=0.9; ctx2.beginPath();
-    for(let x=0;x<=W;x+=6){
-      const yy=y+Math.sin(x*0.025+time*2.0+i*0.42)*amp;
-      x===0?ctx2.moveTo(x,yy):ctx2.lineTo(x,yy);
-    }
-    ctx2.stroke();
-  }
-
-  // 수면 교차 반짝임 — beat 때 잠깐 더 밝게
-  if(S.beat > 0.28 || LQ.bassShock > 0.10){
-    const flashAlpha=(S.beat*0.08+LQ.bassShock*0.06);
-    ctx2.fillStyle=`rgba(220,250,255,${flashAlpha.toFixed(3)})`;
-    ctx2.fillRect(0,0,W,H);
-  }
-
-  ctx2.globalCompositeOperation="source-over";
-  poolCausticsTex.needsUpdate=true;
-}
-
-function updateRainSystem(delta){
-  return; // 비 시스템 비활성화
-}
-
-function renderPoolScene(delta){
-  if(!poolRenderer||!poolScene||!poolCamera||!poolActive) return;
-  poolTime+=delta;
-  // 점성 감쇠 — 빠른 움직임 후엔 관성 남도록
-  poolMouseSpeed *= (poolMouseSpeed > 0.15 ? 0.92 : 0.80);
-  updateRainSystem(delta);
-  updateProceduralCaustics(poolTime);
-  updateWaterSurface(delta);
-
-  if(poolScene._skyMat) poolScene._skyMat.uniforms.uTime.value=poolTime;
-
-  // ── Pool Sky Dawn: 곡 끝 무렵 하늘이 맑고 청아하게 밝아짐 ──
-  {
-    let songProgress = 0;
-    if(mode === MODE_FILE && audioEl.duration > 0 && isPlaying) {
-      songProgress = audioEl.currentTime / audioEl.duration;
-    }
-    // 곡의 마지막 ~28%에서 서서히 시작, 끝에서 최대
-    const dawnOnset = 0.72;
-    const rawDawn = Math.max(0, (songProgress - dawnOnset) / (1.0 - dawnOnset));
-    // ease-in-out cubic for natural feel
-    _poolDawnFactor = rawDawn < 0.5
-      ? 4 * rawDawn * rawDawn * rawDawn
-      : 1 - Math.pow(-2 * rawDawn + 2, 3) / 2;
-    // 곡 안 재생중이면 천천히 원래 밤으로 복귀
-    if(!isPlaying || songProgress < dawnOnset) {
-      _poolDawnFactor = 0;
-    }
-    // 부드러운 추적 (급격한 점프 방지)
-    _poolDawnSmooth += (_poolDawnFactor - _poolDawnSmooth) * 0.012;
-    const d = _poolDawnSmooth;
-
-    if(poolScene._skyMat && d > 0.001) {
-      const u = poolScene._skyMat.uniforms;
-      // 밤하늘 → 맑은 청아한 하늘로 lerp
-      // Top:  0x010306 → 0x1e5a9e (깊은 코발트)
-      u.uTopColor.value.r += (0.118 - u.uTopColor.value.r) * d;
-      u.uTopColor.value.g += (0.353 - u.uTopColor.value.g) * d;
-      u.uTopColor.value.b += (0.620 - u.uTopColor.value.b) * d;
-      // Mid:  0x03080f → 0x5aaad5 (밝은 스카이블루)
-      u.uMidColor.value.r += (0.353 - u.uMidColor.value.r) * d;
-      u.uMidColor.value.g += (0.667 - u.uMidColor.value.g) * d;
-      u.uMidColor.value.b += (0.835 - u.uMidColor.value.b) * d;
-      // Horizon: 0x060e18 → 0xb8ddf0 (밝고 투명한 수평선)
-      u.uHorizonColor.value.r += (0.722 - u.uHorizonColor.value.r) * d;
-      u.uHorizonColor.value.g += (0.867 - u.uHorizonColor.value.g) * d;
-      u.uHorizonColor.value.b += (0.941 - u.uHorizonColor.value.b) * d;
-      // Sun: 0x1a3a6a → 0x7ec8f0 (맑고 선명한 태양빛)
-      u.uSunColor.value.r += (0.494 - u.uSunColor.value.r) * d;
-      u.uSunColor.value.g += (0.784 - u.uSunColor.value.g) * d;
-      u.uSunColor.value.b += (0.941 - u.uSunColor.value.b) * d;
-    }
-
-    // Scene background + fog 밝아짐
-    if(d > 0.001) {
-      // bg: 0x020508 → 0x1a4878 (청아한 딥블루)
-      const bgR = 0.008 + (0.102 - 0.008) * d;
-      const bgG = 0.020 + (0.282 - 0.020) * d;
-      const bgB = 0.031 + (0.471 - 0.031) * d;
-      poolScene.background.setRGB(bgR, bgG, bgB);
-      // fog: 밀도를 살짝 낮추고 색상 밝게
-      if(poolScene.fog) {
-        poolScene.fog.color.setRGB(bgR * 1.2, bgG * 1.15, bgB * 1.08);
-        poolScene.fog.density = 0.010 - d * 0.004;  // 안개 걷힘
-      }
-    }
-  }
-
-  if(piaLoaded&&piaModel){
-    const isMicPia = (mode === MODE_MIC);
-    const subMul = isMicPia ? 3.5 : 1.0;
-    const beatMul = isMicPia ? 2.5 : 1.0;
-    piaModel.position.y=piaModel._baseY+Math.sin(poolTime*0.8)*0.035*(1+LQ.subPressure*2.0*subMul)+S.beat*0.055*beatMul+LQ.bassShock*0.08*beatMul;
-    piaModel.rotation.z=Math.sin(poolTime*0.6)*0.008*(1+LQ.subPressure*2.2*subMul)
-      + (isMicPia ? S.beat * 0.025 : 0);
-    piaModel.rotation.x=Math.PI*0.02+Math.cos(poolTime*0.5)*0.007*(1+LQ.midDensity*1.4)
-      + (isMicPia ? S.mid * 0.012 : 0);
-    // 수면 caustics 물빛 — 아주 약하게 fluctuate
-    piaModel.traverse((c)=>{
-      if(!c.isMesh||!c.material) return;
-      const mats=Array.isArray(c.material)?c.material:[c.material];
-      mats.forEach((m)=>{
-        if(m&&"emissiveIntensity" in m){
-          const target=0.04 + LQ.midDensity*0.09 + LQ.highShimmer*0.06 + Math.sin(poolTime*1.2)*0.016 + S.beat*0.04;
-          m.emissiveIntensity+=(target-m.emissiveIntensity)*0.10;
-        }
-      });
-    });
-  }
-
-  if(poolScene._causticsLight){
-    const l=poolScene._causticsLight;
-    const isMicL = (mode === MODE_MIC);
-    // 마이크: caustics 조명이 beat에 맞춰 확 밝아짐
-    l.intensity = 1.0 + LQ.midDensity*1.8 + LQ.highShimmer*1.2 + poolMouseSpeed*0.8 + S.beat*0.6
-      + (isMicL ? (S.beat * 3.0 + LQ.bassShock * 2.5 + S.mid * 1.2) : 0);
-    l.color.setRGB(0.45+curPal.r/255*0.18, 0.88+curPal.g/255*0.10, 1.0);
-    l.position.x = Math.sin(poolTime*0.4)*1.0;
-    l.position.z = Math.cos(poolTime*0.32)*0.8;
-  }
-  if(poolScene._waterLight){
-    const l=poolScene._waterLight;
-    const isMicL = (mode === MODE_MIC);
-    l.intensity=2.5+S.sub*4.5+LQ.midDensity*2.8+LQ.highShimmer*2.0+poolMouseSpeed*2.0+S.beat*1.5
-      + (isMicL ? (S.beat * 4.0 + S.energy * 3.0 + LQ.bassShock * 3.0) : 0);
-    l.color.setRGB(0.30+curPal.r/255*0.25,0.82+curPal.g/255*0.16,1.0);
-  }
-  if(poolScene._beatLight){
-    const l=poolScene._beatLight;
-    const isMicL = (mode === MODE_MIC);
-    l.intensity = S.beat*9.0+LQ.bassShock*7.0 + (isMicL ? (S.beat * 8.0 + S.sub * 4.0) : 0);
-    l.color.setRGB(0.40+curPal.r/255*0.30,0.92,1.0);
-  }
-  if(poolScene._caustic){
-    const c=poolScene._caustic;
-    c.material.opacity=0.26+LQ.highShimmer*0.35+S.air*0.14+poolMouseSpeed*0.10+S.beat*0.06;
-    const sc=1+Math.sin(poolTime*1.15)*0.038+S.beat*0.055;
-    c.scale.set(sc,sc,sc);
-    c.rotation.z+=delta*(0.022+S.air*0.055);
-  }
-  if(poolFloor&&poolFloor.material){
-    poolFloor.material.color.setRGB(0.18+curPal.r/255*0.10, 0.50+curPal.g/255*0.12, 0.68+curPal.b/255*0.12);
-    poolFloor.material.emissiveIntensity = 0.24 + LQ.midDensity*0.22 + LQ.highShimmer*0.16 + S.beat*0.06;
-  }
-
-  // ── Dawn lighting: 하늘과 함께 조명도 밝아짐 ──
-  if(_poolDawnSmooth > 0.001) {
-    const d = _poolDawnSmooth;
-    // Hemisphere: 밝기 + 하늘색 톤
-    if(poolScene._hemi) {
-      poolScene._hemi.intensity = 1.7 + d * 2.8;
-      // skyColor → 더 밝은 하늘색으로
-      poolScene._hemi.color.r += (0.88 - poolScene._hemi.color.r) * d * 0.5;
-      poolScene._hemi.color.g += (0.94 - poolScene._hemi.color.g) * d * 0.5;
-      poolScene._hemi.color.b += (1.0  - poolScene._hemi.color.b) * d * 0.5;
-    }
-    // 바닥도 살짝 밝아짐
-    if(poolFloor&&poolFloor.material) {
-      poolFloor.material.color.r += d * 0.08;
-      poolFloor.material.color.g += d * 0.12;
-      poolFloor.material.color.b += d * 0.10;
-    }
-  }
-  if(poolOrbitControls) poolOrbitControls.update();
-  if(poolDropPass){
-    poolDropPass.uniforms.uTime.value=poolTime;
-    poolDropPass.uniforms.uBeat.value=Math.min(1,S.beat+LQ.bassShock*0.42);
-    poolDropPass.uniforms.uShimmer.value=Math.min(1,LQ.highShimmer+S.air*0.4);
-    poolDropPass.uniforms.uSub.value=Math.min(1,LQ.subPressure);
-    poolDropPass.uniforms.uMid.value=Math.min(1,LQ.midDensity);
-    poolDropPass.uniforms.uAir.value=Math.min(1,S.air);
-    poolDropPass.uniforms.uMouseX.value=poolMouseX;
-    poolDropPass.uniforms.uMouseY.value=poolMouseY;
-    poolDropPass.uniforms.uMouseSpeed.value=poolMouseSpeed;
-    poolDropPass.uniforms.uResolution.value.set(window.innerWidth,window.innerHeight);
-  }
-  if(poolComposer) poolComposer.render(delta);
-  else poolRenderer.render(poolScene,poolCamera);
-  drawPoolRain();
-}
-
-function drawPoolRain(){
-  if(!rainCtx2||!rainCv) return;
-  const W=window.innerWidth, H=window.innerHeight;
-  rainCtx2.clearRect(0,0,W,H);
-  return; // 비 효과 비활성화
-
-  // fade in/out intensity smoothly
-  const rawIntensity=poolRainActive?(1.0-poolRainTimer/poolRainDuration*0.25):0;
-  const fadeIn=poolRainActive?Math.min(1, (poolRainDuration-poolRainTimer)*0.35):0;
-  const fadeOut=poolRainActive?Math.min(1, poolRainTimer*0.5):0;
-  const rainIntensity=rawIntensity*fadeIn*fadeOut;
-
-  // gentle global wind drift that shifts over time
-  const windT=poolTime||0;
-  const globalWind=Math.sin(windT*0.25)*0.015+Math.sin(windT*0.11)*0.008;
-
-  poolRainDrops.forEach((d)=>{
-    const bv=S[d.band]||0;
-    // smaller drops react less to music — more natural
-    const musicMult=1+bv*1.2*d.size+S.energy*0.35;
-    const spd=d.spd*musicMult*(poolRainActive?1.2:0.08);
-    d.y+=spd;
-    if(d.y>1.12){d.y=-0.06-Math.random()*0.08;d.x=Math.random();}
-    if(!poolRainActive&&rainIntensity<0.03) return;
-
-    // wind sway — each drop has its own phase, light drops sway more
-    const windSway=globalWind*(1.4-d.size*0.9)+Math.sin(windT*0.6+d.windPhase)*0.004*(1-d.size*0.6);
-    d.x+=windSway;
-    if(d.x<-0.02) d.x=1.02;
-    if(d.x>1.02) d.x=-0.02;
-
-    const x=d.x*W, y=d.y*H;
-    const len=d.len*H*(0.35+bv*0.35+d.size*0.25)*(0.5+rainIntensity*0.7);
-    const angle=d.angle+globalWind*2.8;
-    const dx=Math.sin(angle)*len*0.18, dy=Math.cos(angle)*len;
-
-    // opacity: smaller drops are more transparent, smoother falloff
-    const al=d.opacity*(0.25+bv*0.35)*rainIntensity*(0.45+LQ.midDensity*0.35);
-    if(al<0.003) return;
-
-    // color variation: heavier drops slightly bluer, lighter ones more white
-    const colorB=Math.round(235+d.size*20);
-    const colorG=Math.round(225+d.size*10+(1-d.size)*20);
-
-    rainCtx2.beginPath();
-    rainCtx2.strokeStyle=`rgba(${210+Math.round((1-d.size)*25)},${colorG},${colorB},${al.toFixed(3)})`;
-    rainCtx2.lineWidth=d.thick*(0.5+bv*0.3);
-    rainCtx2.lineCap='round';
-    rainCtx2.moveTo(x,y); rainCtx2.lineTo(x+dx,y+dy); rainCtx2.stroke();
-
-    // ripples — only heavy drops near water surface, less frequent
-    if(poolRainActive&&d.size>0.45&&d.y>0.56&&d.y<0.64&&Math.random()<0.08+S.beat*0.10){
-      const rippleSize=4+d.size*14+bv*8+S.beat*6;
-      poolRipples.push({
-        x, y:d.y*H,
-        r:0, maxR:rippleSize,
-        life:1, decay:0.028+Math.random()*0.035,
-        al:Math.min(0.22,al*0.65),
-      });
-    }
-  });
-
-  // render ripples with softer ellipse
-  for(let i=poolRipples.length-1;i>=0;i--){
-    const rp=poolRipples[i];
-    rp.r+=(rp.maxR-rp.r)*0.10; rp.life-=rp.decay;
-    if(rp.life<=0){poolRipples.splice(i,1);continue;}
-    const al=rp.al*rp.life*rp.life*(1-rp.r/rp.maxR);
-    if(al<0.002){poolRipples.splice(i,1);continue;}
-    rainCtx2.beginPath();
-    rainCtx2.ellipse(rp.x,rp.y,rp.r,rp.r*0.28,0,0,Math.PI*2);
-    rainCtx2.strokeStyle=`rgba(220,238,255,${al.toFixed(3)})`;
-    rainCtx2.lineWidth=0.6*rp.life; rainCtx2.stroke();
-  }
-}
-
-
-let poolMouseDisposer=null;
-
-function setupPoolMouseEvents(){
-  if(poolMouseDisposer) poolMouseDisposer();
-  const cv=document.getElementById("pool-canvas");
-  if(!cv) return;
-
-  let _prevMX=0.5, _prevMY=0.5;
-  let _velX=0, _velY=0;
-
-  const onMove=(e)=>{
-    const rect=cv.getBoundingClientRect();
-    const nx=(e.clientX-rect.left)/rect.width;
-    const ny=(e.clientY-rect.top)/rect.height;
-    const dx=nx-_prevMX, dy=ny-_prevMY;
-    _velX=_velX*0.55+dx*0.45;
-    _velY=_velY*0.55+dy*0.45;
-    _prevMX=nx; _prevMY=ny;
-    poolMousePrevX=poolMouseX; poolMousePrevY=poolMouseY;
-    poolMouseX=nx; poolMouseY=ny;
-    const rawSpeed=Math.sqrt(dx*dx+dy*dy)*55;
-    poolMouseSpeed=Math.min(1.0, poolMouseSpeed*0.72+rawSpeed*0.28);
-    if(rawSpeed < 0.0001) poolMouseSpeed=Math.max(poolMouseSpeed, 0.0008);
-  };
-
-  const onLeave=()=>{
-    _velX=0; _velY=0;
-  };
-
-  cv.addEventListener('mousemove',onMove,{passive:true});
-  cv.addEventListener('mouseleave',onLeave,{passive:true});
-
-  poolMouseDisposer=()=>{
-    cv.removeEventListener('mousemove',onMove,{passive:true});
-    cv.removeEventListener('mouseleave',onLeave,{passive:true});
-  };
-}
-
-
-function setupPoolRainCanvas(){
-  rainCv=document.getElementById("pool-rain-canvas");
-  if(!rainCv) return;
-  const W=window.innerWidth, H=window.innerHeight, dpr=window.devicePixelRatio||1;
-  rainCv.width=W*dpr; rainCv.height=H*dpr;
-  rainCtx2=rainCv.getContext("2d");
-  if(rainCtx2){ rainCtx2.setTransform(1,0,0,1,0,0); rainCtx2.scale(dpr,dpr); }
-}
-
-
-function disposeComposer(composer){
-  if(!composer) return;
-  if(composer.passes){
-    composer.passes.forEach((pass)=>{
-      try{ pass.dispose?.(); }catch(_){}
-      try{ pass.fsQuad?.dispose?.(); }catch(_){}
-      try{ pass.material?.dispose?.(); }catch(_){}
-    });
-  }
-  try{ composer.renderTarget1?.dispose?.(); }catch(_){}
-  try{ composer.renderTarget2?.dispose?.(); }catch(_){}
-}
-
-function disposePoolRenderer({ preserveCanvas=true }={}){
-  poolActive=false;
-
-  if(poolOrbitControls){
-    try{ poolOrbitControls.dispose(); }catch(_){}
-    poolOrbitControls=null;
-  }
-  if(poolMouseDisposer){
-    try{ poolMouseDisposer(); }catch(_){}
-    poolMouseDisposer=null;
-  }
-
-  if(poolComposer){
-    disposeComposer(poolComposer);
-    poolComposer=null;
-  }
-
-  if(piaModel){
-    try{ poolScene?.remove(piaModel); }catch(_){}
-    disposeObject3D(piaModel,{ disposeGeometry:true, disposeMaterials:true, disposeTextures:false });
-    piaModel=null;
-    piaLoaded=false;
-  }
-
-  if(waterMesh){
-    try{ poolScene?.remove(waterMesh); }catch(_){}
-    disposeObject3D(waterMesh,{ disposeGeometry:true, disposeMaterials:true, disposeTextures:false });
-    waterMesh=null;
-  }
-
-  if(poolUnderGlow){
-    try{ poolScene?.remove(poolUnderGlow); }catch(_){}
-    disposeObject3D(poolUnderGlow,{ disposeGeometry:true, disposeMaterials:true, disposeTextures:false });
-    poolUnderGlow=null;
-  }
-
-  if(poolScene){
-    poolScene.traverse((obj)=>{
-      if(obj.isMesh){
-        if(obj.geometry) try{ obj.geometry.dispose(); }catch(_){}
-        if(obj.material){
-          const mats=Array.isArray(obj.material)?obj.material:[obj.material];
-          mats.forEach((mat)=>{
-            if(!mat) return;
-            getTextureSlots(mat).forEach((slot)=>{
-              try{ mat[slot]?.dispose?.(); }catch(_){}
-            });
-            try{ mat.dispose(); }catch(_){}
-          });
-        }
-      }
-    });
-    try{ poolScene.clear(); }catch(_){}
-  }
-
-  try{ poolFluidTex?.dispose?.(); }catch(_){}
-  poolFluidTex=null;
-  poolFluidCanvas=null;
-  poolFluidCtx=null;
-
-  try{ poolCausticsTex?.dispose?.(); }catch(_){}
-  poolCausticsTex=null;
-  poolCausticsCanvas=null;
-  poolCausticsCtx=null;
-
-  try{ poolWaterNormals?.dispose?.(); }catch(_){}
-  poolWaterNormals=null;
-
-  if(poolRenderer){
-    try{ poolRenderer.renderLists.dispose(); }catch(_){}
-    try{ poolRenderer.dispose(); }catch(_){}
-    try{ poolRenderer.forceContextLoss(); }catch(_){}
-  }
-
-  poolRenderer=null;
-  poolScene=null;
-  poolCamera=null;
-  poolClock=null;
-  poolDropPass=null;
-  poolFloor=null;
-  poolGlassWalls=[];
-  poolWallPanels=[];
-  poolWallCaustics=[];
-  poolWaterVolume=null;
-  poolInited=false;
-
-  if(!preserveCanvas){
-    const cv=document.getElementById("pool-canvas");
-    if(cv) replaceCanvasWithFreshClone(cv);
-  }
-}
-
-function initPoolRenderer(){
-  if(poolInited) return;
-  const cv=document.getElementById("pool-canvas");
-  if(!cv) return;
-  const W=window.innerWidth, H=window.innerHeight;
-  const shadowEnabled=!IS_MOBILE;
-  const maxDpr=Math.min(window.devicePixelRatio||1, IS_MOBILE ? 1.1 : 1.5);
-
-  poolRenderer=new THREE.WebGLRenderer({
-    canvas:cv,
-    antialias:!IS_MOBILE,
-    alpha:false,
-    powerPreference:"high-performance",
-    preserveDrawingBuffer:false,
-    stencil:false
-  });
-  poolRenderer.setPixelRatio(maxDpr);
-  poolRenderer.setSize(W,H,false);
-  poolRenderer.shadowMap.enabled=shadowEnabled;
-  if(shadowEnabled){
-    poolRenderer.shadowMap.type=THREE.PCFSoftShadowMap;
-    poolRenderer.shadowMap.autoUpdate=false;
-  }
-  poolRenderer.outputColorSpace=THREE.SRGBColorSpace;
-  poolRenderer.toneMapping=THREE.ACESFilmicToneMapping;
-  poolRenderer.toneMappingExposure=1.25;
-
-  if(!cv._poolContextBound){
-    cv.addEventListener("webglcontextlost",(e)=>{
-      e.preventDefault();
-      poolActive=false;
-    },false);
-
-    cv.addEventListener("webglcontextrestored",()=>{
-      disposePoolRenderer({ preserveCanvas:true });
-      initPoolRenderer();
-      if(LS.hIdx===3) startPoolRenderer();
-    },false);
-
-    cv._poolContextBound=true;
-  }
-
-  poolScene=new THREE.Scene();
-  poolScene.background=new THREE.Color(0x020508);
-  poolScene.fog=new THREE.FogExp2(0x030a14,0.010);
-
-  poolCamera=new THREE.PerspectiveCamera(60,W/H,0.1,800);
-  poolCamera.position.set(10.965*POOL_SCENE_SCALE, 5.2*POOL_SCENE_SCALE, 5.939*POOL_SCENE_SCALE);
-  poolCamera.lookAt(1.5, -3.8, -5.5);
-
-  const hemi=new THREE.HemisphereLight(0xd0ecff,0x4488aa,1.7);
-  poolScene.add(hemi);
-  poolScene._hemi=hemi;
-
-  const sun=new THREE.DirectionalLight(0xfff6e0,2.6);
-  sun.position.set(16,32,12);
-  sun.castShadow=shadowEnabled;
-  if(shadowEnabled){
-    const shadowMapSize=IS_MOBILE ? 1024 : 1536;
-    sun.shadow.mapSize.set(shadowMapSize,shadowMapSize);
-    sun.shadow.camera.near=0.5; sun.shadow.camera.far=140;
-    const sh=32*POOL_SCENE_SCALE;
-    sun.shadow.camera.top=sh; sun.shadow.camera.bottom=-sh;
-    sun.shadow.camera.left=-sh; sun.shadow.camera.right=sh;
-    sun.shadow.bias=-0.0006;
-  }
-  poolScene.add(sun);
-  poolScene._sun=sun;
-
-  const fill=new THREE.DirectionalLight(0xa0d0ff,0.85);
-  fill.position.set(-8,6,-5);
-  poolScene.add(fill);
-
-  const backLight=new THREE.DirectionalLight(0xffe0c0,0.42);
-  backLight.position.set(0,4,-12);
-  poolScene.add(backLight);
-
-  const waterLight=new THREE.PointLight(0x44ccff,3.0,26);
-  waterLight.position.set(0,-0.5,0);
-  poolScene.add(waterLight);
-  poolScene._waterLight=waterLight;
-
-  const beatLight=new THREE.PointLight(0x88eeff,0,34);
-  beatLight.position.set(0,3,0);
-  poolScene.add(beatLight);
-  poolScene._beatLight=beatLight;
-
-  const causticsLight=new THREE.PointLight(0x7fe8ff,0.85,18);
-  causticsLight.position.set(0,0.8,0);
-  poolScene.add(causticsLight);
-  poolScene._causticsLight=causticsLight;
-
-  buildPoolSky();
-  buildProceduralCaustics();
-  buildPoolShell();
-  buildWaterSurface();
-  loadPiaModel();
-  initPoolComposer();
-  setupPoolRainCanvas();
-  setupPoolMouseEvents();
-
-  poolClock=new THREE.Clock();
-  poolOrbitControls=createPoolOrbitControls(poolCamera,cv);
-
-  poolInited=true;
-}
-
-function startPoolRenderer(){
-  if(!poolInited) initPoolRenderer();
-  poolActive=true;
-  if(poolClock) poolClock.getDelta();
-  if(poolRenderer && poolScene && poolCamera) {
-    if(poolRenderer.shadowMap.enabled) poolRenderer.shadowMap.needsUpdate=true;
-    if(poolComposer) poolComposer.render();
-    else poolRenderer.render(poolScene, poolCamera);
-  }
-}
-
-
-// ══════════════════════════════════════════════════════
-// ALBUM 패널 — Glossy Magnetic Card Deck
-// ══════════════════════════════════════════════════════
-const ALBUM_DATA = [
-  { title: "돈 벌 준비",         desc: "데뷔 전 믹테",   tags: ["2013", "믹스테이프"] },
-  { title: "돈 벌 시간",         desc: "덕소 욕망기",   tags: ["2013", "믹스테이프"] },
-  { title: "별 될 준비",         desc: "별 될 예고",   tags: ["2014", "믹스테이프"] },
-  { title: "Incomplete",        desc: "미완의 청춘", tags: ["2015", "믹스테이프"] },
-  { title: "M O T O W N",       desc: "덕소 헌정작",   tags: ["2016", "앨범"] },
-  { title: "돈 벌 시간 2",       desc: "성장 가속기",   tags: ["2016", "EP"] },
-  { title: "돈 벌 시간 3",       desc: "확장 전성기",   tags: ["2016", "EP"] },
-  { title: "돈 번 순간",         desc: "성공 자각",     tags: ["2017", "믹스테이프"] },
-  { title: "I Always",          desc: "청춘 OST",      tags: ["2017", "OST 싱글"] },
-  { title: "닿는 순간",         desc: "감성 전환기",   tags: ["2018", "EP"] },
-  { title: "BOY",               desc: "영원한 젊음",     tags: ["2018", "싱글"] },
-  { title: "돈 Touch My Phone",           desc: "들으싈? 빠끄",   tags: ["2019", "공동 싱글"] },
-  { title: "Boyhood",           desc: "첫 정규 서사",     tags: ["2019", "정규 1집"] },
-  { title: "PAY DAY",           desc: "월.급.날.",     tags: ["2020", "공동 싱글"] },
-  { title: "BIPOLAR",         desc: "양가 감정",     tags: ["2020", "EP"] },
-  { title: "광장동에서",         desc: "20대 회고",       tags: ["2020", "싱글"] },
-  { title: "UNDERGROUND ROCKSTAR", desc: "락스타 자전", tags: ["2021", "정규 2집"] },
-  { title: "Wonderful Days",    desc: "오랜 기다림",     tags: ["2024", "EP"] },
-  { title: "Op.1",              desc: "모리엔트 서막", tags: ["2025", "싱글"] },
-  { title: "Op.2",              desc: "다음 장의 문",   tags: ["2025", "싱글"] },
-];
-
-let albumInited=false;
-let albumCards=[];      // DOM 카드 배열
-let deckTopIdx=0;       // 현재 덱 맨 위 카드 인덱스
-let selectedIdx=-1;     // 클릭으로 선택된 카드 인덱스
-let deckAnimating=false;
-
-// 덱에서 보여줄 최대 카드 장수 (겹쳐 보이는 층)
-const DECK_VISIBLE = 5;
-
-// 각 레이어의 변환 값 (맨 위=0, 아래로 갈수록 index++)
-function getDeckTransform(layerIdx, total, isSelected) {
-  if (isSelected) {
-    return {
-      translateX: -30,  // 왼쪽으로 살짝 튀어나옴
-      translateY: -14,
-      translateZ: 60,
-      rotateY: 6,
-      rotateZ: 0,
-      scale: 1.06,
-      opacity: 1,
-    };
-  }
-  const spread = 6;       // 카드간 X 오프셋(px)
-  const stackY = 5;       // 카드간 Y 오프셋(px)
-  const rotZ = [-1.2, 0.6, -0.4, 0.9, -0.3]; // 각 층 기울기
-  const zStep = -8;
   return {
-    translateX: layerIdx * spread,
-    translateY: layerIdx * stackY,
-    translateZ: layerIdx * zStep,
-    rotateY: 0,
-    rotateZ: (rotZ[layerIdx] || 0),
-    scale: 1 - layerIdx * 0.015,
-    opacity: 1 - layerIdx * 0.10,
+    kind: 'particles',
+    memoIds: [memo.id],
+    tone,
+    points,
+    geometry,
+    material,
+    basePositions,
+    velocity,
+    seeds,
   };
 }
 
-function applyDeckTransform(cardEl, layerIdx, total, isSelected, animate=true) {
-  const t = getDeckTransform(layerIdx, total, isSelected);
-  const tf = [
-    `translateX(${t.translateX}px)`,
-    `translateY(${t.translateY}px)`,
-    `translateZ(${t.translateZ}px)`,
-    `rotateY(${t.rotateY}deg)`,
-    `rotateZ(${t.rotateZ}deg)`,
-    `scale(${t.scale})`,
-  ].join(' ');
-  cardEl.style.transform = tf;
-  cardEl.style.opacity = t.opacity;
-  cardEl.style.zIndex = total - layerIdx + (isSelected ? 20 : 0);
-  if (!animate) {
-    cardEl.style.transition = 'none';
+function updateParticleVisual(visual, delta, now) {
+  const memo = STATE.memos.find((item) => item.id === visual.memoIds[0]);
+  if (!memo) return true;
+
+  const ageMs = now - new Date(memo.createdAt).getTime();
+  const duration = getEmotionAnimationDuration(memo);
+  const progress = clamp(ageMs / duration, 0, 1);
+  const positions = visual.geometry.attributes.position.array;
+
+  for (let i = 0; i < visual.seeds.length; i += 1) {
+    const stride = i * 3;
+    const seed = visual.seeds[i];
+
+    if (visual.tone === 'good') {
+      positions[stride] = visual.basePositions[stride] + Math.sin(now * 0.0013 + seed) * 0.04;
+      positions[stride + 1] = visual.basePositions[stride + 1] + Math.cos(now * 0.0011 + seed) * 0.06;
+      positions[stride + 2] = visual.basePositions[stride + 2] + Math.sin(now * 0.0012 + seed * 0.7) * 0.04;
+    } else {
+      positions[stride] += visual.velocity[stride] * delta * 9;
+      positions[stride + 1] += visual.velocity[stride + 1] * delta * 9;
+      positions[stride + 2] += visual.velocity[stride + 2] * delta * 9;
+    }
+  }
+
+  visual.geometry.attributes.position.needsUpdate = true;
+
+  if (visual.tone === 'good') {
+    visual.material.opacity = 0.9 * (1 - Math.max(0, progress - 0.72) / 0.28);
   } else {
-    cardEl.style.transition =
-      'transform 0.48s cubic-bezier(0.22,1,0.36,1), box-shadow 0.35s ease, filter 0.35s ease, opacity 0.35s ease';
+    visual.material.opacity = 0.78 * (1 - progress);
   }
-}
 
-function showDeckDetail(idx) {
-  const det = document.getElementById("album-detail");
-  if (!det) return;
-  const data = ALBUM_DATA[idx];
-  det.querySelector(".ad-index").textContent = `${String(idx+1).padStart(2,"0")} — ${ALBUM_DATA.length}`;
-  det.querySelector(".ad-title").textContent = data.title;
-  det.querySelector(".ad-desc").textContent = data.desc;
-  det.querySelector(".ad-tags").innerHTML = data.tags.map(t=>`<span class="ad-tag">${t}</span>`).join("");
-  det.classList.add("visible");
-}
+  if (progress >= 1) {
+    STATE.scene.remove(visual.points);
+    visual.geometry.dispose();
+    visual.material.dispose();
 
-function hideDeckDetail() {
-  const det = document.getElementById("album-detail");
-  if (det) det.classList.remove("visible");
-}
+    const handledIncrementally = createAndAttachEmotionRewardVisual(memo, memo.id);
+    if (!handledIncrementally) {
+      STATE.pendingVisualRebuild = true;
+    } else {
+      updateCounts();
+      STATE.lastVisualSignature = buildVisualSignature();
+    }
 
-function updateDeckCounterDots() {
-  const counter = document.getElementById("album-deck-counter");
-  if (!counter) return;
-  counter.innerHTML = "";
-  const total = ALBUM_DATA.length;
-  const maxDots = 7;
-  const step = Math.max(1, Math.floor(total / maxDots));
-  for (let i = 0; i < total; i += step) {
-    const dot = document.createElement("span");
-    dot.className = "adc-dot" + (i === deckTopIdx ? " active" : "");
-    counter.appendChild(dot);
+    return false;
   }
+
+  return true;
 }
 
-function layoutDeck(skipAnim=false) {
-  const total = ALBUM_DATA.length;
-  albumCards.forEach((card, dataIdx) => {
-    // layerIdx: 덱 순서상 몇 번째 층인가 (deckTopIdx 기준)
-    const layerIdx = (dataIdx - deckTopIdx + total) % total;
-    const visible = layerIdx < DECK_VISIBLE;
-    card.style.display = visible ? "block" : "none";
-    const isSel = (dataIdx === selectedIdx);
-    if (visible) applyDeckTransform(card, layerIdx, DECK_VISIBLE, isSel, !skipAnim);
-    card.classList.toggle("is-selected", isSel);
+function disposeVisuals() {
+  hideMemoHover();
+
+  STATE.visuals.forEach((visual) => {
+    if (visual.kind === 'particles') {
+      STATE.scene.remove(visual.points);
+      visual.geometry.dispose();
+      visual.material.dispose();
+      return;
+    }
+
+    if (visual.hoverProxy) {
+      STATE.scene.remove(visual.hoverProxy);
+      visual.hoverProxy.geometry?.dispose?.();
+      visual.hoverProxy.material?.dispose?.();
+    }
+
+    STATE.scene.remove(visual.object);
+    if (visual.mixer) {
+      STATE.mixers = STATE.mixers.filter((mixer) => mixer !== visual.mixer);
+    }
   });
-  updateDeckCounterDots();
+
+  STATE.visuals = [];
+  STATE.mixers = [];
 }
 
-function selectDeckCard(idx) {
-  if (deckAnimating) return;
+function disposeSingleVisual(visual) {
+  if (!visual) return;
 
-  if (selectedIdx === idx) {
-    // 이미 선택된 카드 재클릭 → 선택 해제 + 덱 다음 카드로 전진
-    selectedIdx = -1;
-    deckAnimating = true;
-    const total = ALBUM_DATA.length;
-    deckTopIdx = (deckTopIdx + 1) % total;
-    layoutDeck();
-    showDeckDetail(deckTopIdx); // 다음 카드 정보 바로 표시
-    setTimeout(() => { deckAnimating = false; }, 700);
-  } else {
-    deckTopIdx = idx;
-    selectedIdx = idx;
-    layoutDeck();
-    showDeckDetail(idx);
+  if (visual.kind === 'particles') {
+    STATE.scene.remove(visual.points);
+    visual.geometry?.dispose?.();
+    visual.material?.dispose?.();
+    return;
+  }
+
+  if (visual.hoverProxy) {
+    STATE.scene.remove(visual.hoverProxy);
+    visual.hoverProxy.geometry?.dispose?.();
+    visual.hoverProxy.material?.dispose?.();
+  }
+
+  STATE.scene.remove(visual.object);
+  if (visual.mixer) {
+    STATE.mixers = STATE.mixers.filter((mixer) => mixer !== visual.mixer);
   }
 }
 
-function deckHoverEnter(card, idx) {
-  if (selectedIdx !== -1) return; // 선택 중엔 hover 무시
-  const total = ALBUM_DATA.length;
-  const layerIdx = (idx - deckTopIdx + total) % total;
-  if (layerIdx >= DECK_VISIBLE) return;
-  // 살짝 들리는 효과
-  const t = getDeckTransform(layerIdx, DECK_VISIBLE, false);
-  card.style.transform = [
-    `translateX(${t.translateX - 4}px)`,
-    `translateY(${t.translateY - 6}px)`,
-    `translateZ(${t.translateZ + 12}px)`,
-    `rotateZ(${t.rotateZ * 0.6}deg)`,
-    `scale(${t.scale + 0.015})`,
-  ].join(' ');
+function removeVisualsForMemoId(memoId) {
+  hideMemoHover();
+  let removed = 0;
+
+  STATE.visuals = STATE.visuals.filter((visual) => {
+    const memoIds = Array.isArray(visual?.memoIds) ? visual.memoIds : [];
+    if (!memoIds.includes(memoId)) return true;
+    disposeSingleVisual(visual);
+    removed += 1;
+    return false;
+  });
+
+  return removed;
 }
 
-function deckHoverLeave(card, idx) {
-  if (selectedIdx !== -1) return;
-  const total = ALBUM_DATA.length;
-  const layerIdx = (idx - deckTopIdx + total) % total;
-  if (layerIdx >= DECK_VISIBLE) return;
-  applyDeckTransform(card, layerIdx, DECK_VISIBLE, false, true);
+function partitionActiveMemosForLayout(now = Date.now()) {
+  const clutterFresh = [];
+  const clutterOld = [];
+  const records = [];
+  const routines = [];
+  const snacks = [];
+  const emotions = [];
+
+  STATE.memos
+    .filter((memo) => !memo.clearedAt)
+    .slice()
+    .sort((a, b) => new Date(a.createdAt) - new Date(b.createdAt))
+    .forEach((memo) => {
+      const ageDays = getAgeDays(memo.createdAt, now);
+
+      if (memo.category === 'clutter') {
+        if (ageDays >= CLUTTER_MERGE_DAYS) clutterOld.push(memo);
+        else clutterFresh.push(memo);
+        return;
+      }
+
+      if (memo.category === 'record') {
+        records.push(memo);
+        return;
+      }
+
+      if (memo.category === 'routine') {
+        routines.push(memo);
+        return;
+      }
+
+      if (memo.category === 'snack') {
+        snacks.push(memo);
+        return;
+      }
+
+      if (memo.category === 'emotion') {
+        emotions.push(memo);
+      }
+    });
+
+  return { clutterFresh, clutterOld, records, routines, snacks, emotions };
 }
 
-// 마우스 이동으로 맨 위 카드 3D tilt
-function deckMouseMove(e) {
-  if (deckAnimating) return;
-  const stage = document.getElementById("album-deck-stage");
-  if (!stage) return;
-  const rect = stage.getBoundingClientRect();
-  const cx = rect.left + rect.width / 2;
-  const cy = rect.top + rect.height / 2;
-  const dx = (e.clientX - cx) / (rect.width / 2);   // -1 ~ 1
-  const dy = (e.clientY - cy) / (rect.height / 2);  // -1 ~ 1
+function buildOccupiedLayoutContextForCurrentMemos(now = Date.now()) {
+  const partitioned = partitionActiveMemosForLayout(now);
+  const occupied = {
+    desk: [],
+    chair: [],
+    clutter: [],
+    clothes: [],
+    snack: [],
+    recordFloor: [],
+    deskInteractive: [],
+    chairInteractive: [],
+    floorInteractive: [],
+  };
 
-  const topCard = albumCards[deckTopIdx];
-  if (!topCard || selectedIdx === deckTopIdx) return;
-  const layerIdx = 0;
-  const t = getDeckTransform(layerIdx, DECK_VISIBLE, false);
-  topCard.style.transform = [
-    `translateX(${t.translateX + dx * 6}px)`,
-    `translateY(${t.translateY + dy * 4}px)`,
-    `translateZ(${t.translateZ + 8}px)`,
-    `rotateY(${dx * 8}deg)`,
-    `rotateX(${-dy * 6}deg)`,
-    `rotateZ(${t.rotateZ}deg)`,
-    `scale(${t.scale})`,
-  ].join(' ');
-  topCard.style.transition = 'transform 0.12s ease-out';
+  const activeLayoutKeys = buildActiveLayoutKeys(partitioned);
+  reservePlacementCaches(activeLayoutKeys, occupied);
+
+  return {
+    ...partitioned,
+    occupied,
+    deskNoteSlots: getDeskNoteSlots(),
+    deskScribbleSlots: getDeskScribbleSlots(),
+    chairOverflowSlots: getChairOverflowSlots(),
+    recordFloorSlots: getRecordFloorSlots(),
+    deskNoteCount: partitioned.records.reduce((count, memo) => {
+      const cache = getLayoutCacheEntry(getRecordLayoutKey(memo));
+      return count + (cache?.placement === 'desk' && cache?.assetKey !== 'scribble' ? 1 : 0);
+    }, 0),
+    deskScribbleCount: partitioned.records.reduce((count, memo) => {
+      const cache = getLayoutCacheEntry(getRecordLayoutKey(memo));
+      return count + (cache?.placement === 'desk' && cache?.assetKey === 'scribble' ? 1 : 0);
+    }, 0),
+  };
 }
 
-function deckMouseLeave() {
-  const topCard = albumCards[deckTopIdx];
-  if (!topCard || selectedIdx === deckTopIdx) return;
-  applyDeckTransform(topCard, 0, DECK_VISIBLE, false, true);
+function createAndAttachRecordVisual(memo, animateMemoId = null) {
+  if (!memo || memo.category !== 'record') return false;
+
+  const now = Date.now();
+  const context = buildOccupiedLayoutContextForCurrentMemos(now);
+  const index = context.records.findIndex((item) => item.id === memo.id);
+  if (index < 0) return false;
+
+  const layoutKey = getRecordLayoutKey(memo);
+  const cachedLayout = getLayoutCacheEntry(layoutKey);
+  const useScribble = cachedLayout ? cachedLayout.assetKey === 'scribble' : (getMemoStableHash(memo, 'record-variant') % 3 === 2);
+  const key = useScribble ? 'scribble' : 'note';
+  const instance = createAssetInstance(key);
+  const shouldPlayDropIntro = memo.id === animateMemoId && !cachedLayout;
+  let deskNoteCount = context.deskNoteCount;
+  let deskScribbleCount = context.deskScribbleCount;
+
+  if (cachedLayout) {
+    applyCachedTransform(instance.root, cachedLayout);
+
+    if (cachedLayout.placement === 'desk' || cachedLayout.placement === 'chair') {
+      applyObjectToPlacementSurface(instance.root, cachedLayout, cachedLayout.placement, key);
+    } else {
+      restObjectOnY(instance.root, 0.02);
+      if (key === 'scribble') liftDeskObject(instance.root, 'scribble');
+    }
+  } else if (useScribble) {
+    const surfacePlacement = pickDeskOrChairPlacement({
+      assetKey: 'scribble',
+      canUseDesk: deskScribbleCount < Math.min(1, context.deskScribbleSlots.length),
+      deskSlots: context.deskScribbleSlots,
+      chairSlots: context.chairOverflowSlots,
+      occupied: context.occupied,
+      deskMinDistance: 0.68,
+      chairMinDistance: 0.58,
+      seedOffset: getMemoStableSeedOffset(memo, 'seed-17', 9),
+    });
+
+    if (surfacePlacement) {
+      const { slot, placement, area } = surfacePlacement;
+      if (placement === 'desk') {
+        deskScribbleCount += 1;
+        context.occupied.desk.push({ x: slot.x, z: slot.z });
+      } else {
+        context.occupied.chair.push({ x: slot.x, z: slot.z });
+      }
+
+      instance.root.position.set(slot.x, 0, slot.z);
+      instance.root.rotation.y = slot.rotY || 0;
+      instance.root.rotation.z = slot.rotZ || 0;
+      applyObjectToPlacementSurface(instance.root, slot, placement, 'scribble');
+      syncLayoutCacheFromObject(layoutKey, instance.root, { area, placement, assetKey: 'scribble' });
+    } else {
+      const floorSlot = pickSlotFromPreferredSlots(RECORD_SECONDARY_SPREAD_SLOTS, context.recordFloorSlots, context.occupied.floorInteractive, 1.28, getMemoStableSeedOffset(memo, 'seed-21', 11));
+      context.occupied.recordFloor.push({ x: floorSlot.x, z: floorSlot.z });
+      instance.root.position.set(floorSlot.x, 0, floorSlot.z);
+      instance.root.rotation.y = floorSlot.rotY || 0;
+      instance.root.rotation.z = floorSlot.rotZ || 0;
+      restObjectOnY(instance.root, 0.02);
+      liftDeskObject(instance.root, 'scribble');
+      syncLayoutCacheFromObject(layoutKey, instance.root, { area: 'floorInteractive', placement: 'floor', assetKey: 'scribble' });
+    }
+  } else {
+    const surfacePlacement = pickDeskOrChairPlacement({
+      assetKey: 'note',
+      canUseDesk: deskNoteCount < Math.min(MAX_DESK_NOTE_COUNT, context.deskNoteSlots.length),
+      deskSlots: context.deskNoteSlots,
+      chairSlots: context.chairOverflowSlots,
+      occupied: context.occupied,
+      deskMinDistance: 0.76,
+      chairMinDistance: 0.64,
+      seedOffset: getMemoStableSeedOffset(memo, 'seed-19', 10),
+    });
+
+    if (surfacePlacement) {
+      const { slot, placement, area } = surfacePlacement;
+      if (placement === 'desk') {
+        deskNoteCount += 1;
+        context.occupied.desk.push({ x: slot.x, z: slot.z });
+      } else {
+        context.occupied.chair.push({ x: slot.x, z: slot.z });
+      }
+
+      instance.root.position.set(slot.x, 0, slot.z);
+      instance.root.rotation.y = slot.rotY || 0;
+      instance.root.rotation.z = slot.rotZ || 0;
+      applyObjectToPlacementSurface(instance.root, slot, placement, 'note');
+      syncLayoutCacheFromObject(layoutKey, instance.root, { area, placement, assetKey: 'note' });
+    } else {
+      const slot = pickSlot(context.recordFloorSlots, context.occupied.floorInteractive, 0.94, getMemoStableSeedOffset(memo, 'seed-19', 10));
+      context.occupied.recordFloor.push({ x: slot.x, z: slot.z });
+      instance.root.position.set(slot.x, 0, slot.z);
+      instance.root.rotation.y = slot.rotY || 0;
+      instance.root.rotation.z = slot.rotZ || 0;
+      restObjectOnY(instance.root, 0.02);
+      syncLayoutCacheFromObject(layoutKey, instance.root, { area: 'floorInteractive', placement: 'floor', assetKey: 'note' });
+    }
+  }
+
+  const resolvedRecordLayout = getLayoutCacheEntry(layoutKey);
+  const recordPlacement = resolvedRecordLayout?.placement || 'floor';
+  const settledY = instance.root.position.y;
+
+  if (recordPlacement === 'floor' && !cachedLayout) {
+    ensureObjectStartsVisible(instance.root, FLOOR_RECORD_CLUTTER_VISIBLE_ZONE, FLOOR_VISIBILITY_NUDGES, FLOOR_RECORD_CLUTTER_CAMERA_VISIBILITY_BOUNDS);
+  }
+
+  const finalRecordExtra = {
+    area: resolvedRecordLayout?.area || (recordPlacement === 'chair' ? 'chairInteractive' : recordPlacement === 'desk' ? 'deskInteractive' : 'floorInteractive'),
+    placement: recordPlacement,
+    assetKey: key,
+  };
+  syncLayoutCacheFromObject(layoutKey, instance.root, finalRecordExtra);
+  bindObjectLayoutCache(instance.root, layoutKey, finalRecordExtra);
+  tagMemoHoverTarget(instance.root, [memo.id]);
+  STATE.scene.add(instance.root);
+  const hoverProxy = createMemoHoverProxy(instance.root);
+
+  if (instance.mixer) {
+    STATE.mixers.push(instance.mixer);
+  }
+
+  if (instance.action && memo.id === animateMemoId) {
+    instance.action.reset();
+    instance.action.play();
+  }
+
+  STATE.visuals.push({
+    kind: 'asset',
+    memoIds: [memo.id],
+    object: instance.root,
+    mixer: instance.mixer,
+    hoverProxy,
+    dropIntro: buildSurfaceDropIntro(shouldPlayDropIntro, recordPlacement, settledY, now),
+  });
+
+  updateCounts();
+  STATE.lastVisualSignature = buildVisualSignature();
+  return true;
 }
 
-function buildAlbumCards(){
-  const stage = document.getElementById("album-deck-stage");
-  if (!stage) return;
-  stage.innerHTML = "";
-  albumCards = [];
 
-  ALBUM_DATA.forEach((data, i) => {
-    const card = document.createElement("div");
-    card.className = "album-card-deck";
-    card.dataset.idx = i;
+function createAndAttachClutterVisual(memo, animateMemoId = null) {
+  if (!memo || memo.category !== 'clutter') return false;
+  const now = Date.now();
+  if (getAgeDays(memo.createdAt, now) >= CLUTTER_MERGE_DAYS) return false;
 
-    // thumb
-    const thumb = document.createElement("div");
-    thumb.className = "acd-thumb";
-    const img = document.createElement("img");
-    img.src = `assets/c${i+1}.png`;
-    img.alt = data.title;
-    img.loading = "lazy";
-    img.onerror = () => {
-      thumb.style.background = `linear-gradient(135deg,
-        hsl(${260 + i*14},40%,14%) 0%,
-        hsl(${240 + i*10},30%,8%) 100%)`;
-    };
-    thumb.appendChild(img);
+  const context = buildOccupiedLayoutContextForCurrentMemos(now);
+  const index = context.clutterFresh.findIndex((item) => item.id === memo.id);
+  if (index < 0) return false;
 
-    // overlay
-    const overlay = document.createElement("div");
-    overlay.className = "acd-overlay";
+  const layoutKey = getClutterFreshLayoutKey(memo);
+  const cachedLayout = getLayoutCacheEntry(layoutKey);
+  const key = cachedLayout?.assetKey || (getMemoStableHash(memo, 'clutter-variant') % 2 === 0 ? 'paperSingle' : 'paperSingle2');
+  const instance = createAssetInstance(key);
+  const shouldPlayDropIntro = memo.id === animateMemoId;
 
-    // info
-    const info = document.createElement("div");
-    info.className = "acd-info";
-    info.innerHTML = `
-      <span class="acd-idx">${String(i+1).padStart(2,"0")}</span>
-      <span class="acd-title">${data.title}</span>
-      <span class="acd-tags">${data.tags.map(t=>`<span class="acd-tag">${t}</span>`).join("")}</span>
+  if (cachedLayout) {
+    applyCachedTransform(instance.root, cachedLayout);
+    if (cachedLayout.placement === 'desk' || cachedLayout.placement === 'chair') {
+      applyObjectToPlacementSurface(instance.root, cachedLayout, cachedLayout.placement, 'note');
+    } else {
+      restObjectOnY(instance.root, 0.02);
+    }
+  } else {
+    const deskOverflowPaperSlots = getDeskOverflowPaperSlots();
+    const useDeskOverflow = shouldUseDeskPaperOverflow(context.occupied, deskOverflowPaperSlots, 0.64);
+    const surfacePlacement = useDeskOverflow ? pickDeskOrChairPlacement({
+      assetKey: 'note',
+      canUseDesk: true,
+      deskSlots: deskOverflowPaperSlots,
+      chairSlots: context.chairOverflowSlots,
+      occupied: context.occupied,
+      deskMinDistance: 0.64,
+      chairMinDistance: 0.58,
+      seedOffset: getMemoStableSeedOffset(memo, 'seed-16', 8),
+    }) : null;
+    const slot = surfacePlacement
+      ? surfacePlacement.slot
+      : key === 'paperSingle2'
+        ? pickSlotFromPreferredSlots(CLUTTER_SECONDARY_SPREAD_SLOTS, CLUTTER_SLOTS, context.occupied.clutter, EMOTION_DECAY_FLOOR_MIN_DISTANCE, getMemoStableSeedOffset(memo, 'seed-16', 8))
+        : pickSlot(CLUTTER_SLOTS, context.occupied.clutter, EMOTION_FLOOR_MIN_DISTANCE, getMemoStableSeedOffset(memo, 'seed-16', 8));
+
+    instance.root.position.set(slot.x, 0, slot.z);
+    instance.root.rotation.y = slot.rotY || 0;
+    instance.root.rotation.z = slot.rotZ || 0;
+
+    if (surfacePlacement) {
+      if (surfacePlacement.placement === 'desk') context.occupied.desk.push({ x: slot.x, z: slot.z });
+      else context.occupied.chair.push({ x: slot.x, z: slot.z });
+      applyObjectToPlacementSurface(instance.root, slot, surfacePlacement.placement, 'note');
+      syncLayoutCacheFromObject(layoutKey, instance.root, { area: surfacePlacement.area, placement: surfacePlacement.placement, assetKey: key });
+    } else {
+      restObjectOnY(instance.root, 0.02);
+      syncLayoutCacheFromObject(layoutKey, instance.root, { area: 'clutter', placement: 'floor', assetKey: key });
+    }
+  }
+
+  const resolvedClutterLayout = getLayoutCacheEntry(layoutKey);
+  const clutterPlacement = resolvedClutterLayout?.placement || 'floor';
+  const clutterOnSurface = clutterPlacement === 'desk' || clutterPlacement === 'chair';
+  const settledY = instance.root.position.y;
+  const dropHeight = (!cachedLayout && !clutterOnSurface) ? getClutterDropHeightForSlot(resolvedClutterLayout) : 0;
+
+  if (shouldPlayDropIntro && !cachedLayout && !clutterOnSurface) {
+    instance.root.position.y = settledY + dropHeight;
+  }
+
+  if (!clutterOnSurface && !cachedLayout) {
+    ensureObjectStartsVisible(instance.root, FLOOR_RECORD_CLUTTER_VISIBLE_ZONE, FLOOR_VISIBILITY_NUDGES, FLOOR_RECORD_CLUTTER_CAMERA_VISIBILITY_BOUNDS);
+  }
+
+  const finalClutterExtra = clutterOnSurface
+    ? { area: resolvedClutterLayout?.area || 'deskInteractive', placement: clutterPlacement, assetKey: key }
+    : { area: 'clutter', placement: 'floor', assetKey: key };
+  syncLayoutCacheFromObject(layoutKey, instance.root, finalClutterExtra);
+  bindObjectLayoutCache(instance.root, layoutKey, finalClutterExtra);
+  tagMemoHoverTarget(instance.root, [memo.id]);
+  STATE.scene.add(instance.root);
+  const hoverProxy = createMemoHoverProxy(instance.root);
+
+  STATE.visuals.push({
+    kind: 'asset',
+    memoIds: [memo.id],
+    object: instance.root,
+    mixer: null,
+    hoverProxy,
+    dropIntro: clutterOnSurface
+      ? buildSurfaceDropIntro(shouldPlayDropIntro && !cachedLayout, clutterPlacement, settledY, now)
+      : shouldPlayDropIntro && !cachedLayout
+        ? { startedAt: now, duration: CLUTTER_DROP_MS, fromY: settledY + dropHeight, toY: settledY }
+        : null,
+  });
+
+  updateCounts();
+  STATE.lastVisualSignature = buildVisualSignature();
+  return true;
+}
+
+function createAndAttachRoutineVisual(memo, animateMemoId = null) {
+  if (!memo || memo.category !== 'routine') return false;
+  const now = Date.now();
+  const context = buildOccupiedLayoutContextForCurrentMemos(now);
+  const index = context.routines.findIndex((item) => item.id === memo.id);
+  if (index < 0) return false;
+
+  const layoutKey = getRoutineLayoutKey(memo);
+  const cachedLayout = getLayoutCacheEntry(layoutKey);
+  const oldEnough = getAgeDays(memo.createdAt, now) >= ROUTINE_SCATTER_DAYS;
+  const key = oldEnough ? 'clothesScattered' : 'clothesFolded';
+  const instance = createAssetInstance(key);
+  const shouldPlayDropIntro = memo.id === animateMemoId;
+
+  if (cachedLayout) {
+    applyCachedTransform(instance.root, cachedLayout);
+    restObjectOnY(instance.root, 0.02);
+  } else {
+    const slot = pickSlot(getRoutineFloorSlots(), context.occupied.clothes, 1.05, getMemoStableSeedOffset(memo, 'seed-22', 12));
+    instance.root.position.set(slot.x, 0, slot.z);
+    instance.root.rotation.y = slot.rotY || 0;
+    restObjectOnY(instance.root, 0.02);
+    syncLayoutCacheFromObject(layoutKey, instance.root, { area: 'clothes' });
+  }
+
+  const settledY = instance.root.position.y;
+  if (shouldPlayDropIntro && !cachedLayout) {
+    instance.root.position.y = settledY + ROUTINE_DROP_HEIGHT;
+  }
+
+  if (!cachedLayout) ensureObjectStartsVisible(instance.root);
+  const finalRoutineExtra = {
+    area: 'clothes',
+    placement: 'floor',
+    assetKey: key,
+  };
+  syncLayoutCacheFromObject(layoutKey, instance.root, finalRoutineExtra);
+  bindObjectLayoutCache(instance.root, layoutKey, finalRoutineExtra);
+  tagMemoHoverTarget(instance.root, [memo.id]);
+  STATE.scene.add(instance.root);
+  const hoverProxy = createMemoHoverProxy(instance.root);
+
+  STATE.visuals.push({
+    kind: 'asset',
+    memoIds: [memo.id],
+    object: instance.root,
+    mixer: null,
+    hoverProxy,
+    dropIntro: shouldPlayDropIntro && !cachedLayout
+      ? {
+          startedAt: now,
+          duration: ROUTINE_DROP_MS,
+          fromY: settledY + ROUTINE_DROP_HEIGHT,
+          toY: settledY,
+        }
+      : null,
+  });
+
+  updateCounts();
+  STATE.lastVisualSignature = buildVisualSignature();
+  return true;
+}
+
+function createAndAttachSnackVisual(memo, animateMemoId = null) {
+  if (!memo || memo.category !== 'snack') return false;
+  const now = Date.now();
+  const context = buildOccupiedLayoutContextForCurrentMemos(now);
+  const index = context.snacks.findIndex((item) => item.id === memo.id && !item.fromEmotion);
+  if (index < 0) return false;
+
+  const layoutKey = getSnackLayoutKey(memo);
+  const cachedLayout = getLayoutCacheEntry(layoutKey);
+  const deskTumblerSlots = getDeskTumblerSlots();
+  const maxDeskTumblerSlots = Math.min(MAX_DESK_TUMBLER_COUNT, deskTumblerSlots.length);
+  const usedDeskTumblerSlotIndices = new Set();
+
+  context.snacks.forEach((item) => {
+    if (!item || item.id === memo.id || item.fromEmotion) return;
+    const itemCache = getLayoutCacheEntry(getSnackLayoutKey(item));
+    if (itemCache?.placement !== 'desk') return;
+    if (!Number.isInteger(itemCache.slotIndex)) return;
+    if (itemCache.slotIndex < 0 || itemCache.slotIndex >= maxDeskTumblerSlots) return;
+    usedDeskTumblerSlotIndices.add(itemCache.slotIndex);
+  });
+
+  const hasValidCachedDeskSlotIndex = Number.isInteger(cachedLayout?.slotIndex)
+    && cachedLayout.slotIndex >= 0
+    && cachedLayout.slotIndex < maxDeskTumblerSlots
+    && !usedDeskTumblerSlotIndices.has(cachedLayout.slotIndex);
+  const usableCachedLayout = cachedLayout && cachedLayout.placement !== 'chair' ? cachedLayout : null;
+  const instance = createAssetInstance('tumbler');
+  const shouldPlayDropIntro = memo.id === animateMemoId && !(usableCachedLayout && usableCachedLayout.placement !== 'chair');
+
+  if (usableCachedLayout?.placement === 'desk' && hasValidCachedDeskSlotIndex) {
+    const slot = deskTumblerSlots[cachedLayout.slotIndex];
+    usedDeskTumblerSlotIndices.add(cachedLayout.slotIndex);
+    context.occupied.desk.push({ x: slot.x, z: slot.z });
+    applyObjectToPlacementSurface(instance.root, slot, 'desk', 'tumbler');
+    syncLayoutCacheFromObject(layoutKey, instance.root, {
+      area: 'deskInteractive',
+      placement: 'desk',
+      assetKey: 'tumbler',
+      slotIndex: cachedLayout.slotIndex,
+    });
+  } else {
+    const nextDeskSlotIndex = Array.from({ length: maxDeskTumblerSlots }, (_, slotIndex) => slotIndex)
+      .find((slotIndex) => !usedDeskTumblerSlotIndices.has(slotIndex));
+
+    if (Number.isInteger(nextDeskSlotIndex)) {
+      const slot = deskTumblerSlots[nextDeskSlotIndex];
+      usedDeskTumblerSlotIndices.add(nextDeskSlotIndex);
+      context.occupied.desk.push({ x: slot.x, z: slot.z });
+      applyObjectToPlacementSurface(instance.root, slot, 'desk', 'tumbler');
+      syncLayoutCacheFromObject(layoutKey, instance.root, {
+        area: 'deskInteractive',
+        placement: 'desk',
+        assetKey: 'tumbler',
+        slotIndex: nextDeskSlotIndex,
+      });
+    } else {
+      const rawSlot = pickSlotFromPreferredSlots(FLOOR_TUMBLER_PREFERRED_SLOTS, context.recordFloorSlots, context.occupied.floorInteractive, FLOOR_TUMBLER_MIN_DISTANCE, getMemoStableSeedOffset(memo, 'seed-23', 12));
+      const slot = getAdjustedFloorTumblerSlot(rawSlot);
+      instance.root.position.set(slot.x, 0, slot.z);
+      instance.root.rotation.y = slot.rotY || 0;
+      instance.root.rotation.z = slot.rotZ || 0;
+      restObjectOnY(instance.root, 0.02);
+      ensureObjectStartsVisible(instance.root, FLOOR_RECORD_CLUTTER_VISIBLE_ZONE, FLOOR_VISIBILITY_NUDGES, FLOOR_RECORD_CLUTTER_CAMERA_VISIBILITY_BOUNDS);
+      syncLayoutCacheFromObject(layoutKey, instance.root, {
+        area: 'floorInteractive',
+        placement: 'floor',
+        assetKey: 'tumbler',
+        slotIndex: null,
+      });
+    }
+  }
+
+  const resolvedSnackLayout = getLayoutCacheEntry(layoutKey);
+  const snackPlacement = resolvedSnackLayout?.placement || 'floor';
+  const settledY = instance.root.position.y;
+  const tumblerDropIntro = snackPlacement === 'floor'
+    ? (shouldPlayDropIntro
+        ? {
+            startedAt: now,
+            duration: FLOOR_TUMBLER_DROP_MS,
+            fromY: settledY + FLOOR_TUMBLER_DROP_HEIGHT,
+            toY: settledY,
+          }
+        : null)
+    : buildSurfaceDropIntro(shouldPlayDropIntro, snackPlacement, settledY, now);
+
+  if (snackPlacement === 'floor' && !usableCachedLayout) {
+    ensureObjectStartsVisible(instance.root, FLOOR_RECORD_CLUTTER_VISIBLE_ZONE, FLOOR_VISIBILITY_NUDGES, FLOOR_RECORD_CLUTTER_CAMERA_VISIBILITY_BOUNDS);
+  }
+
+  if (tumblerDropIntro) {
+    instance.root.position.y = tumblerDropIntro.fromY;
+  }
+
+  const finalSnackExtra = {
+    area: resolvedSnackLayout?.area || (snackPlacement === 'desk' ? 'deskInteractive' : 'floorInteractive'),
+    placement: snackPlacement,
+    assetKey: 'tumbler',
+    slotIndex: Number.isInteger(resolvedSnackLayout?.slotIndex) ? resolvedSnackLayout.slotIndex : null,
+  };
+  syncLayoutCacheFromObject(layoutKey, instance.root, finalSnackExtra);
+  bindObjectLayoutCache(instance.root, layoutKey, finalSnackExtra);
+  tagMemoHoverTarget(instance.root, [memo.id]);
+  STATE.scene.add(instance.root);
+  const hoverProxy = createMemoHoverProxy(instance.root);
+
+  STATE.visuals.push({
+    kind: 'asset',
+    memoIds: [memo.id],
+    object: instance.root,
+    mixer: null,
+    hoverProxy,
+    dropIntro: tumblerDropIntro,
+  });
+
+  updateCounts();
+  STATE.lastVisualSignature = buildVisualSignature();
+  return true;
+}
+
+function createAndAttachEmotionRewardVisual(memo, animateMemoId = null) {
+  if (!memo || memo.category !== 'emotion' || memo.clearedAt) return false;
+
+  const existingVisual = findVisualForMemoId(memo.id);
+  if (existingVisual && existingVisual.kind === 'asset') {
+    return true;
+  }
+
+  const now = Date.now();
+  const ageMs = now - new Date(memo.createdAt).getTime();
+  if (ageMs < getEmotionAnimationDuration(memo)) return false;
+
+  const layoutKey = getEmotionRewardLayoutKey(memo);
+  const cachedLayout = getLayoutCacheEntry(layoutKey);
+  const rewardKey = getEmotionRewardAssetKey(memo);
+  const instance = createAssetInstance(rewardKey);
+  const shouldPlayDropIntro = !STATE.playedEmotionRewardDropMemoIds.has(memo.id) && !cachedLayout;
+  const context = buildOccupiedLayoutContextForCurrentMemos(now);
+  const deskEmotionRewardSlots = getDeskEmotionRewardSlots();
+  const deskEmotionRewardLimit = Math.min(EMOTION_REWARD_DESK_LIMIT, deskEmotionRewardSlots.length);
+  const usedDeskRewardSlotIndices = new Set();
+  let deskEmotionRewardCount = 0;
+
+  context.snacks.forEach((item) => {
+    if (!item || !item.fromEmotion || item.id === memo.id) return;
+    const itemCache = getLayoutCacheEntry(getEmotionRewardLayoutKey(item));
+    if (itemCache?.placement !== 'desk') return;
+    if (!Number.isInteger(itemCache.slotIndex)) return;
+    if (itemCache.slotIndex < 0 || itemCache.slotIndex >= deskEmotionRewardLimit) return;
+    usedDeskRewardSlotIndices.add(itemCache.slotIndex);
+    deskEmotionRewardCount += 1;
+  });
+
+  if (cachedLayout) {
+    instance.root.position.set(cachedLayout.x, 0, cachedLayout.z);
+    instance.root.rotation.x = cachedLayout.rotX || 0;
+    instance.root.rotation.y = cachedLayout.rotY || 0;
+    instance.root.rotation.z = cachedLayout.rotZ || 0;
+
+    if (cachedLayout.placement === 'desk' || cachedLayout.placement === 'chair') {
+      applyObjectToPlacementSurface(instance.root, cachedLayout, cachedLayout.placement, rewardKey);
+    } else {
+      restObjectOnY(instance.root, 0.02);
+      ensureObjectStartsVisible(instance.root, FLOOR_RECORD_CLUTTER_VISIBLE_ZONE, FLOOR_VISIBILITY_NUDGES, FLOOR_RECORD_CLUTTER_CAMERA_VISIBILITY_BOUNDS);
+    }
+  } else {
+    const nextDeskSlotIndex = Array.from({ length: deskEmotionRewardLimit }, (_, slotIndex) => slotIndex)
+      .find((slotIndex) => !usedDeskRewardSlotIndices.has(slotIndex));
+
+    if (Number.isInteger(nextDeskSlotIndex)) {
+      const slot = deskEmotionRewardSlots[nextDeskSlotIndex];
+      applyObjectToPlacementSurface(instance.root, slot, 'desk', rewardKey);
+      syncLayoutCacheFromObject(layoutKey, instance.root, {
+        area: 'deskInteractive',
+        placement: 'desk',
+        assetKey: rewardKey,
+        slotIndex: nextDeskSlotIndex,
+      });
+    } else {
+      const slot = pickSlot(EMOTION_REWARD_SLOTS, context.occupied.floorInteractive, 2.18, context.snacks.length * 0.19);
+      instance.root.position.set(slot.x, 0, slot.z);
+      instance.root.rotation.x = slot.rotX || 0;
+      instance.root.rotation.y = slot.rotY || 0;
+      instance.root.rotation.z = slot.rotZ || 0;
+      restObjectOnY(instance.root, 0.02);
+      ensureObjectStartsVisible(instance.root, FLOOR_RECORD_CLUTTER_VISIBLE_ZONE, FLOOR_VISIBILITY_NUDGES, FLOOR_RECORD_CLUTTER_CAMERA_VISIBILITY_BOUNDS);
+      syncLayoutCacheFromObject(layoutKey, instance.root, {
+        area: 'floorInteractive',
+        placement: 'floor',
+        assetKey: rewardKey,
+        slotIndex: null,
+      });
+    }
+  }
+
+  const resolvedRewardLayout = getLayoutCacheEntry(layoutKey);
+  const rewardPlacement = resolvedRewardLayout?.placement || 'floor';
+  const settledY = instance.root.position.y;
+
+  if (shouldPlayDropIntro) {
+    instance.root.position.y = settledY + EMOTION_REWARD_DROP_HEIGHT;
+    STATE.playedEmotionRewardDropMemoIds.add(memo.id);
+  }
+
+  const finalRewardExtra = {
+    area: resolvedRewardLayout?.area || (rewardPlacement === 'desk' ? 'deskInteractive' : rewardPlacement === 'chair' ? 'chairInteractive' : 'floorInteractive'),
+    placement: rewardPlacement,
+    assetKey: rewardKey,
+    slotIndex: Number.isInteger(resolvedRewardLayout?.slotIndex) ? resolvedRewardLayout.slotIndex : null,
+  };
+  syncLayoutCacheFromObject(layoutKey, instance.root, finalRewardExtra);
+  bindObjectLayoutCache(instance.root, layoutKey, finalRewardExtra);
+  tagMemoHoverTarget(instance.root, [memo.id]);
+  STATE.scene.add(instance.root);
+  const hoverProxy = createMemoHoverProxy(instance.root);
+
+  if (instance.mixer) {
+    STATE.mixers.push(instance.mixer);
+  }
+
+  STATE.visuals.push({
+    kind: 'asset',
+    memoIds: [memo.id],
+    object: instance.root,
+    mixer: instance.mixer,
+    hoverProxy,
+    dropIntro: shouldPlayDropIntro
+      ? {
+          startedAt: now,
+          duration: EMOTION_REWARD_DROP_MS,
+          fromY: settledY + EMOTION_REWARD_DROP_HEIGHT,
+          toY: settledY,
+        }
+      : null,
+  });
+
+  updateCounts();
+  STATE.lastVisualSignature = buildVisualSignature();
+  return true;
+}
+
+function createAndAttachEmotionVisual(memo, animateMemoId = null) {
+  if (!memo || memo.category !== 'emotion' || memo.clearedAt) return false;
+
+  const now = Date.now();
+  const context = buildOccupiedLayoutContextForCurrentMemos(now);
+  const index = context.emotions.findIndex((item) => item.id === memo.id);
+  if (index < 0) return false;
+
+  const layoutKey = getEmotionLayoutKey(memo);
+  let cachedLayout = getLayoutCacheEntry(layoutKey);
+  const key = getEmotionDecayAssetKey(memo, now);
+  const instance = createAssetInstance(key);
+  const shouldPlayDropIntro = memo.id === animateMemoId;
+
+  if (cachedLayout?.placement === 'desk' && !isAllowedEmotionDeskLayout(cachedLayout)) {
+    delete STATE.layoutCache[layoutKey];
+    persistMemos();
+    cachedLayout = null;
+  }
+
+  if (cachedLayout) {
+    applyCachedTransform(instance.root, cachedLayout);
+
+    if (cachedLayout.placement === 'desk' || cachedLayout.placement === 'chair') {
+      applyObjectToPlacementSurface(instance.root, cachedLayout, cachedLayout.placement, key);
+    } else {
+      restObjectOnY(instance.root, 0.02);
+    }
+  } else {
+    const deskEmotionSlots = getDeskEmotionSlots();
+    const canUseDesk = deskEmotionSlots.length > 0 && context.occupied.desk.length < 1;
+    const surfacePlacement = canUseDesk ? pickDeskOrChairPlacement({
+      assetKey: 'note',
+      canUseDesk: true,
+      deskSlots: deskEmotionSlots,
+      chairSlots: [],
+      occupied: context.occupied,
+      deskMinDistance: 0.72,
+      chairMinDistance: 0.58,
+      seedOffset: getMemoStableSeedOffset(memo, 'seed-16', 8),
+    }) : null;
+    const slot = surfacePlacement
+      ? surfacePlacement.slot
+      : key === 'strawberry' || key === 'jar'
+        ? pickSlotFromPreferredSlots(CLUTTER_SECONDARY_SPREAD_SLOTS, CLUTTER_SLOTS, context.occupied.clutter, 0.98, getMemoStableSeedOffset(memo, 'seed-16', 8))
+        : pickSlot(CLUTTER_SLOTS, context.occupied.clutter, 0.56, getMemoStableSeedOffset(memo, 'seed-16', 8));
+
+    instance.root.position.set(slot.x, 0, slot.z);
+    instance.root.rotation.y = slot.rotY || 0;
+    instance.root.rotation.z = slot.rotZ || 0;
+
+    if (surfacePlacement) {
+      if (surfacePlacement.placement === 'desk') context.occupied.desk.push({ x: slot.x, z: slot.z });
+      else context.occupied.chair.push({ x: slot.x, z: slot.z });
+      applyObjectToPlacementSurface(instance.root, slot, surfacePlacement.placement, key);
+      syncLayoutCacheFromObject(layoutKey, instance.root, { area: surfacePlacement.area, placement: surfacePlacement.placement, assetKey: key });
+    } else {
+      restObjectOnY(instance.root, 0.02);
+      syncLayoutCacheFromObject(layoutKey, instance.root, { area: 'clutter', placement: 'floor', assetKey: key });
+    }
+  }
+
+  const resolvedEmotionLayout = getLayoutCacheEntry(layoutKey);
+  const emotionPlacement = resolvedEmotionLayout?.placement || 'floor';
+  const emotionOnSurface = emotionPlacement === 'desk' || emotionPlacement === 'chair';
+  const settledY = instance.root.position.y;
+  const dropHeight = (!cachedLayout && !emotionOnSurface) ? getClutterDropHeightForSlot(resolvedEmotionLayout) : 0;
+
+  if (shouldPlayDropIntro && !cachedLayout && !emotionOnSurface) {
+    instance.root.position.y = settledY + dropHeight;
+  }
+
+  if (!emotionOnSurface && !cachedLayout) {
+    ensureObjectStartsVisible(instance.root, FLOOR_RECORD_CLUTTER_VISIBLE_ZONE, FLOOR_VISIBILITY_NUDGES, FLOOR_RECORD_CLUTTER_CAMERA_VISIBILITY_BOUNDS);
+  }
+
+  const finalEmotionExtra = emotionOnSurface
+    ? { area: resolvedEmotionLayout?.area || 'deskInteractive', placement: emotionPlacement, assetKey: key }
+    : { area: 'clutter', placement: 'floor', assetKey: key };
+  syncLayoutCacheFromObject(layoutKey, instance.root, finalEmotionExtra);
+  bindObjectLayoutCache(instance.root, layoutKey, finalEmotionExtra);
+  tagMemoHoverTarget(instance.root, [memo.id]);
+  STATE.scene.add(instance.root);
+  const hoverProxy = createMemoHoverProxy(instance.root);
+
+  if (instance.mixer) {
+    STATE.mixers.push(instance.mixer);
+  }
+
+  STATE.visuals.push({
+    kind: 'asset',
+    memoIds: [memo.id],
+    object: instance.root,
+    mixer: instance.mixer,
+    hoverProxy,
+    dropIntro: emotionOnSurface
+      ? buildSurfaceDropIntro(shouldPlayDropIntro && !cachedLayout, emotionPlacement, settledY, now)
+      : shouldPlayDropIntro && !cachedLayout
+        ? { startedAt: now, duration: CLUTTER_DROP_MS, fromY: settledY + dropHeight, toY: settledY }
+        : null,
+  });
+
+  updateCounts();
+  STATE.lastVisualSignature = buildVisualSignature();
+  return true;
+}
+
+function createAndAttachVisualForMemo(memo, animateMemoId = null) {
+  if (!memo || memo.clearedAt) return false;
+  switch (memo.category) {
+    case 'record':
+      return createAndAttachRecordVisual(memo, animateMemoId);
+    case 'clutter':
+      return createAndAttachClutterVisual(memo, animateMemoId);
+    case 'routine':
+      return createAndAttachRoutineVisual(memo, animateMemoId);
+    case 'snack':
+      return createAndAttachSnackVisual(memo, animateMemoId);
+    case 'emotion':
+      return createAndAttachEmotionVisual(memo, animateMemoId);
+    default:
+      return false;
+  }
+}
+
+function findVisualForMemoId(memoId) {
+  return STATE.visuals.find((visual) => Array.isArray(visual?.memoIds) && visual.memoIds.includes(memoId)) || null;
+}
+
+function removeLayoutCacheForMemo(memo) {
+  if (!memo) return;
+
+  if (memo.category === 'record') {
+    delete STATE.layoutCache[getRecordLayoutKey(memo)];
+    return;
+  }
+
+  if (memo.category === 'clutter') {
+    if (getAgeDays(memo.createdAt, Date.now()) >= CLUTTER_MERGE_DAYS) {
+      delete STATE.layoutCache[getClutterOldSingleLayoutKey(memo)];
+    } else {
+      delete STATE.layoutCache[getClutterFreshLayoutKey(memo)];
+    }
+    return;
+  }
+
+  if (memo.category === 'routine') {
+    delete STATE.layoutCache[getRoutineLayoutKey(memo)];
+    return;
+  }
+
+  if (memo.category === 'snack') {
+    delete STATE.layoutCache[getSnackLayoutKey(memo)];
+    return;
+  }
+
+  if (memo.category === 'emotion') {
+    delete STATE.layoutCache[getEmotionLayoutKey(memo)];
+    delete STATE.layoutCache[getEmotionRewardLayoutKey(memo)];
+  }
+}
+
+function canRemoveMemoIncrementally(memo) {
+  if (!memo) return false;
+  const visual = findVisualForMemoId(memo.id);
+  if (!visual) return true;
+  return true;
+}
+
+function removeMemoVisualIncrementally(memo) {
+  if (!memo || !canRemoveMemoIncrementally(memo)) return false;
+
+  const visual = findVisualForMemoId(memo.id);
+  const isSharedClutterPile = memo.category === 'clutter'
+    && visual
+    && Array.isArray(visual.memoIds)
+    && visual.memoIds.length > 1;
+
+  if (isSharedClutterPile) {
+    visual.memoIds = visual.memoIds.filter((id) => id !== memo.id);
+    updateVisualMemoHoverBinding(visual);
+    updateCounts();
+    STATE.lastVisualSignature = buildVisualSignature();
+    return true;
+  }
+
+  removeLayoutCacheForMemo(memo);
+  removeVisualsForMemoId(memo.id);
+  updateCounts();
+  STATE.lastVisualSignature = buildVisualSignature();
+  return true;
+}
+
+function updateCounts() {
+  if (UI.memoCount) UI.memoCount.textContent = `${STATE.memos.length}`;
+  const activeVisualMemoIds = new Set();
+
+  STATE.visuals.forEach((visual) => {
+    visual.memoIds.forEach((id) => activeVisualMemoIds.add(id));
+  });
+
+  if (UI.activeVisualCount) UI.activeVisualCount.textContent = `${activeVisualMemoIds.size}`;
+}
+
+function renderHistory() {
+  UI.historyList.innerHTML = '';
+
+  if (!STATE.memos.length) {
+    const empty = document.createElement('div');
+    empty.className = 'empty-card';
+    empty.innerHTML = `<strong>비어 있음</strong>`;
+    UI.historyList.appendChild(empty);
+    updateCounts();
+    return;
+  }
+
+  STATE.memos.forEach((memo) => {
+    const card = document.createElement('article');
+    card.className = 'log-card';
+    card.dataset.category = memo.category;
+    if (memo.emotionTone) card.dataset.tone = memo.emotionTone;
+
+    const categoryLabel = CATEGORY_INFO[memo.category]?.label || memo.category;
+    const emotionLabel = memo.category === 'emotion' ? ` · ${memo.emotionTone}` : '';
+    const statusChip = memo.clearedAt
+      ? '<span class="log-chip log-chip-success">정리</span>'
+      : '<span class="log-chip log-chip-outline">활성</span>';
+
+    card.innerHTML = `
+      <div class="log-top">
+        <div class="log-title-wrap">
+          <strong class="log-title">${escapeHtml(categoryLabel + emotionLabel)}</strong>
+          <div class="log-chip-row">
+            ${statusChip}
+            <span class="log-chip">${escapeHtml(formatDate(memo.createdAt))}</span>
+          </div>
+        </div>
+      </div>
+      <p class="log-text">${escapeHtml(memo.transcript)}</p>
+      <div class="log-actions">
+        ${memo.clearedAt ? '' : `<button type="button" class="log-btn" data-clear-id="${memo.id}">정리</button>`}
+        <button type="button" class="log-btn danger" data-delete-id="${memo.id}">삭제</button>
+      </div>
     `;
 
-    card.appendChild(thumb);
-    card.appendChild(overlay);
-    card.appendChild(info);
+    UI.historyList.appendChild(card);
+  });
 
-    // events — hover로 detail 표시, click은 선택/해제
-    card.addEventListener("mouseenter", () => {
-      deckHoverEnter(card, i);
-      // hover된 카드가 보이는 층이면 detail 바로 표시
-      const total2 = ALBUM_DATA.length;
-      const li = (i - deckTopIdx + total2) % total2;
-      if (li < DECK_VISIBLE) showDeckDetail(i);
-    });
-    card.addEventListener("mouseleave", () => {
-      deckHoverLeave(card, i);
-      // 선택된 카드가 없으면 detail 숨김
-      if (selectedIdx === -1) hideDeckDetail();
-      else showDeckDetail(selectedIdx);
+  UI.historyList.querySelectorAll('[data-clear-id]').forEach((button) => {
+    button.addEventListener('click', () => clearMemo(button.dataset.clearId));
+  });
+
+  UI.historyList.querySelectorAll('[data-delete-id]').forEach((button) => {
+    button.addEventListener('click', () => deleteMemo(button.dataset.deleteId));
+  });
+
+  /* Export / Import buttons */
+  const backupWrap = document.createElement('div');
+  backupWrap.className = 'backup-actions';
+  backupWrap.innerHTML = `
+    <button type="button" class="log-btn backup-btn" id="export-btn">내보내기</button>
+    <button type="button" class="log-btn backup-btn" id="import-btn">가져오기</button>
+  `;
+  UI.historyList.appendChild(backupWrap);
+  document.getElementById('export-btn')?.addEventListener('click', exportMemosJSON);
+  document.getElementById('import-btn')?.addEventListener('click', importMemosJSON);
+
+  updateCounts();
+}
+
+function clearMemo(memoId) {
+  const memo = STATE.memos.find((item) => item.id === memoId);
+  if (!memo) return;
+
+  snapshotLiveVisualTransformsToLayoutCache();
+  memo.clearedAt = new Date().toISOString();
+  const handledIncrementally = removeMemoVisualIncrementally(memo);
+  persistStorage();
+  if (!handledIncrementally) {
+    rebuildVisuals();
+  }
+  renderHistory();
+  resetDeleteStreak();
+}
+
+function deleteMemo(memoId) {
+  const targetMemo = STATE.memos.find((item) => item.id === memoId);
+  if (!targetMemo) return;
+
+  snapshotLiveVisualTransformsToLayoutCache();
+  STATE.memos = STATE.memos.filter((item) => item.id !== memoId);
+  const handledIncrementally = removeMemoVisualIncrementally(targetMemo);
+
+  persistStorage();
+  hideMemoHover();
+  if (!handledIncrementally) {
+    rebuildVisuals();
+  }
+  renderHistory();
+  registerDeleteActionForEaster();
+}
+
+function describeVisualState(memo) {
+  if (memo.clearedAt) {
+    return `기록은 남아 있고 시각 상태는 정리됨 (${formatDate(memo.clearedAt)})`;
+  }
+
+  const ageDays = getAgeDays(memo.createdAt, Date.now());
+
+  if (memo.category === 'emotion') {
+    const key = getEmotionDecayAssetKey(memo);
+    if (key === 'jar') return '7일 이상 확인되지 않아 strawberry가 jar 상태로 바뀌어 보여';
+    if (key === 'burn') return '7일 이상 확인되지 않아 snack이 burn 상태로 바뀌어 보여';
+    return '감정 오브젝트가 방 안에 그대로 남아 있어';
+  }
+
+  if (memo.category === 'record') {
+    return '책상 위 note 또는 scribble note 오브젝트로 표시돼';
+  }
+
+  if (memo.category === 'clutter') {
+    return ageDays >= CLUTTER_MERGE_DAYS
+      ? '5일 이상 확인되지 않아 paper pile 상태로 합쳐져 보여'
+      : '바닥 종이 상태로 보이는 중이야';
+  }
+
+  if (memo.category === 'routine') {
+    return ageDays >= ROUTINE_SCATTER_DAYS
+      ? '3일 이상 확인되지 않아 흩어진 옷 상태로 바뀌어 보여'
+      : '정리된 옷 상태로 남아 있어';
+  }
+
+  if (memo.category === 'snack') {
+    return '다짐이 텀블러 오브젝트로 책상 위 또는 바닥에 놓여 있어';
+  }
+
+  return '시각 상태 없음';
+}
+
+function tagMemoHoverTarget(object, memoIds) {
+  object.userData.memoVisual = true;
+  object.userData.memoIds = [...memoIds];
+}
+
+function findMemoHoverRoot(object) {
+  if (object?.userData?.hoverOwner) return object.userData.hoverOwner;
+  let current = object;
+  while (current && current !== STATE.scene) {
+    if (current.userData?.memoVisual) return current;
+    current = current.parent;
+  }
+  return null;
+}
+
+function updateMemoHover() {
+  return;
+}
+
+function showMemoHover() {
+  return;
+}
+
+function hideMemoHover() {
+  STATE.hoveredRoot = null;
+  STATE.hoverDebouncePendingRoot = null;
+  if (STATE.hoverDebounceTimer) {
+    clearTimeout(STATE.hoverDebounceTimer);
+    STATE.hoverDebounceTimer = null;
+  }
+}
+
+function startLoop() {
+  const frame = () => {
+    const delta = Math.min(STATE.clock.getDelta(), 0.033);
+    const now = Date.now();
+
+    STATE.mixers.forEach((mixer) => mixer.update(delta));
+    updateCamera(delta);
+    updatePhysics(delta);
+
+    STATE.visuals = STATE.visuals.filter((visual) => {
+      if (visual.kind === 'particles') {
+        return updateParticleVisual(visual, delta, now);
+      }
+
+      if (visual.kind === 'asset' && visual.dropIntro) {
+        return updateAssetDropVisual(visual, now);
+      }
+
+      return true;
     });
 
-    card.addEventListener("click", () => {
-      const total2 = ALBUM_DATA.length;
-      const layerIdx = (i - deckTopIdx + total2) % total2;
-      if (layerIdx >= DECK_VISIBLE) return;
-      if (layerIdx > 0) {
-        // 뒤 카드 클릭 → 그 카드를 top으로 전진
-        deckTopIdx = i;
-        selectedIdx = -1;
-        layoutDeck();
-        showDeckDetail(i);
+    STATE.visuals.forEach((visual) => {
+      if (visual.kind !== 'asset' || !visual.hoverProxy || !visual.object) return;
+      syncHoverProxyBounds(visual.hoverProxy, visual.object);
+      /* Auto-init physics for newly created visuals */
+      if (!visual.phys) initVisualPhysics(visual);
+    });
+
+    if (STATE.pendingVisualRebuild) {
+      STATE.pendingVisualRebuild = false;
+      rebuildVisuals();
+      renderHistory();
+    }
+
+    STATE.visualCheckElapsed += delta * 1000;
+    if (STATE.visualCheckElapsed >= VISUAL_CHECK_MS) {
+      STATE.visualCheckElapsed = 0;
+      const nextSignature = buildVisualSignature();
+      if (nextSignature !== STATE.lastVisualSignature) {
+        rebuildVisuals();
+        renderHistory();
+      } else {
+        updateCounts();
+      }
+    }
+
+    STATE.renderer.render(STATE.scene, STATE.camera);
+    requestAnimationFrame(frame);
+  };
+
+  requestAnimationFrame(frame);
+}
+
+function buildVisualSignature() {
+  return STATE.memos
+    .map((memo) => {
+      if (memo.clearedAt) return `${memo.id}:cleared`;
+      const ageDays = getAgeDays(memo.createdAt, Date.now());
+
+      if (memo.category === 'emotion') {
+        return `${memo.id}:emotion-${getEmotionDecayAssetKey(memo, Date.now())}`;
+      }
+
+      if (memo.category === 'clutter') return `${memo.id}:clutter-${ageDays >= CLUTTER_MERGE_DAYS ? 'old' : 'fresh'}`;
+      if (memo.category === 'routine') return `${memo.id}:routine-${ageDays >= ROUTINE_SCATTER_DAYS ? 'scattered' : 'folded'}`;
+      return `${memo.id}:active`;
+    })
+    .join('|');
+}
+
+function updateCamera(delta) {
+  const isMobile = (window.innerWidth || 768) < 768;
+  if (isMobile) {
+    const baseX = -0.2;
+    const baseY = 7.6;
+    STATE.camera.position.x = THREE.MathUtils.lerp(STATE.camera.position.x, baseX + STATE.pointer.x * 0.1, delta * 1.2);
+    STATE.camera.position.y = THREE.MathUtils.lerp(STATE.camera.position.y, baseY + STATE.pointer.y * 0.05, delta * 1.2);
+    STATE.camera.lookAt(-0.2, 0.6, -2.2);
+  } else {
+    const targetX = -0.55 + STATE.pointer.x * 0.22;
+    const targetY = 5.1 + STATE.pointer.y * 0.12;
+    STATE.camera.position.x = THREE.MathUtils.lerp(STATE.camera.position.x, targetX, delta * 1.5);
+    STATE.camera.position.y = THREE.MathUtils.lerp(STATE.camera.position.y, targetY, delta * 1.5);
+    STATE.camera.lookAt(-0.55, 1.35, -2.35);
+  }
+}
+
+function onResize() {
+  if (!STATE.camera || !STATE.renderer) return;
+  const width = UI.sceneRoot.clientWidth || window.innerWidth;
+  const height = UI.sceneRoot.clientHeight || window.innerHeight;
+  const isMobile = width < 768;
+  STATE.camera.fov = isMobile ? 54 : 43;
+  STATE.camera.aspect = width / height;
+  STATE.camera.updateProjectionMatrix();
+  STATE.renderer.setSize(width, height);
+  if (isMobile) {
+    STATE.camera.position.set(-0.2, 7.6, 14.5);
+  }
+}
+
+function onPointerMove(event) {
+  if (!STATE.renderer) return;
+  const rect = STATE.renderer.domElement.getBoundingClientRect();
+  STATE.pointer.x = ((((event.clientX - rect.left) / rect.width) * 2) - 1) * 0.9;
+  STATE.pointer.y = ((-((event.clientY - rect.top) / rect.height) * 2) + 1) * 0.9;
+  STATE.pointerClient.x = event.clientX;
+  STATE.pointerClient.y = event.clientY;
+}
+
+function closeDetailPanel() {
+  return;
+}
+
+function getFloorOnlyScaleMultiplier(assetKey) {
+  return FLOOR_ONLY_SCALE_MULTIPLIERS[assetKey] || 1;
+}
+
+function applyFloorOnlyScaleIfNeeded(object, targetY) {
+  if (!object || targetY > 0.05) return;
+
+  const assetKey = object.userData?.assetKey;
+  if (!assetKey || assetKey === 'desk') return;
+
+  const scaleMultiplier = getFloorOnlyScaleMultiplier(assetKey);
+  if (!Number.isFinite(scaleMultiplier) || Math.abs(scaleMultiplier - 1) < 0.001) return;
+
+  const appliedMultiplier = Number.isFinite(object.userData?.floorScaleApplied)
+    ? object.userData.floorScaleApplied
+    : 1;
+
+  if (Math.abs(appliedMultiplier - scaleMultiplier) < 0.001) return;
+
+  if (appliedMultiplier !== 1) {
+    object.scale.multiplyScalar(1 / appliedMultiplier);
+  }
+
+  object.scale.multiplyScalar(scaleMultiplier);
+  object.userData.floorScaleApplied = scaleMultiplier;
+  object.updateMatrixWorld(true);
+}
+
+function restObjectOnY(object, targetY) {
+  applyFloorOnlyScaleIfNeeded(object, targetY);
+  object.updateMatrixWorld(true);
+  const box = new THREE.Box3().setFromObject(object);
+  if (!Number.isFinite(box.min.y)) return;
+  object.position.y += targetY - box.min.y;
+  object.updateMatrixWorld(true);
+}
+
+function liftDeskObject(object, key) {
+  const extraY = DESK_ASSET_Y_OFFSET[key] || 0;
+  if (!extraY) return;
+  object.position.y += extraY;
+  object.updateMatrixWorld(true);
+}
+
+function getEmotionAnimationDuration(memo) {
+  return memo?.emotionTone === 'good' ? POSITIVE_EMOTION_VISIBLE_MS : NEGATIVE_EMOTION_VISIBLE_MS;
+}
+
+function getAgeDays(isoString, nowMs = Date.now()) {
+  return (nowMs - new Date(isoString).getTime()) / (1000 * 60 * 60 * 24);
+}
+
+function setMicBadge(kind, text) {
+  UI.micBadge.className = `mic-badge ${kind}`;
+  UI.micBadge.textContent = text;
+}
+
+function sanitizeStoredMemo(item) {
+  if (!item || !item.id || !item.createdAt || !item.category) return null;
+
+  return {
+    id: item.id,
+    category: item.category,
+    emotionTone: item.emotionTone || null,
+    transcript: item.transcript || '',
+    createdAt: item.createdAt,
+    clearedAt: item.clearedAt || null,
+  };
+}
+
+function serializeLayoutCache() {
+  const next = {};
+
+  Object.entries(STATE.layoutCache || {}).forEach(([key, entry]) => {
+    if (!entry) return;
+    if (!Number.isFinite(entry.x) || !Number.isFinite(entry.z)) return;
+
+    const serializedEntry = {
+      x: entry.x,
+      z: entry.z,
+      rotX: Number.isFinite(entry.rotX) ? entry.rotX : 0,
+      rotY: Number.isFinite(entry.rotY) ? entry.rotY : 0,
+      rotZ: Number.isFinite(entry.rotZ) ? entry.rotZ : 0,
+      area: entry.area || null,
+      placement: entry.placement || null,
+      assetKey: entry.assetKey || null,
+      slotIndex: Number.isInteger(entry.slotIndex) ? entry.slotIndex : null,
+      transformLocked: entry.transformLocked !== false,
+      slotMigrationVersion: entry.slotMigrationVersion || LAYOUT_CACHE_SLOT_MIGRATION_VERSION,
+    };
+
+    next[key] = serializedEntry;
+  });
+
+  return next;
+}
+
+function shouldMigrateCachedNonDeskLayout(entry) {
+  if (!entry) return false;
+  if (entry.placement === 'desk' || entry.placement === 'chair') return false;
+  return entry.area === 'floorInteractive'
+    || entry.area === 'clutter'
+    || entry.area === 'clothes'
+    || entry.area === 'recordFloor';
+}
+
+function shouldTightenCachedRightSideRange(entry) {
+  return shouldMigrateCachedNonDeskLayout(entry)
+    && Number.isFinite(entry.x)
+    && entry.x >= RIGHT_SIDE_RANGE_TIGHTEN_START_X;
+}
+
+function shouldInsetCachedFloorTumblerRightSide(entry) {
+  return entry?.assetKey === 'tumbler'
+    && entry?.placement === 'floor'
+    && entry?.area === 'floorInteractive'
+    && Number.isFinite(entry.x)
+    && entry.x >= FLOOR_TUMBLER_RIGHT_INSET_MIN_X;
+}
+
+function pullValueTowardZero(value, amount) {
+  if (!Number.isFinite(value) || !Number.isFinite(amount) || amount <= 0) return value;
+  if (Math.abs(value) <= amount) return 0;
+  return value > 0 ? value - amount : value + amount;
+}
+
+function shouldCenterPullFloorTumbler(entry) {
+  return entry?.assetKey === 'tumbler'
+    && entry?.placement === 'floor'
+    && entry?.area === 'floorInteractive'
+    && Number.isFinite(entry.x);
+}
+
+function shouldInsetBottomRightFloorTumblerTarget(target) {
+  return Number.isFinite(target?.x)
+    && Number.isFinite(target?.z)
+    && target.x >= FLOOR_TUMBLER_BOTTOM_RIGHT_EXTRA_MIN_X
+    && target.z >= FLOOR_TUMBLER_BOTTOM_RIGHT_EXTRA_MIN_Z;
+}
+
+function shouldHardInsetFarRightFloorTumblerTarget(target) {
+  return Number.isFinite(target?.x)
+    && target.x >= FLOOR_TUMBLER_FAR_RIGHT_HARD_MIN_X;
+}
+
+function getAdjustedFloorTumblerSlot(slot) {
+  if (!slot) return slot;
+
+  const originalX = Number.isFinite(slot.x) ? slot.x : null;
+  const adjustedSlot = {
+    ...slot,
+    x: Number.isFinite(slot.x) ? pullValueTowardZero(slot.x, FLOOR_TUMBLER_CENTER_PULL_X) : slot.x,
+  };
+
+  if (Number.isFinite(originalX) && originalX >= FLOOR_TUMBLER_RIGHT_INSET_MIN_X) {
+    adjustedSlot.x += FLOOR_TUMBLER_RIGHT_INSET_X;
+  }
+
+  if (shouldInsetBottomRightFloorTumblerTarget(adjustedSlot)) {
+    adjustedSlot.x += FLOOR_TUMBLER_BOTTOM_RIGHT_EXTRA_INSET_X;
+  }
+
+  if (shouldHardInsetFarRightFloorTumblerTarget(adjustedSlot)) {
+    adjustedSlot.x += FLOOR_TUMBLER_FAR_RIGHT_HARD_INSET_X;
+  }
+
+  return adjustedSlot;
+}
+
+function migrateCachedLayoutEntry(entry) {
+  if (!entry || entry.slotMigrationVersion === LAYOUT_CACHE_SLOT_MIGRATION_VERSION) return entry;
+
+  const isFromPreviousSlotVersion = entry.slotMigrationVersion === PREVIOUS_LAYOUT_CACHE_SLOT_MIGRATION_VERSION;
+
+  if (!entry.slotMigrationVersion) {
+    if (shouldMigrateCachedNonDeskLayout(entry) && Number.isFinite(entry.x)) {
+      entry.x += NON_DESK_SLOT_BAKED_X_SHIFT;
+    }
+
+    if (shouldTightenCachedRightSideRange(entry)) {
+      entry.x += RIGHT_SIDE_RANGE_TIGHTEN_X;
+      if (entry.x >= RIGHT_SIDE_RANGE_TIGHTEN_EXTRA_START_X) {
+        entry.x += RIGHT_SIDE_RANGE_TIGHTEN_EXTRA_X;
+      }
+    }
+
+    if (shouldInsetCachedFloorTumblerRightSide(entry)) {
+      entry.x += FLOOR_TUMBLER_RIGHT_INSET_X;
+    }
+
+    if (shouldInsetBottomRightFloorTumblerTarget(entry)) {
+      entry.x += FLOOR_TUMBLER_BOTTOM_RIGHT_EXTRA_INSET_X;
+    }
+
+    if (shouldHardInsetFarRightFloorTumblerTarget(entry)) {
+      entry.x += FLOOR_TUMBLER_FAR_RIGHT_HARD_INSET_X;
+    }
+  }
+
+  if ((!entry.slotMigrationVersion || isFromPreviousSlotVersion) && shouldCenterPullFloorTumbler(entry)) {
+    entry.x = pullValueTowardZero(entry.x, FLOOR_TUMBLER_CENTER_PULL_X);
+  }
+
+  entry.slotMigrationVersion = LAYOUT_CACHE_SLOT_MIGRATION_VERSION;
+  return entry;
+}
+
+function hydrateLayoutCache(rawLayoutCache) {
+  const next = Object.create(null);
+  if (!rawLayoutCache || typeof rawLayoutCache !== 'object') return next;
+
+  Object.entries(rawLayoutCache).forEach(([key, entry]) => {
+    if (!entry || !Number.isFinite(entry.x) || !Number.isFinite(entry.z)) return;
+
+    const hydratedEntry = {
+      x: entry.x,
+      z: entry.z,
+      rotX: Number.isFinite(entry.rotX) ? entry.rotX : 0,
+      rotY: Number.isFinite(entry.rotY) ? entry.rotY : 0,
+      rotZ: Number.isFinite(entry.rotZ) ? entry.rotZ : 0,
+      area: entry.area || null,
+      placement: entry.placement || null,
+      assetKey: entry.assetKey || null,
+      slotIndex: Number.isInteger(entry.slotIndex) ? entry.slotIndex : null,
+      transformLocked: entry.transformLocked !== false,
+      slotMigrationVersion: entry.slotMigrationVersion || null,
+    };
+
+    migrateCachedLayoutEntry(hydratedEntry);
+
+    if (!('transformLocked' in hydratedEntry)) {
+      hydratedEntry.transformLocked = false;
+    }
+
+    next[key] = hydratedEntry;
+  });
+
+  return next;
+}
+
+/* ═══ IndexedDB Storage Layer ═══ */
+function openIDB() {
+  return new Promise((resolve, reject) => {
+    try {
+      const request = indexedDB.open(IDB_DB_NAME, IDB_DB_VERSION);
+      request.onupgradeneeded = (event) => {
+        const db = event.target.result;
+        if (!db.objectStoreNames.contains(IDB_STORE_NAME)) {
+          db.createObjectStore(IDB_STORE_NAME, { keyPath: 'key' });
+        }
+      };
+      request.onsuccess = () => { STATE.idbReady = true; STATE.idbDatabase = request.result; resolve(request.result); };
+      request.onerror = () => { console.warn('IndexedDB open failed'); resolve(null); };
+    } catch (e) { console.warn('IndexedDB unavailable'); resolve(null); }
+  });
+}
+
+function idbPut(db, key, value) {
+  return new Promise((resolve) => {
+    try {
+      const tx = db.transaction(IDB_STORE_NAME, 'readwrite');
+      tx.objectStore(IDB_STORE_NAME).put({ key, value });
+      tx.oncomplete = () => resolve(true);
+      tx.onerror = () => resolve(false);
+    } catch (e) { resolve(false); }
+  });
+}
+
+function idbGet(db, key) {
+  return new Promise((resolve) => {
+    try {
+      const tx = db.transaction(IDB_STORE_NAME, 'readonly');
+      const req = tx.objectStore(IDB_STORE_NAME).get(key);
+      req.onsuccess = () => resolve(req.result?.value ?? null);
+      req.onerror = () => resolve(null);
+    } catch (e) { resolve(null); }
+  });
+}
+
+/* ═══ Persist (IndexedDB primary, localStorage backup) ═══ */
+async function loadStorage() {
+  let raw = null;
+
+  /* Try IndexedDB first */
+  if (STATE.idbDatabase) {
+    try {
+      raw = await idbGet(STATE.idbDatabase, STORAGE_KEY);
+    } catch (e) { /* fall through */ }
+  }
+
+  /* Fallback to localStorage */
+  if (!raw) {
+    try { raw = localStorage.getItem(STORAGE_KEY); } catch (e) { /* ignore */ }
+  }
+
+  try {
+    const parsed = raw ? JSON.parse(raw) : [];
+
+    if (Array.isArray(parsed)) {
+      STATE.memos = parsed
+        .map((item) => sanitizeStoredMemo(item))
+        .filter(Boolean);
+      STATE.layoutCache = Object.create(null);
+      return;
+    }
+
+    const memoList = Array.isArray(parsed?.memos) ? parsed.memos : [];
+    STATE.memos = memoList
+      .map((item) => sanitizeStoredMemo(item))
+      .filter(Boolean);
+    STATE.layoutCache = hydrateLayoutCache(parsed?.layoutCache);
+  } catch (error) {
+    console.warn('Failed to load storage.', error);
+    STATE.memos = [];
+    STATE.layoutCache = Object.create(null);
+  }
+}
+
+/* ═══ JSON Export / Import ═══ */
+function exportMemosJSON() {
+  const payload = {
+    version: STORAGE_PAYLOAD_VERSION,
+    exportedAt: new Date().toISOString(),
+    memos: STATE.memos.filter(Boolean),
+    layoutCache: serializeLayoutCache(),
+  };
+  const blob = new Blob([JSON.stringify(payload, null, 2)], { type: 'application/json' });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url;
+  a.download = `mind-room-backup-${new Date().toISOString().slice(0, 10)}.json`;
+  document.body.appendChild(a);
+  a.click();
+  setTimeout(() => { document.body.removeChild(a); URL.revokeObjectURL(url); }, 200);
+}
+
+function importMemosJSON() {
+  const input = document.createElement('input');
+  input.type = 'file';
+  input.accept = '.json,application/json';
+  input.onchange = async (event) => {
+    const file = event.target.files?.[0];
+    if (!file) return;
+    try {
+      const text = await file.text();
+      const parsed = JSON.parse(text);
+      const memoList = Array.isArray(parsed?.memos) ? parsed.memos : Array.isArray(parsed) ? parsed : [];
+      const validMemos = memoList.map((item) => sanitizeStoredMemo(item)).filter(Boolean);
+      if (!validMemos.length) { alert('유효한 메모가 없습니다.'); return; }
+
+      const existingIds = new Set(STATE.memos.map((m) => m.id));
+      let addedCount = 0;
+      validMemos.forEach((memo) => {
+        if (!existingIds.has(memo.id)) {
+          STATE.memos.push(memo);
+          existingIds.add(memo.id);
+          addedCount += 1;
+        }
+      });
+
+      if (parsed?.layoutCache) {
+        const imported = hydrateLayoutCache(parsed.layoutCache);
+        Object.entries(imported).forEach(([key, val]) => {
+          if (!STATE.layoutCache[key]) STATE.layoutCache[key] = val;
+        });
+      }
+
+      persistStorage();
+      rebuildVisuals();
+      renderHistory();
+      alert(`${addedCount}개의 메모를 가져왔습니다.`);
+    } catch (e) {
+      console.error('Import failed', e);
+      alert('파일을 읽을 수 없습니다.');
+    }
+  };
+  input.click();
+}
+
+/* ═══ Device Orientation (Tilt) ═══ */
+function setupDeviceOrientation() {
+  const handleOrientation = (event) => {
+    const beta = event.beta ?? 0;   /* front-back tilt: -180..180 */
+    const gamma = event.gamma ?? 0; /* left-right tilt: -90..90 */
+    STATE.tilt.rawBeta = beta;
+    STATE.tilt.rawGamma = gamma;
+    STATE.tilt.active = true;
+  };
+
+  if (typeof DeviceOrientationEvent !== 'undefined' && typeof DeviceOrientationEvent.requestPermission === 'function') {
+    /* iOS 13+ */
+    document.addEventListener('click', function iosOrientationPermission() {
+      DeviceOrientationEvent.requestPermission().then((response) => {
+        if (response === 'granted') {
+          window.addEventListener('deviceorientation', handleOrientation, { passive: true });
+        }
+      }).catch(() => {});
+      document.removeEventListener('click', iosOrientationPermission);
+    }, { once: true });
+  } else {
+    window.addEventListener('deviceorientation', handleOrientation, { passive: true });
+  }
+}
+
+function updateTiltSmoothing() {
+  if (!STATE.tilt.active) return;
+  /* Normalize beta(front-back) → Z force, gamma(left-right) → X force */
+  /* Use symmetric gamma mapping for balanced left-right movement */
+  const rawGamma = STATE.tilt.rawGamma;
+  const targetX = clamp(rawGamma / 30, -1, 1) * PHYSICS_TILT_FORCE;
+  const targetZ = clamp((STATE.tilt.rawBeta - 45) / 30, -1, 1) * PHYSICS_TILT_FORCE;
+  STATE.tilt.x += (targetX - STATE.tilt.x) * PHYSICS_TILT_SMOOTHING;
+  STATE.tilt.z += (targetZ - STATE.tilt.z) * PHYSICS_TILT_SMOOTHING;
+}
+
+/* ═══ Physics System ═══ */
+function isRecentPhysicsLockedMemo(memo) {
+  if (!memo?.createdAt) return false;
+  const ageMs = Date.now() - new Date(memo.createdAt).getTime();
+  const ageHours = ageMs / (1000 * 60 * 60);
+  return ageHours < PHYSICS_AGE_RECENT_HOURS;
+}
+
+function getPhysicsFriction(memo) {
+  if (!memo) return PHYSICS_FRICTION_MID;
+  const ageMs = Date.now() - new Date(memo.createdAt).getTime();
+  const ageHours = ageMs / (1000 * 60 * 60);
+  if (ageHours < PHYSICS_AGE_RECENT_HOURS) return PHYSICS_FRICTION_RECENT;
+  const ageDays = ageHours / 24;
+  if (ageDays >= PHYSICS_AGE_OLD_DAYS) return PHYSICS_FRICTION_OLD;
+  const t = (ageDays - (PHYSICS_AGE_RECENT_HOURS / 24)) / (PHYSICS_AGE_OLD_DAYS - (PHYSICS_AGE_RECENT_HOURS / 24));
+  return THREE.MathUtils.lerp(PHYSICS_FRICTION_RECENT, PHYSICS_FRICTION_OLD, clamp(t, 0, 1));
+}
+
+function initVisualPhysics(visual) {
+  if (!visual || visual.kind !== 'asset') return;
+  const memo = visual.memoIds?.length ? STATE.memos.find((m) => m.id === visual.memoIds[0]) : null;
+  visual.phys = {
+    vx: 0,
+    vz: 0,
+    friction: getPhysicsFriction(memo),
+    restX: visual.object?.position.x ?? 0,
+    restZ: visual.object?.position.z ?? 0,
+    settled: true,
+    onDesk: visual.object?.position.y > 0.5,
+  };
+}
+
+function updatePhysics(delta) {
+  if (!STATE.physicsEnabled) return;
+  updateTiltSmoothing();
+
+  const forceX = STATE.tilt.x;
+  const forceZ = STATE.tilt.z;
+  const hasForce = Math.abs(forceX) > 0.0003 || Math.abs(forceZ) > 0.0003;
+
+  /* ── Pre-compute separation forces between all active (non-locked) GLBs ── */
+  const activeVisuals = [];
+  STATE.visuals.forEach((visual) => {
+    if (visual.kind !== 'asset' || !visual.object || !visual.phys) return;
+    if (visual === STATE.grabbedVisual) return;
+    if (visual.dropIntro) return;
+    const memo = visual.memoIds?.length ? STATE.memos.find((m) => m.id === visual.memoIds[0]) : null;
+    if (isRecentPhysicsLockedMemo(memo)) return;
+    activeVisuals.push(visual);
+  });
+
+  /* Accumulate separation impulses */
+  const sepImpulses = new Map();
+  for (let i = 0; i < activeVisuals.length; i++) {
+    const a = activeVisuals[i];
+    if (!sepImpulses.has(a)) sepImpulses.set(a, { x: 0, z: 0 });
+    for (let j = i + 1; j < activeVisuals.length; j++) {
+      const b = activeVisuals[j];
+      if (!sepImpulses.has(b)) sepImpulses.set(b, { x: 0, z: 0 });
+      const dx = a.object.position.x - b.object.position.x;
+      const dz = a.object.position.z - b.object.position.z;
+      const dist = Math.sqrt(dx * dx + dz * dz);
+      if (dist < PHYSICS_SEPARATION_RADIUS && dist > 0.001) {
+        const overlap = (PHYSICS_SEPARATION_RADIUS - dist) / PHYSICS_SEPARATION_RADIUS;
+        const strength = overlap * overlap * PHYSICS_SEPARATION_FORCE;
+        const nx = dx / dist;
+        const nz = dz / dist;
+        const impA = sepImpulses.get(a);
+        const impB = sepImpulses.get(b);
+        impA.x += nx * strength;
+        impA.z += nz * strength;
+        impB.x -= nx * strength;
+        impB.z -= nz * strength;
+      }
+    }
+  }
+
+  STATE.visuals.forEach((visual) => {
+    if (visual.kind !== 'asset' || !visual.object || !visual.phys) return;
+    if (visual === STATE.grabbedVisual) return;
+    if (visual.dropIntro) return;
+
+    const p = visual.phys;
+    const memo = visual.memoIds?.length ? STATE.memos.find((m) => m.id === visual.memoIds[0]) : null;
+    p.friction = getPhysicsFriction(memo);
+
+    if (isRecentPhysicsLockedMemo(memo)) {
+      p.vx = 0;
+      p.vz = 0;
+      p.settled = true;
+      visual.object.position.x = p.restX;
+      visual.object.position.z = p.restZ;
+      visual.object.updateMatrixWorld(true);
+      return;
+    }
+
+    /* Desk items don't respond to tilt as much */
+    const tiltScale = p.onDesk ? 0.15 : 1.0;
+
+    if (hasForce) {
+      p.vx += forceX * (1 - p.friction) * 3.0 * tiltScale;
+      p.vz += forceZ * (1 - p.friction) * 3.0 * tiltScale;
+      p.settled = false;
+    }
+
+    /* Apply separation impulse */
+    const sep = sepImpulses.get(visual);
+    if (sep && (Math.abs(sep.x) > 0.0001 || Math.abs(sep.z) > 0.0001)) {
+      p.vx += sep.x;
+      p.vz += sep.z;
+      p.settled = false;
+    }
+
+    /* Apply friction */
+    p.vx *= p.friction;
+    p.vz *= p.friction;
+
+    /* Clamp max velocity */
+    const speed = Math.sqrt(p.vx * p.vx + p.vz * p.vz);
+    if (speed > PHYSICS_MAX_VELOCITY) {
+      const scale = PHYSICS_MAX_VELOCITY / speed;
+      p.vx *= scale;
+      p.vz *= scale;
+    }
+
+    /* If nearly stopped, settle */
+    if (speed < PHYSICS_REST_THRESHOLD && !hasForce) {
+      if (!p.settled) {
+        /* Gently return to rest position */
+        const dx = p.restX - visual.object.position.x;
+        const dz = p.restZ - visual.object.position.z;
+        const returnDist = Math.sqrt(dx * dx + dz * dz);
+        if (returnDist > 0.01) {
+          visual.object.position.x += dx * 0.03;
+          visual.object.position.z += dz * 0.03;
+        } else {
+          visual.object.position.x = p.restX;
+          visual.object.position.z = p.restZ;
+          p.settled = true;
+        }
+      }
+      p.vx = 0;
+      p.vz = 0;
+      return;
+    }
+
+    /* Apply velocity */
+    visual.object.position.x += p.vx;
+    visual.object.position.z += p.vz;
+
+    /* Room bounds with bounce */
+    const b = PHYSICS_ROOM_BOUNDS;
+    if (visual.object.position.x < b.minX) { visual.object.position.x = b.minX; p.vx *= -PHYSICS_BOUNCE_FACTOR; }
+    if (visual.object.position.x > b.maxX) { visual.object.position.x = b.maxX; p.vx *= -PHYSICS_BOUNCE_FACTOR; }
+    if (visual.object.position.z < b.minZ) { visual.object.position.z = b.minZ; p.vz *= -PHYSICS_BOUNCE_FACTOR; }
+    if (visual.object.position.z > b.maxZ) { visual.object.position.z = b.maxZ; p.vz *= -PHYSICS_BOUNCE_FACTOR; }
+
+    visual.object.updateMatrixWorld(true);
+  });
+}
+
+/* ═══ Long-Press / Drag / Throw Interaction ═══ */
+function setupInteraction() {
+  const canvas = STATE.renderer?.domElement;
+  if (!canvas) return;
+
+  const floorPlane = new THREE.Plane(new THREE.Vector3(0, 1, 0), 0);
+  const intersectPoint = new THREE.Vector3();
+  const pointerRay = new THREE.Raycaster();
+
+  function getNDC(clientX, clientY) {
+    const rect = canvas.getBoundingClientRect();
+    return new THREE.Vector2(
+      ((clientX - rect.left) / rect.width) * 2 - 1,
+      -((clientY - rect.top) / rect.height) * 2 + 1,
+    );
+  }
+
+  function findVisualFromIntersect(clientX, clientY) {
+    const ndc = getNDC(clientX, clientY);
+    pointerRay.setFromCamera(ndc, STATE.camera);
+
+    const meshes = [];
+    STATE.visuals.forEach((v) => {
+      if (v.kind !== 'asset' || !v.object) return;
+      if (v.hoverProxy) meshes.push(v.hoverProxy);
+      v.object.traverse((child) => { if (child.isMesh) meshes.push(child); });
+    });
+
+    const hits = pointerRay.intersectObjects(meshes, false);
+    if (!hits.length) return null;
+
+    for (const hit of hits) {
+      const root = findMemoHoverRoot(hit.object);
+      if (!root) continue;
+      const visual = STATE.visuals.find((v) => v.object === root || v.object === root.userData?.hoverOwner);
+      if (visual) return visual;
+      /* Try via hoverOwner */
+      if (root.userData?.hoverOwner) {
+        const ownerVisual = STATE.visuals.find((v) => v.object === root.userData.hoverOwner);
+        if (ownerVisual) return ownerVisual;
+      }
+    }
+    return null;
+  }
+
+  function getFloorPosition(clientX, clientY, yOverride) {
+    const ndc = getNDC(clientX, clientY);
+    pointerRay.setFromCamera(ndc, STATE.camera);
+    const plane = new THREE.Plane(new THREE.Vector3(0, 1, 0), -(yOverride ?? 0));
+    const pt = new THREE.Vector3();
+    pointerRay.ray.intersectPlane(plane, pt);
+    return pt;
+  }
+
+  function onPointerDown(event) {
+    if (event.button && event.button !== 0) return;
+    if (!UI.entryPanel.classList.contains('hidden') || !UI.historyPanel.classList.contains('hidden')) return;
+
+    const gs = {
+      startTime: Date.now(),
+      startX: event.clientX,
+      startY: event.clientY,
+      pointerId: event.pointerId,
+      isDragging: false,
+      velocityHistory: [],
+      lastX: event.clientX,
+      lastY: event.clientY,
+      lastTime: Date.now(),
+      liftY: 0.6,
+    };
+    STATE.grabState = gs;
+
+    /* Start long-press timer */
+    clearTimeout(STATE.longPressTimer);
+    STATE.longPressTimer = setTimeout(() => {
+      if (!STATE.grabState || STATE.grabState.pointerId !== gs.pointerId) return;
+      const visual = findVisualFromIntersect(gs.startX, gs.startY);
+      if (!visual || visual.kind !== 'asset' || !visual.object) { STATE.grabState = null; return; }
+
+      STATE.grabbedVisual = visual;
+      gs.isDragging = true;
+      gs.liftY = visual.object.position.y + 0.6;
+
+      /* Haptic feedback if available */
+      if (navigator.vibrate) navigator.vibrate(25);
+
+      canvas.style.cursor = 'grabbing';
+      canvas.setPointerCapture(gs.pointerId);
+    }, LONG_PRESS_MS);
+  }
+
+  function onPointerMove(event) {
+    if (!STATE.grabState) return;
+    const gs = STATE.grabState;
+
+    /* Check if finger moved too far before long-press triggers → cancel */
+    if (!gs.isDragging) {
+      const dx = event.clientX - gs.startX;
+      const dy = event.clientY - gs.startY;
+      if (Math.sqrt(dx * dx + dy * dy) > DRAG_DEAD_ZONE) {
+        clearTimeout(STATE.longPressTimer);
+        STATE.grabState = null;
         return;
       }
-      // 맨 위 카드 클릭 → 선택 토글
-      selectDeckCard(i);
-    });
+      return;
+    }
 
-    stage.appendChild(card);
-    albumCards.push(card);
+    /* Dragging */
+    const visual = STATE.grabbedVisual;
+    if (!visual || !visual.object) return;
+
+    const floorPos = getFloorPosition(event.clientX, event.clientY, gs.liftY);
+    if (floorPos) {
+      visual.object.position.x = clamp(floorPos.x, PHYSICS_ROOM_BOUNDS.minX, PHYSICS_ROOM_BOUNDS.maxX);
+      visual.object.position.z = clamp(floorPos.z, PHYSICS_ROOM_BOUNDS.minZ, PHYSICS_ROOM_BOUNDS.maxZ);
+      visual.object.position.y = gs.liftY;
+      visual.object.updateMatrixWorld(true);
+    }
+
+    /* Record velocity history */
+    const now = Date.now();
+    gs.velocityHistory.push({ x: event.clientX, y: event.clientY, t: now });
+    if (gs.velocityHistory.length > VELOCITY_HISTORY_SIZE) gs.velocityHistory.shift();
+    gs.lastX = event.clientX;
+    gs.lastY = event.clientY;
+    gs.lastTime = now;
+  }
+
+  function onPointerUp(event) {
+    clearTimeout(STATE.longPressTimer);
+    const gs = STATE.grabState;
+    STATE.grabState = null;
+    canvas.style.cursor = '';
+
+    if (!gs || !gs.isDragging || !STATE.grabbedVisual) {
+      STATE.grabbedVisual = null;
+      return;
+    }
+
+    const visual = STATE.grabbedVisual;
+    STATE.grabbedVisual = null;
+
+    if (!visual.object || !visual.phys) return;
+
+    /* Calculate throw velocity from pointer history */
+    let throwVX = 0, throwVZ = 0;
+    if (gs.velocityHistory.length >= 2) {
+      const recent = gs.velocityHistory[gs.velocityHistory.length - 1];
+      const older = gs.velocityHistory[0];
+      const dt = Math.max(recent.t - older.t, 1);
+      const dxScreen = recent.x - older.x;
+      const dyScreen = recent.y - older.y;
+
+      /* Convert screen velocity to world velocity (approximate) */
+      const floorA = getFloorPosition(older.x, older.y, visual.phys.restX > 0.5 ? gs.liftY : 0);
+      const floorB = getFloorPosition(recent.x, recent.y, visual.phys.restX > 0.5 ? gs.liftY : 0);
+      if (floorA && floorB) {
+        throwVX = ((floorB.x - floorA.x) / dt) * 1000 * PHYSICS_THROW_MULTIPLIER;
+        throwVZ = ((floorB.z - floorA.z) / dt) * 1000 * PHYSICS_THROW_MULTIPLIER;
+      }
+    }
+
+    /* Drop object to floor/desk level */
+    const wasOnDesk = visual.phys.onDesk;
+    const deskBounds = getDeskSurfaceBounds();
+    const isOverDesk = visual.object.position.x >= deskBounds.minX - 0.5
+      && visual.object.position.x <= deskBounds.maxX + 0.5
+      && visual.object.position.z >= deskBounds.minZ - 0.5
+      && visual.object.position.z <= deskBounds.maxZ + 0.5;
+
+    if (isOverDesk && STATE.room.deskTopY) {
+      restObjectOnY(visual.object, STATE.room.deskTopY);
+      visual.phys.onDesk = true;
+    } else {
+      restObjectOnY(visual.object, 0.02);
+      visual.phys.onDesk = false;
+    }
+
+    /* Apply throw velocity */
+    visual.phys.vx = clamp(throwVX, -PHYSICS_MAX_VELOCITY, PHYSICS_MAX_VELOCITY);
+    visual.phys.vz = clamp(throwVZ, -PHYSICS_MAX_VELOCITY, PHYSICS_MAX_VELOCITY);
+    visual.phys.settled = false;
+
+    /* Update rest position to new dropped position */
+    visual.phys.restX = visual.object.position.x;
+    visual.phys.restZ = visual.object.position.z;
+
+    /* Persist the new position */
+    const layoutKey = visual.object?.userData?.layoutCacheKey;
+    if (layoutKey) {
+      syncLayoutCacheFromObject(layoutKey, visual.object, visual.object.userData.layoutCacheExtra || {});
+      persistStorage();
+    }
+
+    try { canvas.releasePointerCapture(event.pointerId); } catch (e) { /* ignore */ }
+  }
+
+  function onPointerCancel(event) {
+    clearTimeout(STATE.longPressTimer);
+    if (STATE.grabbedVisual && STATE.grabbedVisual.object && STATE.grabbedVisual.phys) {
+      restObjectOnY(STATE.grabbedVisual.object, STATE.grabbedVisual.phys.onDesk ? (STATE.room.deskTopY || 1.28) : 0.02);
+    }
+    STATE.grabState = null;
+    STATE.grabbedVisual = null;
+    canvas.style.cursor = '';
+  }
+
+  canvas.addEventListener('pointerdown', onPointerDown, { passive: false });
+  canvas.addEventListener('pointermove', onPointerMove, { passive: false });
+  canvas.addEventListener('pointerup', onPointerUp, { passive: false });
+  canvas.addEventListener('pointercancel', onPointerCancel, { passive: false });
+
+  /* Prevent context menu on long-press (mobile) */
+  canvas.addEventListener('contextmenu', (e) => { if (STATE.grabState) e.preventDefault(); });
+
+  /* Prevent touch scrolling while dragging */
+  canvas.addEventListener('touchmove', (e) => {
+    if (STATE.grabState?.isDragging) e.preventDefault();
+  }, { passive: false });
+}
+
+function persistStorage() {
+  const payload = {
+    version: STORAGE_PAYLOAD_VERSION,
+    memos: STATE.memos,
+    layoutCache: serializeLayoutCache(),
+  };
+
+  const json = JSON.stringify(payload);
+
+  /* localStorage backup (always) */
+  try { localStorage.setItem(STORAGE_KEY, json); } catch (e) { console.warn('localStorage write failed', e); }
+
+  /* IndexedDB primary */
+  if (STATE.idbDatabase) {
+    idbPut(STATE.idbDatabase, STORAGE_KEY, json).catch(() => {});
+  }
+}
+
+function seedPlayedEmotionRewardDropsFromExistingMemos(nowMs = Date.now()) {
+  STATE.memos.forEach((memo) => {
+    if (!memo || memo.clearedAt || memo.category !== 'emotion') return;
+    const ageMs = nowMs - new Date(memo.createdAt).getTime();
+    if (ageMs >= getEmotionAnimationDuration(memo)) {
+      STATE.playedEmotionRewardDropMemoIds.add(memo.id);
+    }
+  });
+}
+
+function formatDate(isoString) {
+  const date = new Date(isoString);
+  const yyyy = date.getFullYear();
+  const mm = String(date.getMonth() + 1).padStart(2, '0');
+  const dd = String(date.getDate()).padStart(2, '0');
+  const hh = String(date.getHours()).padStart(2, '0');
+  const min = String(date.getMinutes()).padStart(2, '0');
+  return `${yyyy}.${mm}.${dd} ${hh}:${min}`;
+}
+
+function clamp(value, min, max) {
+  return Math.min(max, Math.max(min, value));
+}
+
+function distance2D(ax, az, bx, bz) {
+  const dx = ax - bx;
+  const dz = az - bz;
+  return Math.sqrt(dx * dx + dz * dz);
+}
+
+function isTooCloseToAnyOccupied(x, z, occupied, minDist) {
+  const lists = [
+    occupied.clutter,
+    occupied.floorInteractive,
+    occupied.snack,
+    occupied.clothes,
+  ].filter(Boolean);
+  for (const list of lists) {
+    for (const p of list) {
+      if (distance2D(x, z, p.x, p.z) < minDist) return true;
+    }
+  }
+  return false;
+}
+
+function escapeHtml(value) {
+  return String(value)
+    .replaceAll('&', '&amp;')
+    .replaceAll('<', '&lt;')
+    .replaceAll('>', '&gt;')
+    .replaceAll('"', '&quot;')
+    .replaceAll("'", '&#39;');
+}
+
+function createDeskFallback() {
+  const group = new THREE.Group();
+
+  const top = new THREE.Mesh(
+    new THREE.BoxGeometry(3.8, 0.16, 1.7),
+    new THREE.MeshStandardMaterial({ color: 0x6f4d37, roughness: 0.8 })
+  );
+  top.position.set(0, 1.48, 0);
+  group.add(top);
+
+  const drawer = new THREE.Mesh(
+    new THREE.BoxGeometry(1.25, 0.9, 1.45),
+    new THREE.MeshStandardMaterial({ color: 0x5b3d2c, roughness: 0.82 })
+  );
+  drawer.position.set(-1.15, 0.85, 0);
+  group.add(drawer);
+
+  const side = new THREE.Mesh(
+    new THREE.BoxGeometry(0.34, 1.4, 1.45),
+    new THREE.MeshStandardMaterial({ color: 0x593c2b, roughness: 0.82 })
+  );
+  side.position.set(1.55, 0.72, 0);
+  group.add(side);
+
+  const legGeo = new THREE.BoxGeometry(0.16, 1.42, 0.16);
+  const legMat = new THREE.MeshStandardMaterial({ color: 0x56382a, roughness: 0.82 });
+
+  [
+    [-1.72, 0.71, -0.72],
+    [-1.72, 0.71, 0.72],
+    [1.72, 0.71, -0.72],
+    [1.72, 0.71, 0.72],
+  ].forEach(([x, y, z]) => {
+    const leg = new THREE.Mesh(legGeo, legMat);
+    leg.position.set(x, y, z);
+    group.add(leg);
   });
 
-  // stage-level mouse events for tilt
-  stage.addEventListener("mousemove", deckMouseMove);
-  stage.addEventListener("mouseleave", deckMouseLeave);
-
-  // 초기 레이아웃 — 애니메이션 없이
-  layoutDeck(true);
+  return group;
 }
 
-function updateAlbumPanel(){
-  if(!albumInited||LS.hIdx!==2) return;
-  // 음악 반응 제거 — filter/textShadow 매 프레임 갱신이 렉의 주범
-  // 선택된 카드 brightness만 정적으로 유지
+function createNoteFallback() {
+  const group = new THREE.Group();
+  const base = new THREE.Mesh(
+    new THREE.BoxGeometry(0.68, 0.08, 0.52),
+    new THREE.MeshStandardMaterial({ color: 0xe8ecf6, roughness: 0.96 })
+  );
+  group.add(base);
+
+  const stripe = new THREE.Mesh(
+    new THREE.BoxGeometry(0.08, 0.09, 0.52),
+    new THREE.MeshStandardMaterial({ color: 0xbfcde7, roughness: 0.9 })
+  );
+  stripe.position.x = -0.26;
+  group.add(stripe);
+
+  return group;
 }
 
-function initAlbumPanel(){
-  if(albumInited) return;
-  buildAlbumCards();
-  albumInited=true;
+function createScribbleFallback() {
+  const group = new THREE.Group();
+  const page = new THREE.Mesh(
+    new THREE.BoxGeometry(0.66, 0.05, 0.5),
+    new THREE.MeshStandardMaterial({ color: 0xf2eee5, roughness: 0.98 })
+  );
+  group.add(page);
 
-  const panelScene=document.getElementById("panel-scene");
-  if(!panelScene) return;
-  const overlay=document.getElementById("album-panel-overlay");
-  if(overlay){
-    overlay.style.display="block";
-    panelScene.appendChild(overlay);
-  }
+  const mark = new THREE.Mesh(
+    new THREE.BoxGeometry(0.4, 0.06, 0.04),
+    new THREE.MeshStandardMaterial({ color: 0x444444, roughness: 0.8 })
+  );
+  mark.position.set(0, 0.01, 0.04);
+  group.add(mark);
 
-  // back → 이전 패널(piano), next → 다음 패널(pool)
-  const btnBack = document.getElementById("album-back-btn");
-  if(btnBack) btnBack.addEventListener("click", ()=>triggerNav(()=>goTo(1,0)));
-
-  const btnNext = document.getElementById("album-next-btn");
-  if(btnNext) btnNext.addEventListener("click", ()=>triggerNav(()=>goTo(LS.hIdx+1,0)));
+  return group;
 }
 
+function createClothesFoldedFallback() {
+  const group = new THREE.Group();
+  const colors = [0x8a7f9b, 0xcaaea0, 0x8ea4bd];
 
-let rafId=0;
-
-function teardownApp(){
-  if(rafId){
-    cancelAnimationFrame(rafId);
-    rafId=0;
-  }
-
-  Object.keys(glbRenderers).forEach((key)=>{
-    disposeLiveGLB(Number(key));
+  colors.forEach((color, index) => {
+    const fold = new THREE.Mesh(
+      new THREE.BoxGeometry(0.88 - index * 0.1, 0.12, 0.58),
+      new THREE.MeshStandardMaterial({ color, roughness: 0.98 })
+    );
+    fold.position.set(0, index * 0.08, (index - 1) * 0.02);
+    group.add(fold);
   });
 
-  disposePoolRenderer({ preserveCanvas:true });
-
-  if(micStream){
-    try{ micStream.getTracks().forEach((t)=>t.stop()); }catch(_){}
-    micStream=null;
-  }
-
-  if(audioCtx && audioCtx.state!=="closed"){
-    try{ audioCtx.close(); }catch(_){}
-  }
+  return group;
 }
 
-function loop(){
-  analyze(); smooth(); updateCSS(); updateHUD(); updatePalette();
-  drawOverlay(); renderGL(); renderActiveGLB(); updateAlbumPanel();
-  if(poolInited&&poolClock){
-    const delta=Math.min(poolClock.getDelta(),0.05);
-    if(poolActive) renderPoolScene(delta);
-  }
-  if(sceneActive) drawScene();
-  rafId=requestAnimationFrame(loop);
+function createClothesScatteredFallback() {
+  const group = new THREE.Group();
+  const colors = [0x778da6, 0xd0b2a2, 0x9287a0];
+
+  colors.forEach((color, index) => {
+    const cloth = new THREE.Mesh(
+      new THREE.BoxGeometry(0.96, 0.08, 0.56),
+      new THREE.MeshStandardMaterial({ color, roughness: 0.98 })
+    );
+    cloth.rotation.set(0.02 * index, index * 0.45, 0.22 - index * 0.12);
+    cloth.position.set((index - 1) * 0.26, index * 0.03, index * 0.11);
+    group.add(cloth);
+  });
+
+  return group;
 }
 
-// ── 진입점
-(function init(){
-  if(!initGL()) return;
-  initAssetLoaders();
-  initOverlay();
-  bindAudioEvents();
-  bindTrackButtons();
-  bindLayoutEvents();
-  mc.style.transform="translate(0px,0px)";
-  audioEl.src="assets/track.mp3";
-  audioEl.addEventListener("error",()=>audioEl.removeAttribute("src"),{once:true});
+function createPaperFallback(color) {
+  const page = new THREE.Mesh(
+    new THREE.BoxGeometry(0.74, 0.02, 0.54),
+    new THREE.MeshStandardMaterial({ color, roughness: 0.99 })
+  );
+  return page;
+}
 
-  const hint=document.getElementById("scroll-hint");
-  if(hint) setTimeout(()=>{hint.style.opacity="0";},5000);
+function createPaperPileFallback() {
+  const group = new THREE.Group();
+  const colors = [0xe9e0d2, 0xddd5c8, 0xd7cddd, 0xe3d9cb, 0xebe2d7];
 
-  // CPU-side GLB 프리로드만 먼저 수행하고,
-  // 실제 WebGL 컨텍스트는 현재 보이는 섹션에만 생성
-  primeGLBPreloadQueue();
+  colors.forEach((color, index) => {
+    const page = new THREE.Mesh(
+      new THREE.BoxGeometry(0.88 - index * 0.03, 0.025, 0.6 - index * 0.02),
+      new THREE.MeshStandardMaterial({ color, roughness: 0.99 })
+    );
+    page.position.set((index - 2) * 0.02, index * 0.02, (index - 2) * 0.012);
+    page.rotation.y = (index - 2) * 0.06;
+    group.add(page);
+  });
 
-  // Pool은 진입 시 즉시 뜨도록 한 번만 사전 초기화
-  setTimeout(()=>{ initPoolRenderer(); }, 200);
+  return group;
+}
 
-  window.addEventListener("pagehide", teardownApp, { once:true });
-  window.addEventListener("beforeunload", teardownApp, { once:true });
+function createSnackFallback() {
+  const group = new THREE.Group();
 
-  loop();
-})();
+  const body = new THREE.Mesh(
+    new THREE.BoxGeometry(0.62, 0.84, 0.28),
+    new THREE.MeshStandardMaterial({ color: 0xf0b34a, roughness: 0.74 })
+  );
+  body.rotation.z = -0.08;
+  group.add(body);
+
+  const stripe = new THREE.Mesh(
+    new THREE.BoxGeometry(0.56, 0.18, 0.3),
+    new THREE.MeshStandardMaterial({ color: 0xdb5538, roughness: 0.7 })
+  );
+  stripe.position.y = 0.12;
+  stripe.rotation.z = -0.08;
+  group.add(stripe);
+
+  return group;
+}
+
+function createStrawberryFallback() {
+  const group = new THREE.Group();
+
+  const berry = new THREE.Mesh(
+    new THREE.SphereGeometry(0.34, 24, 24),
+    new THREE.MeshStandardMaterial({ color: 0xd84b5c, roughness: 0.64, metalness: 0.02 })
+  );
+  berry.scale.set(0.9, 1.08, 0.9);
+  berry.position.y = 0.34;
+  group.add(berry);
+
+  const leaves = new THREE.Mesh(
+    new THREE.ConeGeometry(0.2, 0.16, 6),
+    new THREE.MeshStandardMaterial({ color: 0x4e8a48, roughness: 0.84 })
+  );
+  leaves.position.y = 0.67;
+  leaves.rotation.y = Math.PI / 6;
+  group.add(leaves);
+
+  const stem = new THREE.Mesh(
+    new THREE.CylinderGeometry(0.018, 0.018, 0.14, 8),
+    new THREE.MeshStandardMaterial({ color: 0x5d8f42, roughness: 0.84 })
+  );
+  stem.position.y = 0.76;
+  group.add(stem);
+
+  return group;
+}
+
+function createJarFallback() {
+  const group = new THREE.Group();
+
+  const body = new THREE.Mesh(
+    new THREE.CylinderGeometry(0.28, 0.3, 0.72, 24),
+    new THREE.MeshStandardMaterial({
+      color: 0xe7d8c6,
+      roughness: 0.26,
+      metalness: 0.06,
+      transparent: true,
+      opacity: 0.72,
+    })
+  );
+  body.position.y = 0.36;
+  group.add(body);
+
+  const lid = new THREE.Mesh(
+    new THREE.CylinderGeometry(0.24, 0.24, 0.1, 24),
+    new THREE.MeshStandardMaterial({ color: 0xc7b099, roughness: 0.6 })
+  );
+  lid.position.y = 0.74;
+  group.add(lid);
+
+  return group;
+}
+
+function createBurnFallback() {
+  const group = new THREE.Group();
+
+  const base = new THREE.Mesh(
+    new THREE.CylinderGeometry(0.22, 0.3, 0.12, 18),
+    new THREE.MeshStandardMaterial({ color: 0x3a312e, roughness: 0.92 })
+  );
+  base.position.y = 0.06;
+  group.add(base);
+
+  const ember = new THREE.Mesh(
+    new THREE.ConeGeometry(0.18, 0.42, 12),
+    new THREE.MeshStandardMaterial({ color: 0x9b4d2d, roughness: 0.78, emissive: 0x4a1608, emissiveIntensity: 0.35 })
+  );
+  ember.position.y = 0.29;
+  ember.rotation.z = 0.08;
+  group.add(ember);
+
+  return group;
+}
+
+function createTumblerFallback() {
+  const group = new THREE.Group();
+
+  const body = new THREE.Mesh(
+    new THREE.CylinderGeometry(0.24, 0.28, 0.78, 24),
+    new THREE.MeshStandardMaterial({
+      color: 0xdbc5a7,
+      roughness: 0.36,
+      metalness: 0.08,
+      transparent: true,
+      opacity: 0.92,
+    })
+  );
+  body.position.y = 0.39;
+  group.add(body);
+
+  const lid = new THREE.Mesh(
+    new THREE.CylinderGeometry(0.26, 0.26, 0.08, 24),
+    new THREE.MeshStandardMaterial({ color: 0x8d6752, roughness: 0.6, metalness: 0.1 })
+  );
+  lid.position.y = 0.8;
+  group.add(lid);
+
+  return group;
+}v
