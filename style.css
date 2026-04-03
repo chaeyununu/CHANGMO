@@ -1772,3 +1772,52 @@ html, body {
   }
   .album-detail { top: 5vh; left: 16px; max-width: 160px; }
 }
+
+/* === 2026-03-31: finer music-reactive motion (Meyda-assisted) === */
+:root {
+  --detail: 0;
+  --transient: 0;
+  --texture: 0;
+  --clarity: 0;
+}
+
+.hero-visual {
+  transform:
+    translate3d(calc(var(--mx) * 0.0025), calc(var(--my) * 0.0025), 0)
+    rotate(calc((var(--clarity) - var(--texture) * 0.5) * 1.6deg));
+  transition: transform 0.05s linear;
+}
+
+.pulse-rings {
+  transform: scale(calc(1 + var(--transient) * 0.032 + var(--detail) * 0.018));
+  transition: transform 0.05s linear;
+}
+
+.hero-light {
+  transform: scale(calc(1 + var(--lq-mid) * 0.06 + var(--lq-air) * 0.04 + var(--texture) * 0.05)) rotate(calc(var(--detail) * 3deg));
+}
+
+.hero-png {
+  will-change: transform, filter;
+}
+
+.piano-visual,
+.chron-glb-wrap {
+  transform: translate3d(0, calc(var(--transient) * -4px + var(--texture) * 2px), 0);
+  transition: transform 0.05s linear;
+}
+
+.track-btn.active,
+.control-btn:hover,
+.file-btn:hover {
+  transform:
+    translateY(calc(var(--bass) * -1px + var(--transient) * -2px))
+    scale(calc(1 + var(--energy) * 0.009 + var(--detail) * 0.018));
+}
+
+.reactive-chip,
+.band-item,
+.chron-title,
+.piano-title {
+  will-change: transform, text-shadow, opacity;
+}
