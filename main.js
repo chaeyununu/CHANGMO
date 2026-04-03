@@ -22,6 +22,16 @@ const PHYSICS_BOUNCE_FACTOR = 0.3;
 const PHYSICS_ROOM_BOUNDS = { minX: -8.5, maxX: 8.5, minZ: -5.8, maxZ: 5.4 };
 const PHYSICS_SEPARATION_RADIUS = 1.2;
 const PHYSICS_SEPARATION_FORCE = 0.012;
+const SPECIAL_TILT_AGE_OLD_DAYS = 7;
+const SPECIAL_TILT_ASSET_KEYS = new Set(['burn', 'jar', 'paperPile', 'clothesScattered']);
+const SPECIAL_TILT_MULTIPLIERS = Object.freeze({
+  recent: 0.02,
+  mid: 1.15,
+  old: 2.85,
+});
+const PHONE_FREEZE_RELOAD_MIN_VISUALS = 14;
+const PHONE_FREEZE_RELOAD_NO_FRAME_MS = 2800;
+const PHONE_FREEZE_RELOAD_CHECK_MS = 900;
 const LONG_PRESS_MS = 500;
 const DRAG_DEAD_ZONE = 6;
 const VELOCITY_HISTORY_SIZE = 6;
@@ -1032,7 +1042,22 @@ const STATE = {
   playedEmotionRewardDropMemoIds: new Set(),
   layoutCache: Object.create(null),
   /* physics & interaction */
-  tilt: { x: 0, z: 0, rawBeta: 0, rawGamma: 0, active: false },
+  tilt: {
+    x: 0,
+    z: 0,
+    rawBeta: 0,
+    rawGamma: 0,
+    mappedX: 0,
+    mappedZ: 0,
+    baselineX: 0,
+    baselineZ: 0,
+    calibrated: false,
+    active: false,
+    lastEventAt: 0,
+  },
+  lastFrameAt: 0,
+  freezeReloadTriggered: false,
+  freezeWatchdogId: null,
   grabbedVisual: null,
   grabState: null, /* { startTime, startX, startY, pointerId, isDragging, velocityHistory, lastX, lastY, lastTime, liftY } */
   longPressTimer: null,
@@ -1493,6 +1518,7 @@ async function init() {
   renderHistory();
   setupDeviceOrientation();
   setupInteraction();
+  setupPhoneFreezeWatchdog();
   maybeTriggerReloadRa3();
   startLoop();
   STATE.appReady = true;
@@ -2015,6 +2041,11 @@ function setupScene() {
   STATE.renderer.toneMappingExposure = 1.08;
   UI.sceneRoot.innerHTML = '';
   UI.sceneRoot.appendChild(STATE.renderer.domElement);
+
+  STATE.renderer.domElement.addEventListener('webglcontextlost', (event) => {
+    event.preventDefault();
+    triggerPhoneFreezeReload('webgl-context-lost');
+  }, { passive: false });
 
   const hemi = new THREE.HemisphereLight(0xfffbf4, 0xe9dfd3, 1.7);
   STATE.scene.add(hemi);
@@ -5183,6 +5214,7 @@ function hideMemoHover() {
 
 function startLoop() {
   const frame = () => {
+    STATE.lastFrameAt = performance.now();
     const delta = Math.min(STATE.clock.getDelta(), 0.033);
     const now = Date.now();
 
@@ -5231,6 +5263,7 @@ function startLoop() {
     requestAnimationFrame(frame);
   };
 
+  STATE.lastFrameAt = performance.now();
   requestAnimationFrame(frame);
 }
 
@@ -5675,12 +5708,95 @@ function importMemosJSON() {
 }
 
 /* ═══ Device Orientation (Tilt) ═══ */
+function isIPadLikeDevice() {
+  return /iPad/i.test(navigator.userAgent || '') || (navigator.platform === 'MacIntel' && (navigator.maxTouchPoints || 0) > 1);
+}
+
+function isPhoneLikeViewport() {
+  const minSide = Math.min(window.innerWidth || 0, window.innerHeight || 0);
+  return (navigator.maxTouchPoints || 0) > 0 && !isIPadLikeDevice() && minSide > 0 && minSide < 820;
+}
+
+function getScreenOrientationAngle() {
+  const orientationAngle = window.screen?.orientation?.angle;
+  if (typeof orientationAngle === 'number') return orientationAngle;
+  if (typeof window.orientation === 'number') return window.orientation;
+  return 0;
+}
+
+function mapOrientationToTiltAxes(beta, gamma) {
+  let mappedX = gamma ?? 0;
+  let mappedZ = (beta ?? 0) - 45;
+  const angle = getScreenOrientationAngle();
+
+  if (angle === 90) {
+    const nextX = mappedZ;
+    const nextZ = -mappedX;
+    mappedX = nextX;
+    mappedZ = nextZ;
+  } else if (angle === -90 || angle === 270) {
+    const nextX = -mappedZ;
+    const nextZ = mappedX;
+    mappedX = nextX;
+    mappedZ = nextZ;
+  } else if (Math.abs(angle) === 180) {
+    mappedX *= -1;
+    mappedZ *= -1;
+  }
+
+  return { mappedX, mappedZ };
+}
+
+function triggerPhoneFreezeReload(reason = 'frame-stall') {
+  if (!isPhoneLikeViewport()) return;
+  if (document.hidden) return;
+  if (STATE.freezeReloadTriggered) return;
+  if ((STATE.visuals?.length || 0) < PHONE_FREEZE_RELOAD_MIN_VISUALS) return;
+
+  STATE.freezeReloadTriggered = true;
+  console.warn(`[freeze-guard] Reloading phone view due to ${reason}`);
+  window.setTimeout(() => {
+    window.location.reload();
+  }, 120);
+}
+
+function setupPhoneFreezeWatchdog() {
+  if (STATE.freezeWatchdogId) {
+    clearInterval(STATE.freezeWatchdogId);
+  }
+
+  STATE.lastFrameAt = performance.now();
+  STATE.freezeWatchdogId = window.setInterval(() => {
+    if (!STATE.appReady) return;
+    if (!isPhoneLikeViewport()) return;
+    if (document.hidden) return;
+    if ((STATE.visuals?.length || 0) < PHONE_FREEZE_RELOAD_MIN_VISUALS) return;
+
+    const elapsed = performance.now() - (STATE.lastFrameAt || 0);
+    if (elapsed > PHONE_FREEZE_RELOAD_NO_FRAME_MS) {
+      triggerPhoneFreezeReload('no-frame-watchdog');
+    }
+  }, PHONE_FREEZE_RELOAD_CHECK_MS);
+}
+
 function setupDeviceOrientation() {
   const handleOrientation = (event) => {
     const beta = event.beta ?? 0;   /* front-back tilt: -180..180 */
     const gamma = event.gamma ?? 0; /* left-right tilt: -90..90 */
+    const { mappedX, mappedZ } = mapOrientationToTiltAxes(beta, gamma);
+
     STATE.tilt.rawBeta = beta;
     STATE.tilt.rawGamma = gamma;
+    STATE.tilt.mappedX = mappedX;
+    STATE.tilt.mappedZ = mappedZ;
+    STATE.tilt.lastEventAt = performance.now();
+
+    if (isIPadLikeDevice() && !STATE.tilt.calibrated) {
+      STATE.tilt.baselineX = mappedX;
+      STATE.tilt.baselineZ = mappedZ;
+      STATE.tilt.calibrated = true;
+    }
+
     STATE.tilt.active = true;
   };
 
@@ -5701,11 +5817,13 @@ function setupDeviceOrientation() {
 
 function updateTiltSmoothing() {
   if (!STATE.tilt.active) return;
-  /* Normalize beta(front-back) → Z force, gamma(left-right) → X force */
-  /* Use symmetric gamma mapping for balanced left-right movement */
-  const rawGamma = STATE.tilt.rawGamma;
-  const targetX = clamp(rawGamma / 30, -1, 1) * PHYSICS_TILT_FORCE;
-  const targetZ = clamp((STATE.tilt.rawBeta - 45) / 30, -1, 1) * PHYSICS_TILT_FORCE;
+
+  const ipadBaselineX = isIPadLikeDevice() ? STATE.tilt.baselineX : 0;
+  const ipadBaselineZ = isIPadLikeDevice() ? STATE.tilt.baselineZ : 0;
+  const rawX = (STATE.tilt.mappedX ?? STATE.tilt.rawGamma) - ipadBaselineX;
+  const rawZ = (STATE.tilt.mappedZ ?? ((STATE.tilt.rawBeta ?? 0) - 45)) - ipadBaselineZ;
+  const targetX = clamp(rawX / 30, -1, 1) * PHYSICS_TILT_FORCE;
+  const targetZ = clamp(rawZ / 30, -1, 1) * PHYSICS_TILT_FORCE;
   STATE.tilt.x += (targetX - STATE.tilt.x) * PHYSICS_TILT_SMOOTHING;
   STATE.tilt.z += (targetZ - STATE.tilt.z) * PHYSICS_TILT_SMOOTHING;
 }
@@ -5727,6 +5845,23 @@ function getPhysicsFriction(memo) {
   if (ageDays >= PHYSICS_AGE_OLD_DAYS) return PHYSICS_FRICTION_OLD;
   const t = (ageDays - (PHYSICS_AGE_RECENT_HOURS / 24)) / (PHYSICS_AGE_OLD_DAYS - (PHYSICS_AGE_RECENT_HOURS / 24));
   return THREE.MathUtils.lerp(PHYSICS_FRICTION_RECENT, PHYSICS_FRICTION_OLD, clamp(t, 0, 1));
+}
+
+function getMemoTiltAgeTier(memo) {
+  if (!memo?.createdAt) return 'mid';
+  const ageMs = Date.now() - new Date(memo.createdAt).getTime();
+  const ageHours = ageMs / (1000 * 60 * 60);
+  if (ageHours < PHYSICS_AGE_RECENT_HOURS) return 'recent';
+  const ageDays = ageHours / 24;
+  if (ageDays >= SPECIAL_TILT_AGE_OLD_DAYS) return 'old';
+  return 'mid';
+}
+
+function getVisualTiltResponseMultiplier(visual, memo) {
+  const assetKey = visual?.object?.userData?.assetKey;
+  if (!SPECIAL_TILT_ASSET_KEYS.has(assetKey)) return 1;
+  const tier = getMemoTiltAgeTier(memo);
+  return SPECIAL_TILT_MULTIPLIERS[tier] || 1;
 }
 
 function initVisualPhysics(visual) {
@@ -5808,7 +5943,7 @@ function updatePhysics(delta) {
     }
 
     /* Desk items don't respond to tilt as much */
-    const tiltScale = p.onDesk ? 0.15 : 1.0;
+    const tiltScale = (p.onDesk ? 0.15 : 1.0) * getVisualTiltResponseMultiplier(visual, memo);
 
     if (hasForce) {
       p.vx += forceX * (1 - p.friction) * 3.0 * tiltScale;
